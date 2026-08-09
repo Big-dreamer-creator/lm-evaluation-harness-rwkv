@@ -63,6 +63,7 @@ lm-eval-harness 是 LLM 社区的标准评估库, 很早成为最主流的评估
 ```
 
 model_name 需要写清楚 Qwen(如 Qwen3.5-2B ) / RWKV7 (详情见 `RWKV7 权重` 一章节) 权重具体版本号.
+新增任何文件, 都需要得到用户确认.
 
 ## 权威 RWKV7 实现
 (1) https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/rwkv_v7_numpy.py
