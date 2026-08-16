@@ -15,6 +15,42 @@ from lm_eval._cli.utils import (
 )
 
 
+def _finish_reasons(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [
+            reason
+            for item in value
+            for reason in _finish_reasons(item)
+        ]
+    reason = getattr(value, "finish_reason", None)
+    return [reason] if isinstance(reason, str) else []
+
+
+def _add_truncation_stats(results: dict, samples: dict) -> dict:
+    task_stats = {}
+    for task_name, task_samples in samples.items():
+        generated_samples = 0
+        truncated_samples = 0
+        for sample in task_samples:
+            finish_reasons = _finish_reasons(sample.get("resps", []))
+            if not finish_reasons:
+                continue
+            generated_samples += 1
+            truncated = "length" in finish_reasons
+            truncated_samples += int(truncated)
+            sample["finish_reasons"] = finish_reasons
+            sample["truncated"] = truncated
+        task_stats[task_name] = {
+            "generated_samples": generated_samples,
+            "truncated_samples": truncated_samples,
+            "truncation_rate": (
+                truncated_samples / generated_samples if generated_samples else None
+            ),
+        }
+    results["config"]["truncation"] = task_stats
+    return task_stats
+
+
 class Run(SubCommand):
     """Command for running language model evaluation."""
 
@@ -37,7 +73,7 @@ class Run(SubCommand):
                   $ lm-eval run --model hf --model_args pretrained=gpt2 --tasks lambada --gen_kwargs temperature=0.8 top_p=0.95 'stop=["\\n\\n"]'
 
                   # Use configuration file
-                  $ lm-eval run --config my_config.yaml --tasks mmlu
+                  $ lm-eval run --config my_config.toml
 
                 For more information, see: https://github.com/EleutherAI/lm-evaluation-harness
             """),
@@ -57,7 +93,7 @@ class Run(SubCommand):
             default=None,
             type=str,
             metavar="<path>",
-            help="Set initial arguments from YAML config",
+            help="Set initial arguments from TOML or YAML config",
         )
 
         # Model and Tasks
@@ -429,6 +465,7 @@ class Run(SubCommand):
         if results is not None:
             if cfg.log_samples:
                 samples = results.pop("samples")
+                _add_truncation_stats(results, samples)
 
             dumped = json.dumps(
                 results, indent=2, default=handle_non_serializable, ensure_ascii=False

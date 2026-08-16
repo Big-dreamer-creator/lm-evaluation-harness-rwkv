@@ -1,28 +1,49 @@
 # Configuration Guide
 
-This guide explains how to use YAML configuration files with `lm-eval` to define reusable evaluation settings.
+This guide explains how to use TOML or YAML configuration files with `lm-eval` to define reusable evaluation settings. Task and benchmark definitions remain YAML.
 
 ## Overview
 
-Instead of passing many CLI arguments, you can define evaluation parameters in a YAML configuration file:
+Instead of passing many CLI arguments, define evaluation parameters in a TOML file:
 
 ```bash
 # Instead of:
 lm-eval run --model hf --model_args pretrained=gpt2,dtype=float32 --tasks hellaswag arc_easy --num_fewshot 5 --batch_size 8 --device cuda:0
 
 # Use:
-lm-eval run --config eval_config.yaml
+lm-eval run --config eval_config.toml
 ```
 
 CLI arguments override config file values, so you can set defaults in a config file and override specific settings:
 
 ```bash
-lm-eval run --config eval_config.yaml --tasks mmlu --limit 100
+lm-eval run --config eval_config.toml --tasks mmlu --limit 100
 ```
 
 ## Quick Reference
 
 All configuration keys correspond directly to CLI arguments. See the [CLI Reference](interface.md#lm-eval-run) for detailed descriptions of each option.
+
+### RWKV7 complete run
+
+Start the independent `vllm-rwkv` HTTP service from its own repository and uv environment:
+
+```bash
+cd /path/to/vllm-rwkv
+# Start the repository's RWKV7 server launcher here.
+```
+
+Configure the launcher to pass `--enable-tokenizer-info-endpoint`. The service
+must expose `/tokenizer_info` so lm-eval receives the same official RWKV chat
+template used by the inference backend.
+
+Then run every benchmark adapted for `rwkv7-g1i-1.5b-20260805-ctx16384` with the repository config:
+
+```bash
+uv run --no-sync python -m lm_eval run -C lm-eval-rwkv.toml
+```
+
+The TOML owns the model endpoint, concurrency, complete task set, and result location. Each benchmark YAML owns its prompt, generation limits, filters, and metrics. The deprecated `temp/` launch scripts are not used.
 
 ## Config Schema
 
@@ -57,38 +78,35 @@ All configuration keys correspond directly to CLI arguments. See the [CLI Refere
 
 ## Example
 
-```yaml
-# basic_eval.yaml
-model: hf
-model_args:
-  pretrained: gpt2
-  dtype: float32
+```toml
+# basic_eval.toml
+model = "hf"
+tasks = ["hellaswag", "arc_easy"]
+num_fewshot = 0
+batch_size = "auto"
+device = "cuda:0"
+output_path = "./results/gpt2/"
+log_samples = true
 
-tasks:
-  - hellaswag
-  - arc_easy
-
-num_fewshot: 0
-batch_size: auto
-device: cuda:0
-
-output_path: ./results/gpt2/
-log_samples: true
-
-wandb_args:
-  project: llm-evals
-  name: mistral-7b-instruct
-  tags:
-    - mistral
-    - instruct
-    - production
-
-hf_hub_log_args:
-  hub_results_org: my-org
-  results_repo_name: llm-eval-results
-  push_results_to_hub: true
-  public_repo: false
+[model_args]
+pretrained = "gpt2"
+dtype = "float32"
 ```
+
+## Inheriting a run config
+
+Small or smoke runs can include a formal config and override only their scope:
+
+```toml
+include = "lm-eval-rwkv.toml"
+tasks = ["rwkv7_g1i_1_5b_20260805_ctx16384_race"]
+limit = 10
+output_path = "results/smoke/race"
+```
+
+Included paths are relative to the including file. Nested tables are merged, and local values override included values. CLI arguments still have the highest priority.
+
+Generation settings, prompts, filters, and metrics should be tuned in each benchmark's task YAML, not in a global run config. This preserves the native task protocol for non-RWKV backends.
 
 ---
 
@@ -118,4 +136,4 @@ lm-eval validate --tasks my_task --include_path /path/to/tasks
 2. **Use CLI overrides**: Set defaults in config, override with CLI for experiments
 3. **Separate concerns**: Create different configs for different model families or task sets
 4. **Version control**: Commit config files alongside results for reproducibility
-5. **Use comments**: YAML supports `#` comments to document your choices
+5. **Use comments**: TOML and YAML support `#` comments to document your choices

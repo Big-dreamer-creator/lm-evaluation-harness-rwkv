@@ -31,7 +31,8 @@ dependencies = [
     "word2number",
     "more_itertools",
     "typing_extensions",
-    "tqdm>=4.59.0"
+    "tqdm>=4.59.0",
+    "tomli>=1.1.0; python_version < '3.11'",
 ]
 
 [tool.setuptools.packages.find]

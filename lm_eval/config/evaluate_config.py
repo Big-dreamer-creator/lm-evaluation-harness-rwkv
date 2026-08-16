@@ -9,6 +9,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
 from lm_eval.utils import simple_parse_args_string
 
 
@@ -35,7 +41,7 @@ class EvaluatorConfig:
     This dataclass contains all parameters for configuring model evaluations via
     `simple_evaluate()` or the CLI. It supports initialization from:
     - CLI arguments (via `from_cli()`)
-    - YAML configuration files (via `from_config()`)
+    - TOML or YAML configuration files (via `from_config()`)
     - Direct instantiation with keyword arguments
 
     The configuration handles argument parsing, validation, and preprocessing
@@ -45,8 +51,8 @@ class EvaluatorConfig:
         # From CLI arguments
         config = EvaluatorConfig.from_cli(args)
 
-        # From YAML file
-        config = EvaluatorConfig.from_config("eval_config.yaml")
+        # From a TOML file
+        config = EvaluatorConfig.from_config("eval_config.toml")
 
         # Direct instantiation
         config = EvaluatorConfig(
@@ -61,7 +67,7 @@ class EvaluatorConfig:
 
     # Core evaluation parameters
     config: str | None = field(
-        default=None, metadata={"help": "Path to YAML config file"}
+        default=None, metadata={"help": "Path to TOML or YAML config file"}
     )
     model: str = field(default="hf", metadata={"help": "Name of model e.g. 'hf'"})
     model_args: dict = field(
@@ -202,14 +208,14 @@ class EvaluatorConfig:
     def from_cli(cls, namespace: Namespace) -> EvaluatorConfig:
         """Build an EvaluationConfig by merging with a simple precedence.
 
-        CLI args > YAML config > built-in defaults.
+        CLI args > config file > built-in defaults.
         """
         # Start with built-in defaults
         config = asdict(cls())
 
-        # Load and merge YAML config if provided
+        # Load and merge TOML/YAML config if provided
         if used_config := getattr(namespace, "config", None):
-            config.update(cls.load_yaml_config(cast("str", used_config)))
+            config.update(cls.load_config(cast("str", used_config)))
 
         # Override with CLI args (only truthy values or 0, exclude non-config args)
         excluded_args = {"command", "func"}  # argparse internal args
@@ -227,7 +233,7 @@ class EvaluatorConfig:
         if used_config:
             cli_args.pop("config", None)
             eval_logger.info(
-                "CLI args %s will override yaml", cli_args
+                "CLI args %s will override config file", cli_args
             ) if cli_args else None
             print(textwrap.dedent(f"""{instance}"""))
 
@@ -235,34 +241,81 @@ class EvaluatorConfig:
 
     @classmethod
     def from_config(cls, config_path: str | Path) -> EvaluatorConfig:
-        """Build an EvaluationConfig from a YAML config file.
+        """Build an EvaluationConfig from a TOML or YAML config file.
 
         Merges with built-in defaults and validates.
         """
-        # Load YAML config
-        yaml_config = cls.load_yaml_config(config_path)
-        return cls(**yaml_config)._configure()
+        file_config = cls.load_config(config_path)
+        return cls(**file_config)._configure()
 
-    @staticmethod
-    def load_yaml_config(config_path: str | Path) -> dict[str, Any]:
-        """Load and validate YAML config file."""
-        _config_path = Path(config_path)
+    @classmethod
+    def load_config(
+        cls,
+        config_path: str | Path,
+        *,
+        _seen: set[Path] | None = None,
+    ) -> dict[str, Any]:
+        """Load and validate a TOML or YAML evaluation config file."""
+        _config_path = Path(config_path).expanduser().resolve()
         if not _config_path.is_file():
-            raise FileNotFoundError(f"Config file not found: {_config_path.resolve()}")
+            raise FileNotFoundError(f"Config file not found: {_config_path}")
+        if _seen is None:
+            _seen = set()
+        if _config_path in _seen:
+            raise ValueError(f"Config include cycle at {_config_path}")
+        _seen.add(_config_path)
 
         try:
-            yaml_data = yaml.safe_load(_config_path.read_text())
+            if _config_path.suffix.lower() == ".toml":
+                config_data = tomllib.loads(_config_path.read_text(encoding="utf-8"))
+            elif _config_path.suffix.lower() in {".yaml", ".yml"}:
+                config_data = yaml.safe_load(_config_path.read_text(encoding="utf-8"))
+            else:
+                raise ValueError(
+                    f"Unsupported config format for {_config_path}. "
+                    "Use a .toml, .yaml, or .yml file."
+                )
+        except tomllib.TOMLDecodeError as e:
+            raise ValueError(f"Invalid TOML in {_config_path}: {e}") from e
         except yaml.YAMLError as e:
             raise ValueError(f"Invalid YAML in {_config_path}: {e}") from e
         except (OSError, UnicodeDecodeError) as e:
             raise ValueError(f"Could not read config file {_config_path}: {e}") from e
 
-        if not isinstance(yaml_data, dict):
+        if not isinstance(config_data, dict):
             raise TypeError(
-                f"YAML root must be a mapping in {_config_path.resolve()}, got {type(yaml_data).__name__}"
+                f"Config root must be a mapping in {_config_path.resolve()}, "
+                f"got {type(config_data).__name__}"
             )
 
-        return yaml_data
+        includes = config_data.pop("include", [])
+        if not isinstance(includes, (str, list)):
+            raise TypeError("Config include must be a path or list of paths")
+
+        merged: dict[str, Any] = {}
+        for include in [includes] if isinstance(includes, str) else includes:
+            if not isinstance(include, str):
+                raise TypeError("Every config include must be a path string")
+            include_path = Path(include)
+            if not include_path.is_absolute():
+                include_path = _config_path.parent / include_path
+            included = cls.load_config(include_path, _seen=_seen)
+            merged = cls._merge_config(merged, included)
+
+        _seen.remove(_config_path)
+        return cls._merge_config(merged, config_data)
+
+    @staticmethod
+    def _merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(base)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = EvaluatorConfig._merge_config(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    load_yaml_config = load_config
 
     def _parse_dict_args(self):
         # Parse string arguments that should be dictionaries
@@ -357,7 +410,6 @@ class EvaluatorConfig:
         # if metadata manually passed use that:
         self.metadata = metadata or self.metadata
 
-        # Create task manager with metadata
         task_manager = TaskManager(
             include_path=self.include_path,
             metadata=self.metadata or {},

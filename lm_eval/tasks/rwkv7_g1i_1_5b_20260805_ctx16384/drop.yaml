@@ -1,0 +1,10 @@
+include: ../drop/default.yaml
+task: rwkv7_g1i_1_5b_20260805_ctx16384_drop
+task_alias: DROP (RWKV7 g1i 1.5B 20260805 ctx16384)
+generation_kwargs:
+  until:
+    - "."
+  max_gen_toks: 64
+metadata:
+  version: 1.0
+  benchmark_name: drop

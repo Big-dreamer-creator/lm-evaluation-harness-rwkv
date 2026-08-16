@@ -1,0 +1,14 @@
+group: rwkv7_g1i_1_5b_20260805_ctx16384_babilong
+group_alias: BABILong 16k (RWKV7 g1i 1.5B 20260805 ctx16384)
+task:
+  - group: babilong_longctx
+    generation_kwargs:
+      until:
+        - "\n"
+      max_gen_toks: 64
+    metadata:
+      version: 1.0
+      benchmark_name: babilong
+      max_seq_lengths: 16k
+metadata:
+  version: 1.0

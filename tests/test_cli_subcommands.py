@@ -6,7 +6,7 @@ import pytest
 
 from lm_eval._cli.harness import HarnessCLI
 from lm_eval._cli.ls import List
-from lm_eval._cli.run import Run
+from lm_eval._cli.run import Run, _add_truncation_stats
 from lm_eval._cli.utils import (
     MergeDictAction,
     _int_or_none_list_arg_type,
@@ -376,6 +376,70 @@ class TestValidateCommand:
 
 class TestEvaluatorConfigTaskLoading:
     """Test EvaluatorConfig task loading."""
+
+    @patch("lm_eval.tasks.TaskManager")
+    def test_non_rwkv_model_uses_native_task_index(self, mock_task_manager):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        mock_tm_instance = MagicMock()
+        mock_tm_instance.match_tasks.return_value = ["race"]
+        mock_task_manager.return_value = mock_tm_instance
+        cfg = EvaluatorConfig(model="hf", tasks=["race"])
+        cfg._configure()
+        cfg.process_tasks()
+
+        mock_task_manager.assert_called_once_with(
+            include_path=None,
+            metadata={},
+        )
+
+    def test_truncation_stats_are_per_generated_sample(self):
+        class Generation(str):
+            finish_reason = "length"
+
+        results = {"config": {}}
+        samples = {
+            "race": [{"resps": [[(-1.0, True)]]}],
+            "drop": [
+                {"resps": [[Generation("truncated")]]},
+                {"resps": [["complete"]]},
+            ],
+        }
+
+        _add_truncation_stats(results, samples)
+
+        assert results["config"]["truncation"] == {
+            "race": {
+                "generated_samples": 0,
+                "truncated_samples": 0,
+                "truncation_rate": None,
+            },
+            "drop": {
+                "generated_samples": 1,
+                "truncated_samples": 1,
+                "truncation_rate": 1.0,
+            },
+        }
+        assert samples["drop"][0]["finish_reasons"] == ["length"]
+        assert samples["drop"][0]["truncated"] is True
+
+    def test_truncation_stats_support_local_completions(self):
+        class Generation(str):
+            finish_reason = "length"
+
+        results = {"config": {}}
+        samples = {"task": [{"resps": [Generation("unfinished")]}]}
+
+        _add_truncation_stats(results, samples)
+
+        assert results["config"]["truncation"] == {
+            "task": {
+                "generated_samples": 1,
+                "truncated_samples": 1,
+                "truncation_rate": 1.0,
+            }
+        }
+        assert samples["task"][0]["truncated"] is True
 
     @patch("lm_eval.tasks.TaskManager")
     def test_process_tasks_comma_separated_in_list(self, mock_task_manager):
@@ -844,7 +908,62 @@ class TestMergeDictAction:
 
 
 class TestEvaluatorConfigPrecedence:
-    """Test EvaluatorConfig merging precedence: CLI args > YAML config > built-in defaults."""
+    """Test EvaluatorConfig merging precedence: CLI > file > defaults."""
+
+    def test_toml_config_and_relative_include(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        base = tmp_path / "base.toml"
+        base.write_text(
+            """
+model = "rwkv7-http"
+tasks = ["race", "drop"]
+output_path = "results/formal"
+log_samples = true
+
+[model_args]
+model = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+rwkv_generation_prompt = "fake_think"
+""",
+            encoding="utf-8",
+        )
+        smoke = tmp_path / "smoke.toml"
+        smoke.write_text(
+            """
+include = "base.toml"
+tasks = ["race"]
+limit = 2
+output_path = "results/smoke"
+
+[model_args]
+rwkv_generation_prompt = "open_think"
+""",
+            encoding="utf-8",
+        )
+
+        cfg = EvaluatorConfig.from_config(smoke)
+
+        assert cfg.model == "rwkv7-http"
+        assert cfg.tasks == ["race"]
+        assert cfg.limit == 2
+        assert cfg.output_path == "results/smoke"
+        assert cfg.model_args == {
+            "model": "rwkv7-g1i-1.5b-20260805-ctx16384",
+            "base_url": "http://127.0.0.1:8000/v1/completions",
+            "rwkv_generation_prompt": "open_think",
+        }
+
+    def test_toml_config_include_cycle_is_rejected(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        first = tmp_path / "first.toml"
+        second = tmp_path / "second.toml"
+        first.write_text('include = "second.toml"', encoding="utf-8")
+        second.write_text('include = "first.toml"', encoding="utf-8")
+
+        with pytest.raises(ValueError, match="include cycle"):
+            EvaluatorConfig.load_config(first)
 
     def test_cli_overrides_yaml_overrides_defaults(self, tmp_path):
         """Test full precedence chain: CLI args > YAML config > built-in defaults."""

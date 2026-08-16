@@ -1,0 +1,9 @@
+group: rwkv7_g1i_1_5b_20260805_ctx16384_infinitebench
+group_alias: InfiniteBench (RWKV7 g1i 1.5B 20260805 ctx16384)
+task:
+  - group: infinitebench
+    metadata:
+      version: 1.0
+      benchmark_name: infinitebench
+metadata:
+  version: 1.0
