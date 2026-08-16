@@ -2,7 +2,7 @@
 .DS_Store
 
 # Virtual environments
-.venv/
+.venv
 venv/
 ENV/
 env/
@@ -27,6 +27,7 @@ ipython_config.py
 
 # Output and data
 output/
+results/
 data/
 temp/
 test_logs/
