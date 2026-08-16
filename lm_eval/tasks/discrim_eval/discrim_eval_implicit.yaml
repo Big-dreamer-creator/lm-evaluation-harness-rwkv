@@ -3,6 +3,8 @@ tag:
 task: discrim_eval_implicit
 dataset_path: Anthropic/discrim-eval
 dataset_name: implicit
+dataset_kwargs:
+  revision: 6986d6ea802e019d01e94dd59597e94fbd8f8c4a
 target_delimiter: ""
 validation_split: null
 test_split: train
