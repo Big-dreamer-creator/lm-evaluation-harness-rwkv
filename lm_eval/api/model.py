@@ -259,6 +259,9 @@ class CachingLM:
 
         self.lm: LM = lm
         self.cache_db: str = cache_db
+        self.cache_sampled_generations = (
+            os.environ.get("LMEVAL_CACHE_SAMPLED_GENERATIONS") == "1"
+        )
         if os.path.dirname(cache_db):
             os.makedirs(os.path.dirname(cache_db), exist_ok=True)
         self.dbdict = SqliteDict(cache_db, autocommit=True, outer_stack=False)
@@ -282,7 +285,11 @@ class CachingLM:
             )
             for req in tqdm(requests, desc="Checking cached requests"):
                 hsh = hash_args(attr, req.args)
-                if attr == "generate_until" and req.args[1].get("do_sample", False):
+                if (
+                    attr == "generate_until"
+                    and req.args[1].get("do_sample", False)
+                    and not self.cache_sampled_generations
+                ):
                     # when we are doing non-greedy generation, don't use the cache
                     # (else every "randomly sampled" generation would be identical for repeats > 1).
                     if not warned:
