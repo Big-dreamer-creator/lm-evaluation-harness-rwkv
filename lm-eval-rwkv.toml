@@ -1,4 +1,5 @@
-# Complete RWKV7 evaluation entrypoint. Benchmark protocol lives in task YAML.
+# Validated RWKV7 1.5B preset. Copy it for another checkpoint or task set.
+# Benchmark protocol lives in task YAML; server identity lives in model_args.
 model = "rwkv7-http"
 tasks = ["rwkv7_g1i_1_5b_20260805_ctx16384"]
 batch_size = 1
@@ -14,6 +15,7 @@ model = "rwkv7-g1i-1.5b-20260805-ctx16384"
 base_url = "http://127.0.0.1:8000/v1/completions"
 rwkv_prompt_template = "assistant"
 rwkv_generation_prompt = "fake_think"
+rwkv_sampling_mode = "profile"
 num_concurrent = 5
 max_length = 16384
 

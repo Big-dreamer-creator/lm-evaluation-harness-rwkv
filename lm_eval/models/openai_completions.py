@@ -79,7 +79,7 @@ class _VLLMRWKVTokenizer(RemoteTokenizer):
 
 
 class _CompletionGeneration(str):
-    def __new__(cls, text: str, finish_reason: str | None):
+    def __new__(cls, text: str, finish_reason: str | None = None):
         value = super().__new__(cls, text)
         value.finish_reason = finish_reason
         return value
@@ -231,6 +231,7 @@ class RWKV7HTTP(LocalCompletionsAPI):
         "function_calling": "\n### User",
     }
     GENERATION_PROMPTS = {"open_think", "fake_think"}
+    SAMPLING_MODES = {"profile", "task"}
     SAMPLING_PROFILES = {
         "open_think": {
             "temperature": 0.96,
@@ -259,6 +260,9 @@ class RWKV7HTTP(LocalCompletionsAPI):
         max_length=16384,
         rwkv_prompt_template="assistant",
         rwkv_generation_prompt="open_think",
+        rwkv_sampling_mode="profile",
+        rwkv_system_prompt=None,
+        rwkv_system_prompt_pattern=None,
         cot_mode=None,
         tokenized_requests=True,
         verify_certificate=True,
@@ -268,10 +272,11 @@ class RWKV7HTTP(LocalCompletionsAPI):
         max_retries=3,
         **kwargs,
     ):
-        model = model or pretrained or self.DEFAULT_MODEL
-        if model != self.DEFAULT_MODEL:
+        model = model or pretrained
+        if not isinstance(model, str) or not model.strip():
             raise ValueError(
-                f"rwkv7-http serves {self.DEFAULT_MODEL!r}; got model={model!r}."
+                "rwkv7-http requires model= or pretrained= with the complete "
+                "served model name."
             )
         if cot_mode is not None:
             rwkv_generation_prompt = cot_mode
@@ -285,6 +290,11 @@ class RWKV7HTTP(LocalCompletionsAPI):
                 "rwkv_generation_prompt/cot_mode must be one of: "
                 + ", ".join(sorted(self.GENERATION_PROMPTS))
             )
+        if rwkv_sampling_mode not in self.SAMPLING_MODES:
+            raise ValueError(
+                "rwkv_sampling_mode must be one of: "
+                + ", ".join(sorted(self.SAMPLING_MODES))
+            )
         if tokenizer_backend != "remote":
             raise ValueError(
                 "rwkv7-http requires tokenizer_backend=remote so inference "
@@ -297,6 +307,9 @@ class RWKV7HTTP(LocalCompletionsAPI):
 
         self.rwkv_prompt_template = rwkv_prompt_template
         self.rwkv_generation_prompt = rwkv_generation_prompt
+        self.rwkv_sampling_mode = rwkv_sampling_mode
+        self.rwkv_system_prompt = rwkv_system_prompt
+        self.rwkv_system_prompt_pattern = rwkv_system_prompt_pattern
 
         super().__init__(
             base_url=base_url,
@@ -331,9 +344,16 @@ class RWKV7HTTP(LocalCompletionsAPI):
 
     @property
     def tokenizer_name(self) -> str:
+        system_prompt_sha256 = hashlib.sha256(
+            (
+                f"{self.rwkv_system_prompt or ''}\0"
+                f"{self.rwkv_system_prompt_pattern or ''}"
+            ).encode("utf-8")
+        ).hexdigest()
         return (
-            f"{self.DEFAULT_MODEL}:{self._chat_template_sha256}:"
-            f"{self.rwkv_prompt_template}:{self.rwkv_generation_prompt}"
+            f"{self.model}:{self._chat_template_sha256}:"
+            f"{self.rwkv_prompt_template}:{self.rwkv_generation_prompt}:"
+            f"{self.rwkv_sampling_mode}:{system_prompt_sha256}"
         )
 
     @cached_property
@@ -359,6 +379,38 @@ class RWKV7HTTP(LocalCompletionsAPI):
     ) -> str:
         from lm_eval.utils import env
 
+        use_system_prompt = bool(self.rwkv_system_prompt) and (
+            not self.rwkv_system_prompt_pattern
+            or any(
+                self.rwkv_system_prompt_pattern.casefold()
+                in str(message.get("content", "")).casefold()
+                for message in chat_history
+            )
+        )
+        if use_system_prompt:
+            chat_history = [dict(message) for message in chat_history]
+            if chat_history and chat_history[0]["role"] == "system":
+                chat_history[0]["content"] = (
+                    f"{chat_history[0]['content'].rstrip()}\n\n"
+                    f"{self.rwkv_system_prompt}"
+                )
+            else:
+                chat_history.insert(
+                    0,
+                    {"role": "system", "content": self.rwkv_system_prompt},
+                )
+        if (
+            not add_generation_prompt
+            and self.rwkv_generation_prompt == "fake_think"
+            and chat_history
+            and chat_history[-1]["role"] == "assistant"
+            and not chat_history[-1]["content"].startswith("<think></think>")
+        ):
+            chat_history = [*chat_history]
+            chat_history[-1] = {
+                **chat_history[-1],
+                "content": f"<think></think>\n{chat_history[-1]['content']}",
+            }
         render_kwargs = {
             "tools": kwargs.pop("tools", None),
             "rwkv_prompt_template": self.rwkv_prompt_template,
@@ -456,15 +508,16 @@ class RWKV7HTTP(LocalCompletionsAPI):
         gen_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> dict:
+        gen_kwargs = dict(gen_kwargs or {})
+        do_sample = gen_kwargs.get("do_sample")
         payload = super()._create_payload(
             messages,
             generate=generate,
-            gen_kwargs=gen_kwargs or {},
+            gen_kwargs=gen_kwargs,
             **kwargs,
         )
         payload.pop("seed", None)
         if generate:
-            profile = self.SAMPLING_PROFILES[self.rwkv_generation_prompt]
             for name in (
                 "temperature",
                 "top_p",
@@ -473,8 +526,15 @@ class RWKV7HTTP(LocalCompletionsAPI):
                 "frequency_penalty",
                 "penalty_decay",
             ):
-                payload.pop(name, None)
-            payload.update(profile)
+                if do_sample is False or self.rwkv_sampling_mode == "profile":
+                    payload.pop(name, None)
+            if do_sample is False:
+                payload["temperature"] = 1
+                payload["top_k"] = 1
+            elif self.rwkv_sampling_mode == "profile":
+                payload.update(
+                    self.SAMPLING_PROFILES[self.rwkv_generation_prompt]
+                )
             if not payload["stop"]:
                 payload["stop"] = [self.PROMPT_STOPS[self.rwkv_prompt_template]]
         else:

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import pickle
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -89,6 +90,11 @@ def test_local_completions_preserves_finish_reason(api):
     assert generations[0].finish_reason == "stop"
     assert generations[1].finish_reason == "length"
 
+    restored = pickle.loads(pickle.dumps(generations))
+    assert restored == generations
+    assert restored[0].finish_reason == "stop"
+    assert restored[1].finish_reason == "length"
+
 
 def test_rwkv7_http_template_and_sampling_profiles(monkeypatch):
     class FakeRemoteTokenizer:
@@ -116,20 +122,45 @@ def test_rwkv7_http_template_and_sampling_profiles(monkeypatch):
         "lm_eval.models.openai_completions._VLLMRWKVTokenizer",
         FakeRemoteTokenizer,
     )
+    served_model = "rwkv7-g1h-7.2b-20260710-ctx10240"
     model = RWKV7HTTP(
-        model=RWKV7HTTP.DEFAULT_MODEL,
+        model=served_model,
         base_url="http://test-url.com/v1/completions",
         num_concurrent=1,
     )
 
+    assert model.model == served_model
+    assert model.tokenizer_name.startswith(f"{served_model}:")
+
     assert model.apply_chat_template(
         [{"role": "user", "content": "hello"}]
     ) == "assistant|open_think|hello|True"
+    model.rwkv_system_prompt = "Copy identifiers exactly."
+    model._chat_template_source = (
+        "{{ messages[0]['role'] }}|{{ messages[0]['content'] }}|"
+        "{{ messages[1]['content'] if messages|length > 1 else '' }}"
+    )
+    assert model.apply_chat_template(
+        [{"role": "user", "content": "hello"}]
+    ) == "system|Copy identifiers exactly.|hello"
+    model.rwkv_system_prompt_pattern = "special magic"
+    assert model.apply_chat_template(
+        [{"role": "user", "content": "hello"}]
+    ) == "user|hello|"
+    assert model.apply_chat_template(
+        [{"role": "user", "content": "Find the special magic key"}]
+    ) == "system|Copy identifiers exactly.|Find the special magic key"
+    model.rwkv_system_prompt = None
+    model.rwkv_system_prompt_pattern = None
+    model._chat_template_source = (
+        "{{ rwkv_prompt_template }}|{{ rwkv_generation_prompt }}|"
+        "{{ messages[0]['content'] }}|{{ add_generation_prompt }}"
+    )
     assert model._create_payload(
         ["prompt"], generate=True, gen_kwargs={"max_gen_toks": 4, "temperature": 0.1}
     ) == {
         "prompt": ["prompt"],
-        "model": RWKV7HTTP.DEFAULT_MODEL,
+        "model": served_model,
         "max_tokens": 4,
         "temperature": 0.96,
         "stop": ["\nUser:"],
@@ -148,6 +179,13 @@ def test_rwkv7_http_template_and_sampling_profiles(monkeypatch):
     assert model.apply_chat_template(
         [{"role": "user", "content": "hello"}]
     ) == "<think></think>\n"
+    model._chat_template_source = (
+        "{{ messages[-1]['content'] }}|{{ add_generation_prompt }}"
+    )
+    assert model.apply_chat_template(
+        [{"role": "assistant", "content": "Answer:"}],
+        add_generation_prompt=False,
+    ) == "<think></think>\nAnswer:|False"
     fake_payload = model._create_payload(
         ["prompt"], generate=True, gen_kwargs={"max_gen_toks": 4}
     )
@@ -155,6 +193,34 @@ def test_rwkv7_http_template_and_sampling_profiles(monkeypatch):
         key: fake_payload[key]
         for key in ("temperature", "top_p", "top_k")
     } == {"temperature": 1.0, "top_p": 0.28, "top_k": 32}
+
+    greedy_payload = model._create_payload(
+        ["prompt"],
+        generate=True,
+        gen_kwargs={
+            "max_gen_toks": 4,
+            "do_sample": False,
+            "temperature": 0.0,
+        },
+    )
+    assert greedy_payload["temperature"] == 1
+    assert greedy_payload["top_k"] == 1
+    assert "top_p" not in greedy_payload
+
+    model.rwkv_sampling_mode = "task"
+    task_payload = model._create_payload(
+        ["prompt"],
+        generate=True,
+        gen_kwargs={
+            "max_gen_toks": 4,
+            "do_sample": True,
+            "temperature": 0.2,
+            "top_p": 0.95,
+        },
+    )
+    assert task_payload["temperature"] == 0.2
+    assert task_payload["top_p"] == 0.95
+    assert "top_k" not in task_payload
 
     logprobs_payload = model._create_payload(
         [[1, 2]], generate=False, gen_kwargs=None
@@ -237,7 +303,11 @@ def test_rwkv7_http_likelihood_request_adds_one_bos(monkeypatch):
         "lm_eval.models.openai_completions._VLLMRWKVTokenizer",
         BoundaryTokenizer,
     )
+    with pytest.raises(ValueError, match="complete served model name"):
+        RWKV7HTTP(num_concurrent=1)
+
     model = RWKV7HTTP(
+        model=RWKV7HTTP.DEFAULT_MODEL,
         num_concurrent=1,
     )
     context, continuation = model._encode_pair("hello", " world")

@@ -37,13 +37,20 @@ Configure the launcher to pass `--enable-tokenizer-info-endpoint`. The service
 must expose `/tokenizer_info` so lm-eval receives the same official RWKV chat
 template used by the inference backend.
 
-Then run every benchmark adapted for `rwkv7-g1i-1.5b-20260805-ctx16384` with the repository config:
+The root `lm-eval-rwkv.toml` is a validated preset for
+`rwkv7-g1i-1.5b-20260805-ctx16384`. Run it directly with:
 
 ```bash
 uv run --no-sync python -m lm_eval run -C lm-eval-rwkv.toml
 ```
 
-The TOML owns the model endpoint, concurrency, complete task set, and result location. Each benchmark YAML owns its prompt, generation limits, filters, and metrics. The deprecated `temp/` launch scripts are not used.
+The `rwkv7-http` backend itself accepts any RWKV7 served model name. For another
+checkpoint size or revision, copy the preset and change `model`, `max_length`,
+`tasks`, `output_path`, and matching metadata. The TOML owns the model endpoint,
+concurrency, task set, and result location. Each benchmark YAML owns its prompt,
+generation limits, filters, and metrics. See the
+[RWKV evaluation guide](../RWKV_EVALUATION_GUIDE.md) for the complete server and
+evaluation workflow. The deprecated `temp/` launch scripts are not used.
 
 ## Config Schema
 
