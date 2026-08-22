@@ -1,0 +1,14 @@
+include: ../graphwalks/graphwalks_128k.yaml
+task: rwkv7_g1i_1_5b_20260805_ctx16384_graphwalks
+task_alias: GraphWalks 16K comparable subset (RWKV7 g1i 1.5B 20260805 ctx16384)
+doc_to_text: !function lm_eval.tasks.graphwalks.utils.doc_to_text_rwkv
+process_results: !function lm_eval.tasks.graphwalks.utils.process_results_rwkv
+generation_kwargs:
+  until:
+    - "\n"
+  max_gen_toks: 512
+metadata:
+  version: 1.3
+  benchmark_name: graphwalks
+  task_adapter: rwkv7-http
+  evaluation_scope: 128k_and_shorter_ctx16384_subset
