@@ -1,0 +1,35 @@
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = [
+  "rwkv7_g1i_1_5b_20260805_ctx16384_moral_stories",
+  "rwkv7_g1i_1_5b_20260805_ctx16384_haerae",
+  "rwkv7_g1i_1_5b_20260805_ctx16384_jsonschema_bench",
+  "rwkv7_g1i_1_5b_20260805_ctx16384_gsm8k_platinum",
+  "rwkv7_g1i_1_5b_20260805_ctx16384_aexams",
+]
+output_dir = "results/formal-rwkv-five-benchmarks-20260821/rwkv7-g1i-1.5b-20260805-ctx16384"
+max_length = 16384
+batch_size = 1
+num_concurrent = 25
+device = "cpu"
+include_defaults = false
+include_path = [
+  "lm_eval/tasks/moral_stories",
+  "lm_eval/tasks/haerae",
+  "lm_eval/tasks/jsonschema_bench",
+  "lm_eval/tasks/gsm8k_platinum",
+  "lm_eval/tasks/aexams",
+  "lm_eval/tasks/rwkv7_g1i_1_5b_20260805_ctx16384",
+]
+apply_chat_template = true
+fewshot_as_multiturn = true
+log_samples = true
+seed = [0, 1234, 1234, 1234]
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
