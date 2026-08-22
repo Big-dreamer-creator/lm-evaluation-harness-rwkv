@@ -12,6 +12,156 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
 
+_ALBATROSS_ANSWER_MARKUP = re.compile(r"\*\*|__|`")
+
+
+def _albatross_last_answer(
+    text: str, patterns: tuple[re.Pattern[str], ...]
+) -> str | None:
+    matches = [
+        (match.start(), match.group(1).upper())
+        for pattern in patterns
+        for match in pattern.finditer(text)
+    ]
+    return max(matches, key=lambda item: item[0])[1] if matches else None
+
+
+def extract_albatross_mcq_answer(
+    text: str,
+    *,
+    choice_labels: str = "ABCD",
+    require_think_close: bool = False,
+) -> str | None:
+    """Extract the final letter using Albatross GPQA-style precedence."""
+    if not isinstance(text, str):
+        return None
+    labels = "".join(dict.fromkeys(choice_labels.upper()))
+    if not labels or any(not label.isalpha() or len(label) != 1 for label in labels):
+        raise ValueError("choice_labels must contain unique alphabetic characters")
+    if require_think_close and "</think>" not in text:
+        return None
+
+    label_class = re.escape(labels)
+    answer_patterns = (
+        re.compile(
+            rf"\\boxed\s*\{{\s*(?:\\(?:text|mathrm)\s*\{{\s*)?"
+            rf"\(?\s*([{label_class}])\s*\)?\s*\}}?\s*\}}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?i:(?:final\s+answer|correct\s+answer|answer)\s*"
+            rf"(?:(?:choice|option)\s*)?(?:is\s*|[:=]\s*)"
+            rf"(?:(?:choice|option)\s*)?\(?\s*)([{label_class}])"
+            rf"(?i:\s*\)?)"
+        ),
+        re.compile(
+            rf"(?i:(?:(?:choice|option)\s*)?\(?\s*)([{label_class}])"
+            rf"(?i:\s*\)?\s+is\s+(?:the\s+)?"
+            rf"(?:final\s+|correct\s+)?answer)"
+        ),
+    )
+    fallback_patterns = (
+        re.compile(
+            rf"(?i:\b(?:choose|select|pick)\s+"
+            rf"(?:(?:choice|option|answer)\s*)?[:=]?\s*\(?\s*)"
+            rf"([{label_class}])(?i:\s*\)?\b)"
+        ),
+        re.compile(
+            rf"(?i:\b(?:corresponds?|maps?)\s+to\s+"
+            rf"(?:(?:choice|option|answer)\s*)?\(?\s*)"
+            rf"([{label_class}])(?i:\s*\)?\b)"
+        ),
+        re.compile(
+            rf"(?i:\b(?:therefore|thus|hence|so|consequently)[,:]?\s+"
+            rf"(?:the\s+)?(?:(?:correct|final)\s+)?"
+            rf"(?:answer|choice|option)\s+(?:is|would\s+be)\s+\(?\s*)"
+            rf"([{label_class}])(?i:\s*\)?\b)"
+        ),
+        re.compile(
+            rf"(?i:\b\(?\s*)([{label_class}])"
+            rf"(?i:\s*\)?\s+(?:is|would\s+be)\s+(?:the\s+)?"
+            rf"(?:best|correct|final)\s+(?:answer|choice|option)\b)"
+        ),
+    )
+    think_final_pattern = re.compile(
+        rf"(?i:\b(?:final\s+answer|correct\s+(?:answer|choice|option))\s*"
+        rf"(?:is\s*|[:=]\s*)?(?:\\boxed\s*\{{\s*)?"
+        rf"(?:\\(?:text|mathrm)\s*\{{\s*)?\(?\s*)"
+        rf"([{label_class}])(?i:\s*\)?)"
+    )
+
+    before_think, think_closed, answer_text = text.rpartition("</think>")
+    answer_text = _ALBATROSS_ANSWER_MARKUP.sub(
+        "", answer_text if think_closed else text
+    )
+    answer = _albatross_last_answer(answer_text, answer_patterns)
+    if answer is None:
+        answer = _albatross_last_answer(answer_text, fallback_patterns)
+    if answer is not None:
+        return answer
+    for line in reversed(answer_text.splitlines()):
+        match = re.fullmatch(
+            rf"\s*(?:final\s+answer\s*[:=]?\s*)?"
+            rf"[\[(]?([{label_class}])[\])]?[.!]?\s*",
+            line,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).upper()
+    if think_closed:
+        matches = list(
+            think_final_pattern.finditer(_ALBATROSS_ANSWER_MARKUP.sub("", before_think))
+        )
+        if matches:
+            return matches[-1].group(1).upper()
+    return None
+
+
+@register_filter("albatross_mcq")
+class AlbatrossMultiChoiceFilter(Filter):
+    """Apply the authoritative Albatross final-answer extraction order."""
+
+    def __init__(
+        self,
+        choice_labels: str = "ABCD",
+        require_think_close: bool = False,
+        fallback: str = "[invalid]",
+        regex_pattern: str | None = None,
+    ) -> None:
+        if regex_pattern:
+            legacy_labels = re.search(r"\[([A-Z]+)\]", regex_pattern)
+            if legacy_labels:
+                choice_labels = legacy_labels.group(1)
+        self.choice_labels = choice_labels
+        self.require_think_close = require_think_close
+        self.fallback = fallback
+        self.regex_pattern = (
+            re.compile(regex_pattern, re.IGNORECASE) if regex_pattern else None
+        )
+
+    def apply(
+        self, resps: Iterable[Sequence[str]], docs: Sequence[dict[str, Any]]
+    ) -> list[list[str]]:
+        return [
+            [
+                (
+                    _albatross_last_answer(response, (self.regex_pattern,))
+                    if self.regex_pattern is not None
+                    and (not self.require_think_close or "</think>" in response)
+                    else None
+                )
+                or extract_albatross_mcq_answer(
+                    response,
+                    choice_labels=self.choice_labels,
+                    require_think_close=self.require_think_close,
+                )
+                or self.fallback
+                for response in response_set
+            ]
+            for response_set in resps
+        ]
+
+
 @register_filter("regex")
 class RegexFilter(Filter):
     """A filter that extracts values from text using regex pattern matching.
