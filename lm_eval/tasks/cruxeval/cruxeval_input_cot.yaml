@@ -24,3 +24,5 @@ filter_list:
         filter_fn: !function utils.build_predictions_input_cot
 metadata:
   version: 1.0
+  benchmark_name: cruxeval
+  task_adapter: rwkv7-http

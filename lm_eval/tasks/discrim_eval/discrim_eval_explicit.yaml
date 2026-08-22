@@ -38,3 +38,5 @@ metric_list:
     higher_is_better: false
 metadata:
   version: 1.0
+  benchmark_name: discrim_eval
+  task_adapter: rwkv7-http

@@ -1,5 +1,6 @@
 import argparse
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -390,6 +391,7 @@ class TestEvaluatorConfigTaskLoading:
 
         mock_task_manager.assert_called_once_with(
             include_path=None,
+            include_defaults=True,
             metadata={},
         )
 
@@ -910,21 +912,49 @@ class TestMergeDictAction:
 class TestEvaluatorConfigPrecedence:
     """Test EvaluatorConfig merging precedence: CLI > file > defaults."""
 
+    def test_rwkv_preset_lists_all_validated_benchmarks(self):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config_path = Path(__file__).parents[1] / "configs/eval/lm_eval.toml"
+        config = EvaluatorConfig.from_config(config_path)
+
+        assert config.tasks == [
+            "race",
+            "drop",
+            "xquad",
+            "babilong",
+            "infinitebench",
+            "ruler",
+            "wmdp",
+            "cruxeval",
+            "inverse_scaling_prize",
+            "model_written_evals",
+            "humaneval_infilling",
+            "mutual",
+            "mc_taco",
+            "discrim_eval",
+            "winogender",
+        ]
+
     def test_toml_config_and_relative_include(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
 
         base = tmp_path / "base.toml"
         base.write_text(
             """
-model = "rwkv7-http"
-tasks = ["race", "drop"]
-output_path = "results/formal"
-log_samples = true
-
-[model_args]
-model = "rwkv7-g1i-1.5b-20260805-ctx16384"
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
 base_url = "http://127.0.0.1:8000/v1/completions"
-rwkv_generation_prompt = "fake_think"
+benchmarks = ["race", "drop"]
+output_dir = "results/formal"
+max_length = 16384
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
 """,
             encoding="utf-8",
         )
@@ -932,12 +962,12 @@ rwkv_generation_prompt = "fake_think"
         smoke.write_text(
             """
 include = "base.toml"
-tasks = ["race"]
+benchmarks = ["race"]
 limit = 2
-output_path = "results/smoke"
+output_dir = "results/smoke"
 
-[model_args]
-rwkv_generation_prompt = "open_think"
+[rwkv_profile]
+generation_prompt = "open_think"
 """,
             encoding="utf-8",
         )
@@ -951,8 +981,14 @@ rwkv_generation_prompt = "open_think"
         assert cfg.model_args == {
             "model": "rwkv7-g1i-1.5b-20260805-ctx16384",
             "base_url": "http://127.0.0.1:8000/v1/completions",
+            "rwkv_prompt_template": "assistant",
             "rwkv_generation_prompt": "open_think",
+            "rwkv_sampling_mode": "profile",
+            "num_concurrent": 5,
+            "max_length": 16384,
         }
+        assert cfg.metadata["wkv_mode"] == "fp32io16"
+        assert cfg.metadata["cot_mode"] == "open_think"
 
     def test_toml_config_include_cycle_is_rejected(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
@@ -964,6 +1000,255 @@ rwkv_generation_prompt = "open_think"
 
         with pytest.raises(ValueError, match="include cycle"):
             EvaluatorConfig.load_config(first)
+
+    def test_versioned_config_rejects_unknown_fields(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/race"
+max_length = 16384
+model_args = "deprecated"
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="Unknown versioned config fields"):
+            EvaluatorConfig.load_config(config)
+
+    def test_versioned_config_rejects_duplicate_benchmarks(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["race", "race"]
+output_dir = "results/race"
+max_length = 16384
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="duplicate benchmarks: race"):
+            EvaluatorConfig.load_config(config)
+
+    def test_versioned_config_accepts_explicit_samples(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["graphwalks"]
+output_dir = "results/graphwalks"
+max_length = 16384
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
+
+[samples]
+rwkv_graphwalks = [0, 4, 9]
+""",
+            encoding="utf-8",
+        )
+
+        loaded = EvaluatorConfig.load_config(config)
+
+        assert loaded["samples"] == {"rwkv_graphwalks": [0, 4, 9]}
+
+    def test_versioned_config_accepts_targeted_task_roots(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["graphwalks"]
+output_dir = "results/graphwalks"
+max_length = 16384
+include_defaults = false
+include_path = ["lm_eval/tasks/graphwalks", "lm_eval/tasks/rwkv_adapter"]
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        loaded = EvaluatorConfig.load_config(config)
+
+        assert loaded["include_defaults"] is False
+        assert loaded["include_path"] == [
+            "lm_eval/tasks/graphwalks",
+            "lm_eval/tasks/rwkv_adapter",
+        ]
+
+    @pytest.mark.parametrize("indices", ["[]", "[0, 0]", "[-1]"])
+    def test_versioned_config_rejects_invalid_samples(self, tmp_path, indices):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            f"""
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["graphwalks"]
+output_dir = "results/graphwalks"
+max_length = 16384
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
+
+[samples]
+rwkv_graphwalks = {indices}
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="samples.rwkv_graphwalks"):
+            EvaluatorConfig.load_config(config)
+
+    def test_versioned_config_preserves_benchmark_order(self, tmp_path, monkeypatch):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        class OrderedTaskManager:
+            def __init__(self, **_kwargs):
+                pass
+
+            @staticmethod
+            def resolve_adapter_tasks(tasks, adapter):
+                assert adapter == "rwkv7-http"
+                return [f"adapted::{task}" for task in tasks]
+
+            @staticmethod
+            def match_tasks(tasks):
+                return tasks
+
+        monkeypatch.setattr("lm_eval.tasks.TaskManager", OrderedTaskManager)
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["race", "drop", "xquad"]
+output_dir = "results/formal"
+max_length = 16384
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        loaded = EvaluatorConfig.from_config(config)
+        loaded.process_tasks()
+
+        assert loaded.tasks == ["adapted::race", "adapted::drop", "adapted::xquad"]
+
+    @pytest.mark.parametrize(
+        "field",
+        ["doc_to_text", "filter_list", "metric_list", "until", "max_gen_toks"],
+    )
+    def test_versioned_config_rejects_task_protocol_fields(self, tmp_path, field):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            f"""
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/race"
+max_length = 16384
+{field} = "task-owned"
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ValueError, match=f"Unknown versioned config fields: {field}"
+        ):
+            EvaluatorConfig.load_config(config)
+
+    def test_versioned_config_rejects_unknown_profile_fields(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/race"
+max_length = 16384
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
+metric = "exact_match"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="Unknown RWKV profile fields: metric"):
+            EvaluatorConfig.load_config(config)
 
     def test_cli_overrides_yaml_overrides_defaults(self, tmp_path):
         """Test full precedence chain: CLI args > YAML config > built-in defaults."""

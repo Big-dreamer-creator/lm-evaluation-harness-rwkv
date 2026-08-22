@@ -222,6 +222,7 @@ class RWKV7HTTP(LocalCompletionsAPI):
     and renders the official chat template published by that service.
     """
 
+    TASK_ADAPTER = "rwkv7-http"
     DEFAULT_MODEL = "rwkv7-g1i-1.5b-20260805-ctx16384"
     DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1/completions"
     PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
@@ -528,13 +529,13 @@ class RWKV7HTTP(LocalCompletionsAPI):
             ):
                 if do_sample is False or self.rwkv_sampling_mode == "profile":
                     payload.pop(name, None)
-            if do_sample is False:
-                payload["temperature"] = 1
-                payload["top_k"] = 1
-            elif self.rwkv_sampling_mode == "profile":
+            if self.rwkv_sampling_mode == "profile":
                 payload.update(
                     self.SAMPLING_PROFILES[self.rwkv_generation_prompt]
                 )
+            elif do_sample is False:
+                payload["temperature"] = 1
+                payload["top_k"] = 1
             if not payload["stop"]:
                 payload["stop"] = [self.PROMPT_STOPS[self.rwkv_prompt_template]]
         else:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from collections import defaultdict
 from itertools import chain
@@ -82,6 +83,8 @@ class TaskManager:
         if include_defaults:
             all_paths.append(Path(__file__).parent)
         if include_path:
+            if isinstance(include_path, str):
+                include_path = include_path.split(os.pathsep)
             all_paths += [
                 Path(p)
                 for p in (
@@ -309,6 +312,56 @@ class TaskManager:
     def match_tasks(self, task_list: list[str]) -> list[str]:
         """Match task names using glob patterns."""
         return utils.pattern_match(task_list, self.all_tasks)
+
+    def resolve_adapter_tasks(
+        self, task_list: Sequence[str], adapter: str
+    ) -> list[str]:
+        """Resolve public benchmark names through a declared task adapter.
+
+        Adapter aliases are declared in task YAML metadata with
+        ``task_adapter`` and ``benchmark_name``. This keeps model-specific
+        protocol in task YAML while run configurations expose stable names.
+        """
+        aliases: dict[str, list[str]] = {}
+        adapter_tasks: set[str] = set()
+        for name, entry in self._index.items():
+            metadata = (
+                entry.cfg.get("metadata") if isinstance(entry.cfg, dict) else None
+            )
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("task_adapter") != adapter
+            ):
+                continue
+            benchmark_name = metadata.get("benchmark_name")
+            if (
+                not isinstance(benchmark_name, str)
+                or not benchmark_name
+                or benchmark_name != benchmark_name.strip()
+            ):
+                raise ValueError(
+                    f"Task adapter {adapter!r} entry {name!r} must declare "
+                    "metadata.benchmark_name"
+                )
+            targets = aliases.setdefault(benchmark_name, [])
+            if name not in targets:
+                targets.append(name)
+            adapter_tasks.add(name)
+
+        resolved: list[str] = []
+        missing: list[str] = []
+        for selector in task_list:
+            if selector in aliases:
+                resolved.extend(aliases[selector])
+            elif selector in adapter_tasks:
+                resolved.append(selector)
+            else:
+                missing.append(selector)
+        if missing:
+            raise ValueError(
+                f"No {adapter} task adapter is registered for: {', '.join(missing)}"
+            )
+        return resolved
 
     def list_all_tasks(
         self,

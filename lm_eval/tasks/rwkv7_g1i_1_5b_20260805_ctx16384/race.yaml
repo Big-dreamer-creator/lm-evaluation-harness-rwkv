@@ -4,3 +4,4 @@ task_alias: RACE (RWKV7 g1i 1.5B 20260805 ctx16384)
 metadata:
   version: 1.0
   benchmark_name: race
+  task_adapter: rwkv7-http

@@ -510,6 +510,136 @@ class TestTaskManagerIntegration:
         assert "arc_easy" in matches
         assert "arc_challenge" in matches
 
+    def test_resolve_adapter_tasks(self, tmp_path):
+        """Public benchmark names resolve through task YAML metadata."""
+        (tmp_path / "native.yaml").write_text("task: race\ndataset_path: native")
+        (tmp_path / "adapted.yaml").write_text(
+            """
+task: rwkv_race
+dataset_path: adapted
+metadata:
+  benchmark_name: race
+  task_adapter: rwkv7-http
+"""
+        )
+        (tmp_path / "adapted_second.yaml").write_text(
+            """
+task: rwkv_race_second
+dataset_path: adapted
+metadata:
+  benchmark_name: race
+  task_adapter: rwkv7-http
+"""
+        )
+        task_manager = TaskManager(include_path=str(tmp_path), include_defaults=False)
+
+        assert task_manager.resolve_adapter_tasks(["race"], "rwkv7-http") == [
+            "rwkv_race",
+            "rwkv_race_second",
+        ]
+        with pytest.raises(
+            ValueError, match="No hf task adapter is registered for: race"
+        ):
+            task_manager.resolve_adapter_tasks(["race"], "hf")
+
+    def test_rwkv_adapter_exposes_public_benchmark_names(self):
+        adapter_path = Path(__file__).parents[1] / (
+            "lm_eval/tasks/rwkv7_g1i_1_5b_20260805_ctx16384"
+        )
+        task_manager = TaskManager(
+            include_path=adapter_path,
+            include_defaults=False,
+        )
+
+        assert task_manager.resolve_adapter_tasks(
+            [
+                "race",
+                "drop",
+                "xquad",
+                "babilong",
+                "infinitebench",
+                "graphwalks",
+                "multiblimp",
+                "logiqa2",
+                "tmmluplus",
+                "mmlu_prox",
+                "moral_stories",
+                "haerae",
+                "jsonschema_bench",
+                "gsm8k_platinum",
+                "aexams",
+            ],
+            "rwkv7-http",
+        ) == [
+            "rwkv7_g1i_1_5b_20260805_ctx16384_race",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_drop",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_xquad",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_babilong",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_infinitebench",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_graphwalks",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_multiblimp",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_logiqa2",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_tmmluplus",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_mmlu_prox",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_moral_stories",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_haerae",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_jsonschema_bench",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_gsm8k_platinum",
+            "rwkv7_g1i_1_5b_20260805_ctx16384_aexams",
+        ]
+
+    def test_rwkv_adapter_resolves_all_supported_benchmark_families(self):
+        task_root = Path(__file__).parents[1] / "lm_eval/tasks"
+        task_manager = TaskManager(
+            include_path=[
+                task_root / "rwkv7_g1i_1_5b_20260805_ctx16384",
+                task_root / "ruler",
+                task_root / "wmdp",
+                task_root / "cruxeval",
+                task_root / "inverse_scaling",
+                task_root / "model_written_evals",
+                task_root / "humaneval_infilling",
+                task_root / "mutual",
+                task_root / "mc_taco",
+                task_root / "discrim_eval",
+                task_root / "winogender",
+            ],
+            include_defaults=False,
+        )
+
+        expected_counts = {
+            "race": 1,
+            "drop": 1,
+            "xquad": 1,
+            "babilong": 1,
+            "infinitebench": 1,
+            "ruler": 1,
+            "wmdp": 1,
+            "cruxeval": 2,
+            "inverse_scaling_prize": 10,
+            "model_written_evals": 187,
+            "humaneval_infilling": 1,
+            "mutual": 1,
+            "mc_taco": 1,
+            "discrim_eval": 2,
+            "winogender": 7,
+            "graphwalks": 1,
+            "multiblimp": 1,
+            "logiqa2": 1,
+            "tmmluplus": 1,
+            "mmlu_prox": 1,
+            "moral_stories": 1,
+            "haerae": 1,
+            "jsonschema_bench": 1,
+            "gsm8k_platinum": 1,
+            "aexams": 1,
+        }
+        for benchmark, expected_count in expected_counts.items():
+            assert (
+                len(task_manager.resolve_adapter_tasks([benchmark], "rwkv7-http"))
+                == expected_count
+            )
+
     def test_name_is_registered(self, shared_task_manager):
         """_name_is_registered checks if name exists"""
         assert "arc_easy" in shared_task_manager._index

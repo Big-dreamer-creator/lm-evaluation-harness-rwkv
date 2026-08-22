@@ -203,9 +203,9 @@ def test_rwkv7_http_template_and_sampling_profiles(monkeypatch):
             "temperature": 0.0,
         },
     )
-    assert greedy_payload["temperature"] == 1
-    assert greedy_payload["top_k"] == 1
-    assert "top_p" not in greedy_payload
+    assert greedy_payload["temperature"] == 1.0
+    assert greedy_payload["top_p"] == 0.28
+    assert greedy_payload["top_k"] == 32
 
     model.rwkv_sampling_mode = "task"
     task_payload = model._create_payload(

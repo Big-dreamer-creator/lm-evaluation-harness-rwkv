@@ -18,3 +18,5 @@ aggregate_metric_list:
     weight_by_size: False
 metadata:
   version: 1
+  benchmark_name: ruler
+  task_adapter: rwkv7-http

@@ -1,0 +1,7 @@
+include: ../logiqa2/logiqa2.yaml
+task: rwkv7_g1i_1_5b_20260805_ctx16384_logiqa2
+task_alias: LogiQA 2.0 (RWKV7 g1i 1.5B 20260805 ctx16384)
+metadata:
+  version: 1.0
+  benchmark_name: logiqa2
+  task_adapter: rwkv7-http

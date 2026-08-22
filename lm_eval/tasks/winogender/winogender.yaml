@@ -20,3 +20,5 @@ metric_list:
 metadata:
   version: 1.0
   num_fewshot: 0
+  benchmark_name: winogender
+  task_adapter: rwkv7-http

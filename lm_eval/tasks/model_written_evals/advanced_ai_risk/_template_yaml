@@ -13,3 +13,5 @@ metric_list:
   - metric: acc
 metadata:
   version: 0.0
+  benchmark_name: model_written_evals
+  task_adapter: rwkv7-http

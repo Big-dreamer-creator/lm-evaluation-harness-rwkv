@@ -8,3 +8,4 @@ generation_kwargs:
 metadata:
   version: 1.0
   benchmark_name: drop
+  task_adapter: rwkv7-http

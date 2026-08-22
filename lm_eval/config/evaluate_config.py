@@ -6,6 +6,7 @@ import textwrap
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -32,6 +33,50 @@ DICT_KEYS = [
     "model_args",
     "gen_kwargs",
 ]
+VERSIONED_CONFIG_FIELDS = {
+    "apply_chat_template",
+    "backend",
+    "base_url",
+    "batch_size",
+    "benchmarks",
+    "device",
+    "fewshot_as_multiturn",
+    "include_defaults",
+    "include_path",
+    "limit",
+    "log_samples",
+    "max_length",
+    "model_overrides",
+    "model_name",
+    "num_concurrent",
+    "output_dir",
+    "rwkv_profile",
+    "samples",
+    "schema_version",
+    "seed",
+    "task_overrides",
+    "use_cache",
+}
+VERSIONED_REQUIRED_FIELDS = {
+    "backend",
+    "base_url",
+    "benchmarks",
+    "max_length",
+    "model_name",
+    "output_dir",
+    "rwkv_profile",
+    "schema_version",
+}
+RWKV_PROFILE_FIELDS = {
+    "generation_prompt",
+    "prompt_template",
+    "sampling_mode",
+    "wkv_mode",
+}
+RWKV_PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
+RWKV_GENERATION_PROMPTS = {"fake_think", "open_think"}
+RWKV_SAMPLING_MODES = {"profile", "task"}
+RWKV_WKV_MODES = {"fp16", "fp32io16"}
 
 
 @dataclass(slots=True)
@@ -154,8 +199,11 @@ class EvaluatorConfig:
     )
 
     # External tasks and generation
-    include_path: str | None = field(
+    include_path: str | list[str] | None = field(
         default=None, metadata={"help": "Additional dir path for external tasks"}
+    )
+    include_defaults: bool = field(
+        default=True, metadata={"help": "Include built-in task definitions"}
     )
     gen_kwargs: dict = field(
         default_factory=dict,
@@ -256,6 +304,16 @@ class EvaluatorConfig:
         _seen: set[Path] | None = None,
     ) -> dict[str, Any]:
         """Load and validate a TOML or YAML evaluation config file."""
+        config_data = cls._load_config_mapping(config_path, _seen=_seen)
+        return cls._normalize_versioned_config(config_data)
+
+    @classmethod
+    def _load_config_mapping(
+        cls,
+        config_path: str | Path,
+        *,
+        _seen: set[Path] | None = None,
+    ) -> dict[str, Any]:
         _config_path = Path(config_path).expanduser().resolve()
         if not _config_path.is_file():
             raise FileNotFoundError(f"Config file not found: {_config_path}")
@@ -299,11 +357,247 @@ class EvaluatorConfig:
             include_path = Path(include)
             if not include_path.is_absolute():
                 include_path = _config_path.parent / include_path
-            included = cls.load_config(include_path, _seen=_seen)
+            included = cls._load_config_mapping(include_path, _seen=_seen)
             merged = cls._merge_config(merged, included)
 
         _seen.remove(_config_path)
         return cls._merge_config(merged, config_data)
+
+    @classmethod
+    def _normalize_versioned_config(cls, config: dict[str, Any]) -> dict[str, Any]:
+        """Translate the repository's public eval schema to lm-eval arguments."""
+        if "schema_version" not in config:
+            return config
+
+        unknown = sorted(set(config) - VERSIONED_CONFIG_FIELDS)
+        if unknown:
+            raise ValueError("Unknown versioned config fields: " + ", ".join(unknown))
+        missing = sorted(VERSIONED_REQUIRED_FIELDS - set(config))
+        if missing:
+            raise ValueError("Missing versioned config fields: " + ", ".join(missing))
+        if isinstance(config["schema_version"], bool) or config["schema_version"] != 1:
+            raise ValueError("schema_version must be 1")
+        if config["backend"] != "rwkv7-http":
+            raise ValueError("backend must be rwkv7-http for schema_version = 1")
+
+        model_name = cls._non_empty_string(config["model_name"], "model_name")
+        base_url = cls._completion_url(config["base_url"])
+        benchmarks = cls._string_list(config["benchmarks"], "benchmarks")
+        output_dir = cls._non_empty_string(config["output_dir"], "output_dir")
+        max_length = cls._positive_int(config["max_length"], "max_length")
+        batch_size = cls._positive_int(config.get("batch_size", 1), "batch_size")
+        num_concurrent = cls._positive_int(
+            config.get("num_concurrent", 5), "num_concurrent"
+        )
+
+        profile = config["rwkv_profile"]
+        if not isinstance(profile, dict):
+            raise TypeError("rwkv_profile must be a table")
+        unknown_profile = sorted(set(profile) - RWKV_PROFILE_FIELDS)
+        if unknown_profile:
+            raise ValueError(
+                "Unknown RWKV profile fields: " + ", ".join(unknown_profile)
+            )
+        missing_profile = sorted(RWKV_PROFILE_FIELDS - set(profile))
+        if missing_profile:
+            raise ValueError(
+                "Missing RWKV profile fields: " + ", ".join(missing_profile)
+            )
+
+        prompt_template = cls._non_empty_string(
+            profile["prompt_template"], "rwkv_profile.prompt_template"
+        )
+        if prompt_template not in RWKV_PROMPT_TEMPLATES:
+            raise ValueError(
+                "rwkv_profile.prompt_template must be one of: "
+                + ", ".join(sorted(RWKV_PROMPT_TEMPLATES))
+            )
+        generation_prompt = cls._non_empty_string(
+            profile["generation_prompt"], "rwkv_profile.generation_prompt"
+        )
+        if generation_prompt not in RWKV_GENERATION_PROMPTS:
+            raise ValueError(
+                "rwkv_profile.generation_prompt must be one of: "
+                + ", ".join(sorted(RWKV_GENERATION_PROMPTS))
+            )
+        sampling_mode = cls._non_empty_string(
+            profile["sampling_mode"], "rwkv_profile.sampling_mode"
+        )
+        if sampling_mode not in RWKV_SAMPLING_MODES:
+            raise ValueError(
+                "rwkv_profile.sampling_mode must be one of: "
+                + ", ".join(sorted(RWKV_SAMPLING_MODES))
+            )
+        wkv_mode = cls._non_empty_string(profile["wkv_mode"], "rwkv_profile.wkv_mode")
+        if wkv_mode not in RWKV_WKV_MODES:
+            raise ValueError(
+                "rwkv_profile.wkv_mode must be one of: "
+                + ", ".join(sorted(RWKV_WKV_MODES))
+            )
+
+        apply_chat_template = cls._boolean(
+            config.get("apply_chat_template", True), "apply_chat_template"
+        )
+        fewshot_as_multiturn = cls._boolean(
+            config.get("fewshot_as_multiturn", apply_chat_template),
+            "fewshot_as_multiturn",
+        )
+        if fewshot_as_multiturn and not apply_chat_template:
+            raise ValueError("fewshot_as_multiturn requires apply_chat_template = true")
+        log_samples = cls._boolean(config.get("log_samples", True), "log_samples")
+        include_defaults = cls._boolean(
+            config.get("include_defaults", True), "include_defaults"
+        )
+        device = cls._non_empty_string(config.get("device", "cpu"), "device")
+        seed = config.get("seed", [0, 1234, 1234, 1234])
+        if (
+            not isinstance(seed, list)
+            or len(seed) != 4
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) for value in seed
+            )
+        ):
+            raise ValueError("seed must contain four integers")
+
+        normalized: dict[str, Any] = {
+            "model": "rwkv7-http",
+            "tasks": benchmarks,
+            "batch_size": batch_size,
+            "device": device,
+            "apply_chat_template": apply_chat_template,
+            "fewshot_as_multiturn": fewshot_as_multiturn,
+            "log_samples": log_samples,
+            "include_defaults": include_defaults,
+            "output_path": output_dir,
+            "seed": seed,
+            "model_args": {
+                "model": model_name,
+                "base_url": base_url,
+                "rwkv_prompt_template": prompt_template,
+                "rwkv_generation_prompt": generation_prompt,
+                "rwkv_sampling_mode": sampling_mode,
+                "num_concurrent": num_concurrent,
+                "max_length": max_length,
+            },
+            "metadata": {
+                "model_name": model_name,
+                "wkv_mode": wkv_mode,
+                "cot_mode": generation_prompt,
+                "prompt_template": prompt_template,
+            },
+        }
+        if "limit" in config:
+            limit = config["limit"]
+            if (
+                isinstance(limit, bool)
+                or not isinstance(limit, (int, float))
+                or limit <= 0
+            ):
+                raise ValueError("limit must be a positive number")
+            normalized["limit"] = limit
+        if "samples" in config:
+            samples = config["samples"]
+            if not isinstance(samples, dict) or not samples:
+                raise TypeError("samples must be a non-empty table")
+            normalized_samples: dict[str, list[int]] = {}
+            for task_name, indices in samples.items():
+                if (
+                    not isinstance(task_name, str)
+                    or not task_name
+                    or task_name != task_name.strip()
+                ):
+                    raise ValueError(
+                        "samples task names must be non-empty trimmed strings"
+                    )
+                if (
+                    not isinstance(indices, list)
+                    or not indices
+                    or any(
+                        isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or index < 0
+                        for index in indices
+                    )
+                ):
+                    raise ValueError(
+                        f"samples.{task_name} must be a non-empty array of "
+                        "non-negative integers"
+                    )
+                if len(indices) != len(set(indices)):
+                    raise ValueError(f"samples.{task_name} contains duplicate indices")
+                normalized_samples[task_name] = indices
+            normalized["samples"] = normalized_samples
+        if "include_path" in config:
+            include_path = config["include_path"]
+            if isinstance(include_path, str):
+                normalized["include_path"] = cls._non_empty_string(
+                    include_path, "include_path"
+                )
+            else:
+                normalized["include_path"] = cls._string_list(
+                    include_path, "include_path"
+                )
+        if not include_defaults and "include_path" not in normalized:
+            raise ValueError("include_defaults = false requires include_path")
+        if "limit" in normalized and "samples" in normalized:
+            raise ValueError("limit and samples are mutually exclusive")
+        if "use_cache" in config:
+            normalized["use_cache"] = cls._non_empty_string(
+                config["use_cache"], "use_cache"
+            )
+        return normalized
+
+    @staticmethod
+    def _non_empty_string(value: Any, name: str) -> str:
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"{name} must be a non-empty trimmed string")
+        return value
+
+    @classmethod
+    def _completion_url(cls, value: Any) -> str:
+        url = cls._non_empty_string(value, "base_url")
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path.rstrip("/") != "/v1/completions"
+        ):
+            raise ValueError("base_url must be an HTTP(S) /v1/completions endpoint")
+        return url
+
+    @staticmethod
+    def _string_list(value: Any, name: str) -> list[str]:
+        if (
+            not isinstance(value, list)
+            or not value
+            or any(
+                not isinstance(item, str) or not item or item != item.strip()
+                for item in value
+            )
+        ):
+            raise ValueError(
+                f"{name} must be a non-empty array of non-empty trimmed strings"
+            )
+        duplicates = sorted(item for item in set(value) if value.count(item) > 1)
+        if duplicates:
+            raise ValueError(f"duplicate {name}: " + ", ".join(duplicates))
+        return value
+
+    @staticmethod
+    def _positive_int(value: Any, name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _boolean(value: Any, name: str) -> bool:
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be a boolean")
+        return value
 
     @staticmethod
     def _merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -412,6 +706,7 @@ class EvaluatorConfig:
 
         task_manager = TaskManager(
             include_path=self.include_path,
+            include_defaults=self.include_defaults,
             metadata=self.metadata or {},
         )
 
@@ -432,6 +727,14 @@ class EvaluatorConfig:
                 task_names.append(config)
             self.tasks = task_names
             return task_manager
+
+        import lm_eval.models  # noqa: F401
+        from lm_eval.api.registry import get_model
+
+        model_cls = get_model(self.model)
+        task_adapter = getattr(model_cls, "TASK_ADAPTER", None)
+        if task_adapter is not None:
+            task_list = task_manager.resolve_adapter_tasks(task_list, task_adapter)
 
         # Normalize paths and deduplicate
         task_list = [

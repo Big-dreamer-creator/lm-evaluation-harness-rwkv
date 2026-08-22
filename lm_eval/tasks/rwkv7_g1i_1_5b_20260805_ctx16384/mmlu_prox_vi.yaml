@@ -1,0 +1,7 @@
+group: rwkv7_g1i_1_5b_20260805_ctx16384_mmlu_prox_vi
+task:
+  - mmlu_prox_vi
+metadata:
+  version: 1.0
+  benchmark_name: mmlu_prox_vi
+  task_adapter: rwkv7-http

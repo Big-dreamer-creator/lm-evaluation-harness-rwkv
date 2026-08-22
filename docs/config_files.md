@@ -22,7 +22,10 @@ lm-eval run --config eval_config.toml --tasks mmlu --limit 100
 
 ## Quick Reference
 
-All configuration keys correspond directly to CLI arguments. See the [CLI Reference](interface.md#lm-eval-run) for detailed descriptions of each option.
+Unversioned configuration keys correspond directly to CLI arguments. The
+versioned RWKV preset uses the smaller public schema documented below. See the
+[CLI Reference](interface.md#lm-eval-run) for detailed descriptions of native
+options.
 
 ### RWKV7 complete run
 
@@ -37,22 +40,67 @@ Configure the launcher to pass `--enable-tokenizer-info-endpoint`. The service
 must expose `/tokenizer_info` so lm-eval receives the same official RWKV chat
 template used by the inference backend.
 
-The root `lm-eval-rwkv.toml` is a validated preset for
+`configs/eval/lm_eval.toml` is the versioned, validated preset for
 `rwkv7-g1i-1.5b-20260805-ctx16384`. Run it directly with:
 
 ```bash
-uv run --no-sync python -m lm_eval run -C lm-eval-rwkv.toml
+uv run --no-sync python -m lm_eval run -C configs/eval/lm_eval.toml
 ```
 
 The `rwkv7-http` backend itself accepts any RWKV7 served model name. For another
-checkpoint size or revision, copy the preset and change `model`, `max_length`,
-`tasks`, `output_path`, and matching metadata. The TOML owns the model endpoint,
-concurrency, task set, and result location. Each benchmark YAML owns its prompt,
-generation limits, filters, and metrics. See the
+checkpoint size or revision, copy the preset and change `model_name`,
+`max_length`, `benchmarks`, and `output_dir`. The loader derives lm-eval's
+`model_args` and result metadata from this public schema, removing duplicated
+model and profile fields. `rwkv_profile.wkv_mode` remains a declared server-side
+fact and must be checked against the vllm-rwkv startup log. The TOML owns the
+exact model version, endpoint, ordered benchmark selectors, RWKV profile,
+concurrency, and result location. The runner preserves the `benchmarks` array
+order. For `rwkv7-http`, these ordinary names are resolved through the
+model-specific task adapter declared in the adapted task YAML; internal RWKV
+task names never appear in this file. Each benchmark YAML owns its prompt,
+answer extraction, metrics, stop conditions, and `max_gen_toks`. See the
 [RWKV evaluation guide](../RWKV_EVALUATION_GUIDE.md) for the complete server and
 evaluation workflow. The deprecated `temp/` launch scripts are not used.
 
+The preset currently exposes 15 benchmark families in configured run order:
+RACE, DROP, XQuAD, BABILong, InfiniteBench, RULER, WMDP, CRUXEval,
+Inverse Scaling Prize, Model-Written Evals, HumanEval-Infilling, MuTual,
+MC-TACO, Discrim-Eval, and Winogender. PALOMA remains excluded because dataset
+access is still blocked; it must not be represented as a completed benchmark.
+
 ## Config Schema
+
+The repository preset follows the same strict configuration approach as the
+Helicopter LightEval runner: `schema_version = 1`, an allowlist of public fields,
+required-field checks, duplicate benchmark rejection, and derived internal
+arguments. Unknown fields fail before model or dataset initialization.
+
+| Versioned RWKV field | Type | Default | Description |
+|----------------------|------|---------|-------------|
+| `schema_version` | int | required | Must be `1` |
+| `backend` | string | required | Must be `"rwkv7-http"` |
+| `model_name` | string | required | Complete served RWKV7 version name |
+| `base_url` | string | required | HTTP(S) `/v1/completions` endpoint |
+| `benchmarks` | list | required | Unique public benchmark names in execution order |
+| `output_dir` | string | required | Result directory |
+| `max_length` | int | required | Positive service context limit |
+| `batch_size` | int | `1` | lm-eval request batch size |
+| `num_concurrent` | int | `5` | HTTP request concurrency |
+| `device` | string | `"cpu"` | Evaluation-side device |
+| `rwkv_profile` | table | required | Complete RWKV execution profile |
+| `rwkv_profile.prompt_template` | string | required | Official RWKV template mode |
+| `rwkv_profile.generation_prompt` | string | required | `fake_think` or `open_think` |
+| `rwkv_profile.sampling_mode` | string | required | RWKV profile or task-native sampling |
+| `rwkv_profile.wkv_mode` | string | required | Recorded server WKV mode |
+| `apply_chat_template` | bool | `true` | Render the service's official template |
+| `fewshot_as_multiturn` | bool | chat setting | Render few-shot examples as turns |
+| `log_samples` | bool | `true` | Save inputs and model outputs |
+| `seed` | list[int] | `[0,1234,1234,1234]` | Four lm-eval random seeds |
+| `limit` | number | unset | Smoke-only sample limit |
+| `use_cache` | string | unset | Response cache path |
+
+Unversioned TOML and YAML files remain compatible with upstream lm-eval. Their
+keys correspond directly to CLI arguments:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -105,15 +153,24 @@ dtype = "float32"
 Small or smoke runs can include a formal config and override only their scope:
 
 ```toml
-include = "lm-eval-rwkv.toml"
-tasks = ["rwkv7_g1i_1_5b_20260805_ctx16384_race"]
+include = "lm_eval.toml"
+benchmarks = ["race"]
 limit = 10
-output_path = "results/smoke/race"
+output_dir = "results/smoke/race"
 ```
 
 Included paths are relative to the including file. Nested tables are merged, and local values override included values. CLI arguments still have the highest priority.
 
-Generation settings, prompts, filters, and metrics should be tuned in each benchmark's task YAML, not in a global run config. This preserves the native task protocol for non-RWKV backends.
+The array order is the run order; do not hide a campaign sequence in a
+model-specific group YAML. Benchmark prompt construction (`doc_to_text`), answer
+extraction and filters, metrics, stop conditions (`until`), and `max_gen_toks`
+belong in each task YAML and are rejected by the versioned global schema. For
+RWKV, task YAML additionally declares `metadata.task_adapter` and
+`metadata.benchmark_name`; the generic task manager uses those declarations to
+resolve each public name to one or more adapted tasks. The `rwkv_profile` table selects
+only the official model template and RWKV sampling profile. The Python CLI
+runner only loads this configuration, selects the model adapter, and executes
+lm-eval; it contains no benchmark-specific strategy.
 
 ---
 

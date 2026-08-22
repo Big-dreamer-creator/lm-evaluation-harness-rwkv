@@ -7,3 +7,5 @@ task:
       benchmark_name: infinitebench
 metadata:
   version: 1.0
+  benchmark_name: infinitebench
+  task_adapter: rwkv7-http

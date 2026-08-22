@@ -8,3 +8,5 @@ task:
   - xquad
 metadata:
   version: 1.0
+  benchmark_name: xquad
+  task_adapter: rwkv7-http

@@ -15,3 +15,5 @@ metric_list:
     higher_is_better: true
 metadata:
   version: 0
+  benchmark_name: inverse_scaling_prize
+  task_adapter: rwkv7-http

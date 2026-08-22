@@ -12,3 +12,5 @@ task:
       max_seq_lengths: 16k
 metadata:
   version: 1.0
+  benchmark_name: babilong
+  task_adapter: rwkv7-http

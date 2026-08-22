@@ -35,6 +35,11 @@ uv sync --extra api --extra tasks
 所有评估命令均从本仓库根目录执行，并通过 `uv run --no-sync` 使用当前
 `.venv`。
 
+当前总配置公开 15 个 benchmark family：RACE、DROP、XQuAD、BABILong、
+InfiniteBench、RULER、WMDP、CRUXEval、Inverse Scaling Prize、
+Model-Written Evals、HumanEval-Infilling、MuTual、MC-TACO、Discrim-Eval 和
+Winogender。PALOMA 因数据权限仍阻塞，不计入已支持清单。
+
 ## 3. 安装 vllm-rwkv
 
 在另一个目录克隆并构建专用推理后端：
@@ -75,7 +80,8 @@ rwkv7-g1h-7.2b-20260710-ctx10240.pth
 
 `vllm-rwkv` 可从标准文件名识别 0.1B、0.4B、1.5B、2.9B、7.2B 和
 13.3B 的结构。模型目录还应提供官方 `chat_template.jinja`。不要为了某个
-benchmark 修改该模板；模板选择通过 `rwkv_prompt_template` 完成。
+benchmark 修改该模板；模板选择通过配置中的
+`rwkv_profile.prompt_template` 完成。
 
 ## 5. 启动推理服务
 
@@ -118,39 +124,51 @@ curl -fsS http://127.0.0.1:8000/v1/models
 curl -fsS http://127.0.0.1:8000/tokenizer_info
 ```
 
-`/v1/models` 返回的 ID 必须与后续配置中的 `model` 完全相同。
+`/v1/models` 返回的 ID 必须与后续配置中的 `model_name` 完全相同。
 
 ## 6. 创建评估配置
 
-根目录的 `lm-eval-rwkv.toml` 是已经验证的 1.5B preset。评估其他权重时，
-复制其结构并修改以下配置；不要复用旧权重的 model 名、上下文长度或结果目录。
+`configs/eval/lm_eval.toml` 是已经验证的 1.5B preset，采用与 Helicopter
+LightEval 相同的版本化、严格字段配置方式。评估其他权重时，复制其结构并修改
+以下配置；不要复用旧权重的 model 名、上下文长度或结果目录。
 
 ```toml
-model = "rwkv7-http"
-tasks = ["<task-or-group>"]
+schema_version = 1
+backend = "rwkv7-http"
+
+model_name = "<model-name>"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = [
+  "<first-benchmark-name>",
+  "<second-benchmark-name>",
+]
+output_dir = "results/<model-name>"
+
+max_length = <context-length>
 batch_size = 1
+num_concurrent = 5
 device = "cpu"
+
 apply_chat_template = true
 fewshot_as_multiturn = true
 log_samples = true
-output_path = "results/<model-name>"
 seed = [0, 1234, 1234, 1234]
 
-[model_args]
-model = "<model-name>"
-base_url = "http://127.0.0.1:8000/v1/completions"
-max_length = <context-length>
-num_concurrent = 5
-rwkv_prompt_template = "assistant"
-rwkv_generation_prompt = "fake_think"
-rwkv_sampling_mode = "profile"
-
-[metadata]
-model_name = "<model-name>"
-wkv_mode = "fp32io16"
-cot_mode = "fake_think"
+[rwkv_profile]
 prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
 ```
+
+加载器会把这些字段转换为 lm-eval 的 `model`、`tasks`、`model_args`、
+`output_path` 和 `metadata`。`benchmarks` 数组只写普通 benchmark 名称，
+数组顺序就是运行顺序；当模型是 `rwkv7-http` 时，任务管理器会根据 RWKV
+适配 task YAML 的声明自动解析到对应的内部 task。`model_name`、
+`rwkv_profile.generation_prompt`、`rwkv_profile.prompt_template` 同时生成执行参数
+和结果元数据，避免重复字段分叉；`rwkv_profile.wkv_mode` 只记录服务端模式，
+仍需与 vllm-rwkv 启动日志核对。
+未知字段、重复 benchmark、非法 URL、非正数并发或上下文长度会在连接模型前报错。
 
 `num_concurrent` 应略大于服务的有效推理并发量，使服务允许少量排队但不空载。
 显存不足时先降低服务端 `--max-num-seqs`，再同步降低评估端并发，不要通过缩短
@@ -158,22 +176,26 @@ prompt_template = "assistant"
 
 ## 7. Prompt 与采样模式
 
-`rwkv_prompt_template` 仅接受官方模板中的三种模式：
+`rwkv_profile.prompt_template` 仅接受官方模板中的三种模式：
 
 - `assistant`
 - `bot`
 - `function_calling`
 
-`rwkv_generation_prompt` 支持：
+`rwkv_profile.generation_prompt` 支持：
 
 - `open_think`：temperature 0.96、top_p 0.76、top_k 32、
   presence_penalty 1.0、frequency_penalty 0.1、penalty_decay 0.988。
 - `fake_think`：temperature 1.0、top_p 0.28、top_k 32。
 
-`rwkv_sampling_mode = "profile"` 使用上述 RWKV 官方解码参数；
-`rwkv_sampling_mode = "task"` 保留 task YAML 的 temperature、top_p 等设置。
+`rwkv_profile.sampling_mode = "profile"` 使用上述 RWKV 官方解码参数；
+`rwkv_profile.sampling_mode = "task"` 保留 task YAML 的 temperature、top_p 等设置。
 只有在 benchmark 协议明确要求自己的生成参数时才使用 `task`。判分、过滤器、
-stop 条件和 `max_gen_toks` 仍归 task YAML 所有。
+stop 条件和 `max_gen_toks` 仍归 task YAML 所有。具体边界如下：
+
+- 总 TOML：模型版本、普通 benchmark 清单及顺序、RWKV profile 和运行资源参数。
+- task YAML：prompt、答案抽取/过滤、metric、stop 和 `max_gen_toks`。
+- Python runner：只加载配置、选择模型适配器并执行，不包含 benchmark 分支或策略。
 
 ## 8. 运行与恢复
 
@@ -188,7 +210,7 @@ uv run --no-sync python -m lm_eval validate --tasks <task-or-group>
 
 ```bash
 uv run --no-sync python -m lm_eval run \
-  --config /path/to/model-eval.toml \
+  --config configs/eval/lm_eval.toml \
   --limit 10
 ```
 
@@ -196,7 +218,7 @@ uv run --no-sync python -m lm_eval run \
 
 ```bash
 uv run --no-sync python -m lm_eval run \
-  --config /path/to/model-eval.toml
+  --config configs/eval/lm_eval.toml
 ```
 
 如需使用响应缓存，在 TOML 中设置 `use_cache`。lm-eval 默认不复用随机采样结果；
@@ -235,10 +257,11 @@ Linux 本地文件系统；WSL 下将 SQLite 缓存放在 `/mnt/c` 或 `/mnt/e` 
 - `rwkv7-http requires tokenizer_backend=remote`：不要给评估端配置本地 tokenizer。
 - `/tokenizer_info` 缺失：服务启动时补上
   `--enable-tokenizer-info-endpoint`。
-- 模型 ID 不匹配：让 TOML 的 `model` 与 `--served-model-name` 完全一致。
+- 模型 ID 不匹配：让 TOML 的 `model_name` 与 `--served-model-name` 完全一致。
 - 请求超过上下文：让服务端 `--max-model-len` 与评估端 `max_length` 匹配，
   并检查 benchmark 的输入与输出 token 上限。
-- 采样参数不生效：检查 `rwkv_sampling_mode` 是 `profile` 还是 `task`。
+- 采样参数不生效：检查 `rwkv_profile.sampling_mode` 是 `profile` 还是
+  `task`。
 - GPU 空载但评估未结束：检查 SQLite/Hugging Face 缓存是否位于 Windows 挂载盘，
   以及数据集是否在离线模式下反复查询网络元数据。
 
