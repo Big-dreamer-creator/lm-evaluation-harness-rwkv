@@ -162,6 +162,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.extend-per-file-ignores]
+"lm_eval/tasks/rwkv7_g1i_1_5b_20260805_ctx16384/utils.py" = ["BLE001"]
+"scripts/run_rwkv_five_benchmarks.py" = ["S603"]
 "scripts/run_rwkv_qwen_campaign.py" = ["S603"]
 "__init__.py" = [
     "F401",   # unused-import

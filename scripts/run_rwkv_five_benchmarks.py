@@ -9,7 +9,6 @@ import json
 import os
 import signal
 import subprocess
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
