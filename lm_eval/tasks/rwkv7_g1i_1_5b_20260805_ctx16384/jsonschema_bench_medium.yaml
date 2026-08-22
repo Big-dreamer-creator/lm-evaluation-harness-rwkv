@@ -1,0 +1,4 @@
+include: jsonschema_bench_easy.yaml
+task: rwkv7_g1i_1_5b_20260805_ctx16384_jsonschema_bench_medium
+task_alias: JSONSchemaBench Medium
+dataset_name: Github_medium

@@ -1,0 +1,10 @@
+include: ../haerae/_default_haerae_yaml
+task: rwkv7_g1i_1_5b_20260805_ctx16384_haerae_standard_nomenclature
+task_alias: HAE-RAE Standard Nomenclature
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    test: https://huggingface.co/datasets/HAERAE-HUB/HAE_RAE_BENCH/resolve/b480e81024913f27783d2b05d2f0b10089db19ad/data/standard_nomenclature-00000-of-00001-52814989a6843328.parquet
+metadata:
+  version: 1.0
+  dataset_revision: b480e81024913f27783d2b05d2f0b10089db19ad

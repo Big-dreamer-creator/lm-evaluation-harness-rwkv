@@ -1,0 +1,15 @@
+include: ../jsonschema_bench/jsonschema_bench_easy.yaml
+task: rwkv7_g1i_1_5b_20260805_ctx16384_jsonschema_bench_easy
+task_alias: JSONSchemaBench Easy
+dataset_kwargs:
+  revision: 5bd0f4640badc6f3f02df796421d21cb0ca0b141
+description: "Generate a JSON object that matches the schema. Return only the JSON object without Markdown fences or explanation."
+doc_to_text: 'JSON schema: {{json_schema}}\n\nJSON object:'
+generation_kwargs:
+  until:
+    - "\nUser:"
+  max_gen_toks: 2048
+  do_sample: true
+metadata:
+  version: 1.0
+  dataset_revision: 5bd0f4640badc6f3f02df796421d21cb0ca0b141

@@ -1,0 +1,18 @@
+group: rwkv7_g1i_1_5b_20260805_ctx16384_jsonschema_bench
+group_alias: JSONSchemaBench (RWKV7 g1i 1.5B 20260805 ctx16384)
+task:
+  - rwkv7_g1i_1_5b_20260805_ctx16384_jsonschema_bench_easy
+  - rwkv7_g1i_1_5b_20260805_ctx16384_jsonschema_bench_medium
+  - rwkv7_g1i_1_5b_20260805_ctx16384_jsonschema_bench_hard
+aggregate_metric_list:
+  - metric: json_validity
+    aggregation: mean
+    weight_by_size: true
+  - metric: schema_compliance
+    aggregation: mean
+    weight_by_size: true
+metadata:
+  version: 1.0
+  benchmark_name: jsonschema_bench
+  task_adapter: rwkv7-http
+  dataset_revision: 5bd0f4640badc6f3f02df796421d21cb0ca0b141

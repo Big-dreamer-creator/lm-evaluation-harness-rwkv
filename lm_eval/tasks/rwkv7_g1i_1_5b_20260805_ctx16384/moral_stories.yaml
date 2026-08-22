@@ -1,0 +1,13 @@
+include: ../moral_stories/moral_stories.yaml
+task: rwkv7_g1i_1_5b_20260805_ctx16384_moral_stories
+task_alias: Moral Stories (RWKV7 g1i 1.5B 20260805 ctx16384)
+dataset_path: json
+dataset_name: null
+dataset_kwargs:
+  data_files:
+    train: https://huggingface.co/datasets/demelin/moral_stories/resolve/b830cf56eb00bc4edd1860dd544a192216eb3587/data/moral_stories_full.jsonl
+metadata:
+  version: 1.0
+  benchmark_name: moral_stories
+  task_adapter: rwkv7-http
+  dataset_revision: b830cf56eb00bc4edd1860dd544a192216eb3587

@@ -1,0 +1,10 @@
+include: ../haerae/_default_haerae_yaml
+task: rwkv7_g1i_1_5b_20260805_ctx16384_haerae_general_knowledge
+task_alias: HAE-RAE General Knowledge
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    test: https://huggingface.co/datasets/HAERAE-HUB/HAE_RAE_BENCH/resolve/b480e81024913f27783d2b05d2f0b10089db19ad/data/general_knowledge-00000-of-00001-7418d1a0b8c4a615.parquet
+metadata:
+  version: 1.0
+  dataset_revision: b480e81024913f27783d2b05d2f0b10089db19ad

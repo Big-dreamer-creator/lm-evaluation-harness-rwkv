@@ -1,0 +1,27 @@
+task: rwkv7_g1i_1_5b_20260805_ctx16384_aexams
+task_alias: EXAMS Arabic (RWKV7 g1i 1.5B 20260805 ctx16384)
+dataset_path: OALL/Arabic_EXAMS
+dataset_kwargs:
+  revision: bc7a29346dbcaa16a8cd883b1f3e681ab2b7ff2a
+test_split: test
+fewshot_split: validation
+fewshot_config:
+  sampler: first_n
+output_type: multiple_choice
+description: "قم بالإجابة عن أسئلة الاختيار من متعدد الآتية.\n\n"
+doc_to_text: "{{question.strip()}}\nA. {{A}}\nB. {{B}}\nC. {{C}}\nD. {{D}}\nالجواب:"
+doc_to_choice: ["A", "B", "C", "D"]
+doc_to_target: "{{['A', 'B', 'C', 'D'].index(answer)}}"
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: acc_norm
+    aggregation: mean
+    higher_is_better: true
+num_fewshot: 5
+metadata:
+  version: 1.0
+  benchmark_name: aexams
+  task_adapter: rwkv7-http
+  dataset_revision: bc7a29346dbcaa16a8cd883b1f3e681ab2b7ff2a

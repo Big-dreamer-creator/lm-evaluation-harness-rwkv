@@ -1,0 +1,30 @@
+include: ../gsm8k_platinum/gsm8k-platinum-cot-zeroshot.yaml
+task: rwkv7_g1i_1_5b_20260805_ctx16384_gsm8k_platinum
+task_alias: GSM8K Platinum (RWKV7 g1i 1.5B 20260805 ctx16384)
+dataset_kwargs:
+  revision: e762492455a1cf7967de89f05b6bef72fc713b66
+doc_to_text: 'Solve the problem. End with "Final Answer: [answer]".\n\nProblem: {{question}}\nSolution:'
+doc_to_target: "{{answer.split('####')[-1].strip()}}"
+process_results: !function utils.process_gsm8k_platinum_results
+filter_list:
+  - name: raw
+    filter:
+      - function: take_first
+generation_kwargs:
+  until:
+    - "\nUser:"
+  max_gen_toks: 512
+  do_sample: true
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+  - metric: math_verify
+    aggregation: mean
+    higher_is_better: true
+num_fewshot: 0
+metadata:
+  version: 1.0
+  benchmark_name: gsm8k_platinum
+  task_adapter: rwkv7-http
+  dataset_revision: e762492455a1cf7967de89f05b6bef72fc713b66
