@@ -29,28 +29,61 @@ SPEC.loader.exec_module(MODULE)
 
 
 def campaign() -> dict:
-    return {
+    weight_sha256 = "a" * 64
+    value = {
         "schema_version": MODULE.CAMPAIGN_SCHEMA,
-        "run_key": "a" * 64,
-        "config_digest": "b" * 64,
-        "registry_digest": "c" * 64,
-        "eval_contract_digest": "d" * 64,
-        "lighteval_version": MODULE.LIGHTEVAL_VERSION,
-        "configured_selectors": ["task"],
-        "resolved_selectors": ["task"],
-        "skipped_selectors": [],
+        "source": "lm-eval-harness",
+        "config_sha256": "b" * 64,
+        "registry_sha256": "c" * 64,
+        "contract_sha256": "d" * 64,
+        "configured_benchmarks": ["task"],
+        "resolved_benchmarks": ["task"],
+        "skipped_benchmarks": [],
         "expected_tasks": [
-            {"identity": "weight:fp16:task"},
-            {"identity": "weight:fp32io16:task"},
+            expected_task(weight_sha256, "fp16"),
+            expected_task(weight_sha256, "fp32io16"),
         ],
+    }
+    value["run_key"] = CONVERTER.campaign_run_key(value)
+    return value
+
+
+def expected_task(weight_sha256: str, wkv_mode: str) -> dict:
+    return {
+        "identity": f"{weight_sha256}:{wkv_mode}:task",
+        "weight_sha256": weight_sha256,
+        "weight_display_name": "model.pth",
+        "wkv_mode": wkv_mode,
+        "benchmark": "task",
+        "task_name": "task",
+        "task_version": "1.0",
+        "dataset": "dataset/task",
+        "subset": "full",
+        "evaluation_splits": ["test"],
+        "languages": ["english"],
+        "tags": ["test"],
     }
 
 
 def task(identity: str) -> dict:
+    weight_sha256, wkv_mode, _ = identity.split(":", 2)
     return {
         "schema_version": MODULE.TASK_SCHEMA,
         "campaign_id": "assigned-by-uploader",
-        "task": {"identity": identity},
+        "task": expected_task(weight_sha256, wkv_mode),
+        "result_files": [{"role": "metrics", "path": "results/model/task.json"}],
+        "task_config": {
+            "generation_size": 1,
+            "original_num_docs": 1,
+            "effective_num_docs": 1,
+            "skipped_multiselect_docs": 0,
+        },
+        "environment": {"source": "lm-eval-harness"},
+        "sampling_config": {},
+        "primary_metric": "acc",
+        "metrics": {"acc": 0.5},
+        "diagnostics": {},
+        "samples": [],
     }
 
 
@@ -58,7 +91,9 @@ def write_inputs(tmp_path: Path) -> tuple[Path, list[Path]]:
     campaign_path = tmp_path / "campaign.json"
     campaign_path.write_text(json.dumps(campaign()), encoding="utf-8")
     task_paths = []
-    for index, identity in enumerate(("weight:fp16:task", "weight:fp32io16:task")):
+    weight_sha256 = "a" * 64
+    for index, mode in enumerate(("fp16", "fp32io16")):
+        identity = f"{weight_sha256}:{mode}:task"
         path = tmp_path / f"task-{index}.json"
         path.write_text(json.dumps(task(identity)), encoding="utf-8")
         task_paths.append(path)
@@ -83,9 +118,9 @@ def test_load_inputs_rejects_raw_lm_eval_results(tmp_path: Path) -> None:
         json.dumps({"results": {"task": {"acc": 0.5}}}), encoding="utf-8"
     )
     task_path = tmp_path / "task.json"
-    task_path.write_text(json.dumps(task("weight:fp16:task")), encoding="utf-8")
+    task_path.write_text(json.dumps(task("a" * 64 + ":fp16:task")), encoding="utf-8")
 
-    with pytest.raises(MODULE.ScoreboardError, match="lighteval-campaign-v3"):
+    with pytest.raises(MODULE.ScoreboardError, match="scoreboard-v1"):
         MODULE.load_publication_inputs(raw_result, [task_path])
 
 
@@ -93,7 +128,7 @@ def test_load_inputs_requires_exact_task_set(tmp_path: Path) -> None:
     campaign_path = tmp_path / "campaign.json"
     campaign_path.write_text(json.dumps(campaign()), encoding="utf-8")
     task_path = tmp_path / "task.json"
-    task_path.write_text(json.dumps(task("weight:fp16:task")), encoding="utf-8")
+    task_path.write_text(json.dumps(task("a" * 64 + ":fp16:task")), encoding="utf-8")
 
     with pytest.raises(MODULE.ScoreboardError, match="does not match campaign"):
         MODULE.load_publication_inputs(campaign_path, [task_path])
@@ -228,13 +263,14 @@ def test_producer_payload_is_converted_losslessly_to_scoreboard_dto() -> None:
     assert all(
         payload["schema_version"] == MODULE.TASK_SCHEMA for payload in task_payloads
     )
-    assert {
-        payload["task"]["identity"] for payload in task_payloads
-    } == {f"{'e' * 64}:fp16:moral_stories", f"{'e' * 64}:fp32io16:moral_stories"}
-    detail = task_payloads[0]["details"][0]
+    assert {payload["task"]["identity"] for payload in task_payloads} == {
+        f"{'e' * 64}:fp16:moral_stories",
+        f"{'e' * 64}:fp32io16:moral_stories",
+    }
+    detail = task_payloads[0]["samples"][0]
     assert detail["model_response"]["logprobs"] == [-0.1]
     assert detail["model_response"]["output_tokens"] == [[11]]
-    assert detail["doc"]["specific"]["helicopter_document_index"] == 0
+    assert detail["document"]["specific"]["helicopter_document_index"] == 0
 
 
 def test_producer_conversion_rejects_non_publishable_sampling_contract() -> None:
@@ -373,6 +409,241 @@ def test_publication_settings_reject_invalid_environment(monkeypatch) -> None:
         MODULE.resolve_publication_settings()
 
 
+def test_preflight_must_advertise_requested_schema(monkeypatch) -> None:
+    request_options = {}
+    client = MODULE.ScoreboardClient(
+        base_url="https://eval.rwkv.rs/test",
+        token="secret",  # noqa: S106
+        timeout=12,
+    )
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda method, path, **kwargs: (
+            request_options.update(kwargs)
+            or {
+                "status": "ready",
+                "schema_version": MODULE.CAMPAIGN_SCHEMA,
+                "sources": ["lm-eval-harness"],
+            }
+        ),
+    )
+
+    assert (
+        client.preflight(expected_campaign_schema=MODULE.SCOREBOARD_SCHEMA)[
+            "schema_version"
+        ]
+        == MODULE.SCOREBOARD_SCHEMA
+    )
+    assert request_options["timeout"] == MODULE.CONTROL_REQUEST_TIMEOUT
+
+
+def test_native_conversion_rejects_incomplete_evidence() -> None:
+    results = {
+        "config": {
+            "model": "rwkv7-http",
+            "model_args": {
+                "model": "rwkv7-g1i-1.5b-20260805-ctx16384",
+                "rwkv_prompt_template": "assistant",
+                "rwkv_generation_prompt": "fake_think",
+                "rwkv_sampling_mode": "profile",
+                "num_concurrent": 5,
+                "max_length": 16384,
+            },
+        },
+        "configs": {
+            "race": {
+                "task": "race",
+                "dataset_path": "race",
+                "test_split": "test",
+                "output_type": "generate_until",
+                "generation_kwargs": {"max_gen_toks": 32},
+                "metadata": {"wkv_mode": "fp32io16"},
+            }
+        },
+        "results": {"race": {"acc,none": 0.5}},
+        "n-samples": {"race": {"original": 1, "effective": 1}},
+        "lm_eval_version": "0.4.13.dev0",
+        "backend_commit": "f" * 40,
+        "backend_version": "0.10.0",
+        "torch_version": "2.11.0+cu130",
+        "gpu": "NVIDIA RTX 4060",
+    }
+    samples = {
+        "race": [
+            {
+                "doc_id": 0,
+                "doc": {"question": "question"},
+                "metrics": ["acc"],
+                "acc": 0.0,
+                "response_evidence": [
+                    [
+                        {
+                            "input_token_ids": [1],
+                            "raw_response": {"choices": [{"text": "answer"}]},
+                            "post_processed_answer": "answer",
+                        }
+                    ]
+                ],
+            }
+        ]
+    }
+
+    with pytest.raises(CONVERTER.ScoreboardError, match="complete raw response/token"):
+        CONVERTER.build_lm_eval_publication(
+            results,
+            samples,
+            publication={"enabled": True, "model_sha256": "e" * 64},
+        )
+
+
+def test_native_conversion_preserves_real_nested_lm_eval_shape() -> None:
+    task_name = "rwkv7_g1i_1_5b_20260805_ctx16384_race"
+    weight_sha256 = "e" * 64
+    results = {
+        "model_name": "rwkv7-g1i-1.5b-20260805-ctx16384",
+        "config": {
+            "model": "rwkv7-http",
+            "model_args": {
+                "model": "rwkv7-g1i-1.5b-20260805-ctx16384",
+                "rwkv_prompt_template": "assistant",
+                "rwkv_generation_prompt": "fake_think",
+                "rwkv_sampling_mode": "profile",
+                "num_concurrent": 5,
+                "max_length": 16384,
+            },
+            "batch_size": "1",
+            "gen_kwargs": {},
+        },
+        "configs": {
+            task_name: {
+                "task": task_name,
+                "dataset_path": "EleutherAI/race",
+                "dataset_name": "high",
+                "test_split": "test",
+                "output_type": "multiple_choice",
+                "metric_list": [{"metric": "acc", "aggregation": "mean"}],
+                "metadata": {
+                    "version": 1.0,
+                    "benchmark_name": "race",
+                    "wkv_mode": "fp32io16",
+                    "prompt_template": "assistant",
+                },
+            }
+        },
+        "results": {task_name: {"acc,none": 0.5, "acc_stderr,none": 0.1}},
+        "n-samples": {task_name: {"original": 1, "effective": 1}},
+        "lm_eval_version": "0.4.13.dev0",
+        "backend_commit": "f" * 40,
+        "backend_version": "0.10.0",
+        "torch_version": "2.11.0+cu130",
+        "gpu": "NVIDIA RTX 4060",
+        "chat_template_sha": "a" * 64,
+        "task_hashes": {task_name: "b" * 64},
+    }
+    choices = []
+    evidence = []
+    for index in range(4):
+        choices.append([[str(-index - 1.0), "False"]])
+        evidence.append(
+            [
+                {
+                    "prompt": "prompt",
+                    "input_token_ids": [10, index],
+                    "output_token_ids": [20 + index],
+                    "raw_response": {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "text": "",
+                                "logprobs": {"token_logprobs": [None, -0.1]},
+                            }
+                        ]
+                    },
+                    "post_processed_answer": "0",
+                    "finish_reason": None,
+                    "truncation": False,
+                }
+            ]
+        )
+    samples = {
+        task_name: [
+            {
+                "doc_id": 0,
+                "doc": {"question": "question", "options": ["a", "b", "c", "d"]},
+                "target": "0",
+                "arguments": {
+                    f"gen_args_{index}": {"arg_0": "prompt", "arg_1": choice}
+                    for index, choice in enumerate(("a", "b", "c", "d"))
+                },
+                "resps": choices,
+                "filtered_resps": [[str(-index - 1.0), "False"] for index in range(4)],
+                "filter": "none",
+                "metrics": ["acc"],
+                "acc": 1.0,
+                "response_evidence": evidence,
+            }
+        ]
+    }
+
+    campaign_payload, task_payloads = CONVERTER.build_lm_eval_publication(
+        results,
+        samples,
+        publication={
+            "enabled": True,
+            "model_sha256": weight_sha256,
+            "model_revision": "20260805",
+            "task_metadata": {
+                "race": {
+                    "selector": "race",
+                    "module_family": "race",
+                    "module": "lm_eval.tasks.race",
+                    "languages": ["english"],
+                    "upstream_tags": ["reading-comprehension"],
+                }
+            },
+        },
+    )
+
+    descriptor = campaign_payload["expected_tasks"][0]
+    assert descriptor["identity"] == f"{weight_sha256}:fp32io16:{task_name}"
+    assert descriptor["benchmark"] == "race"
+    payload = task_payloads[0]
+    assert payload["task"] == descriptor
+    assert payload["result_files"][0]["role"] == "metrics"
+    assert payload["task_config"]["original_num_docs"] == 1
+    assert payload["task_config"]["effective_num_docs"] == 1
+    assert payload["environment"]["weight_sha256"] == weight_sha256
+    assert payload["environment"]["wkv_mode"] == "fp32io16"
+    assert payload["environment"]["gpu"] == "NVIDIA RTX 4060"
+    assert payload["environment"]["dependency_versions"] == {
+        "lm-eval": "0.4.13.dev0",
+        "vllm": "0.10.0@" + "f" * 40,
+        "torch": "2.11.0+cu130",
+    }
+    assert payload["sampling_config"]["temperature"] == 1.0
+    assert payload["diagnostics"] == {
+        "samples": 1,
+        "completions": 4,
+        "truncated": 0,
+        "non_truncated": 4,
+        "truncation_rate": 0.0,
+        "turn_boundary_violations": 0,
+        "turn_boundary_violation_rate": 0.0,
+    }
+    detail = payload["samples"][0]
+    assert detail["document_index"] == 0
+    assert detail["document"]["specific"]["lm_eval_document_index"] == 0
+    assert [item["request_index"] for item in detail["model_response"]["evidence"]] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert detail["model_response"]["output_tokens"] == [[20], [21], [22], [23]]
+    assert detail["model_response"]["evidence_complete"] is True
+
+
 class FakeResponse:
     status = 200
 
@@ -387,6 +658,32 @@ class FakeResponse:
 
     def read(self) -> bytes:
         return self.body
+
+
+def test_request_retries_transient_network_error(monkeypatch) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def fake_urlopen(request, timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise MODULE.URLError("temporary TLS failure")
+        return FakeResponse({"status": "ok"})
+
+    monkeypatch.setattr(MODULE, "urlopen", fake_urlopen)
+    monkeypatch.setattr(MODULE.time, "sleep", sleeps.append)
+    client = MODULE.ScoreboardClient(
+        base_url="https://eval.rwkv.rs/test",
+        token="secret",  # noqa: S106
+        timeout=12,
+        retries=2,
+        retry_delay=0.25,
+    )
+
+    assert client._request("GET", "/health") == {"status": "ok"}
+    assert attempts == 2
+    assert sleeps == [0.25]
 
 
 def test_publish_uses_scoreboard_contract_transport_and_is_resumable(monkeypatch):
@@ -416,19 +713,18 @@ def test_publish_uses_scoreboard_contract_transport_and_is_resumable(monkeypatch
             return FakeResponse(
                 {
                     "status": "ready",
-                    "publisher_principal": "test",
                     "schema_version": MODULE.CAMPAIGN_SCHEMA,
-                    "lighteval_version": MODULE.LIGHTEVAL_VERSION,
+                    "sources": ["lm-eval-harness"],
                 }
             )
         if path.endswith("evaluation-campaigns"):
             return FakeResponse(
                 {
                     "campaign_id": campaign_id,
-                    "disposition": "created",
+                    "action": "created",
                     "status": "incomplete",
                     "expected_task_count": 2,
-                    "acknowledged_task_digests": {},
+                    "task_hashes": {},
                 }
             )
         if path.endswith(campaign_id):
@@ -437,8 +733,8 @@ def test_publish_uses_scoreboard_contract_transport_and_is_resumable(monkeypatch
                     "campaign_id": campaign_id,
                     "status": "incomplete",
                     "expected_task_count": 2,
-                    "acknowledged_task_digests": acknowledged,
-                    "missing_task_identities": [],
+                    "task_hashes": acknowledged,
+                    "missing_tasks": [],
                 }
             )
         if "/tasks/" in path:
@@ -450,8 +746,8 @@ def test_publish_uses_scoreboard_contract_transport_and_is_resumable(monkeypatch
                 {
                     "evaluation_id": identity,
                     "task_identity": identity,
-                    "content_digest": digest,
-                    "disposition": "created",
+                    "content_sha256": digest,
+                    "action": "created",
                 }
             )
         if path.endswith("/finalize"):
@@ -468,7 +764,7 @@ def test_publish_uses_scoreboard_contract_transport_and_is_resumable(monkeypatch
     campaign_payload = campaign()
     tasks = {
         identity: task(identity)
-        for identity in ("weight:fp16:task", "weight:fp32io16:task")
+        for identity in ("a" * 64 + ":fp16:task", "a" * 64 + ":fp32io16:task")
     }
 
     first = MODULE.publish(
@@ -485,7 +781,7 @@ def test_publish_uses_scoreboard_contract_transport_and_is_resumable(monkeypatch
         for item in requests
         if item["method"] == "POST" and item["path"].endswith("evaluation-campaigns")
     )
-    assert campaign_request["idempotency"] == "campaign:" + "a" * 64
+    assert campaign_request["idempotency"] == "campaign:" + campaign_payload["run_key"]
     task_requests = [item for item in requests if "/tasks/" in item["path"]]
     assert [item["payload"]["campaign_id"] for item in task_requests] == [
         campaign_id,
@@ -500,7 +796,7 @@ def test_publish_uses_scoreboard_contract_transport_and_is_resumable(monkeypatch
         task_by_identity=tasks,
         expected_identities=list(tasks),
     )
-    assert second["tasks"][0]["disposition"] == "unchanged"
+    assert second["tasks"][0]["action"] == "unchanged"
     assert not any("/tasks/" in item["path"] for item in requests)
 
 
@@ -513,17 +809,46 @@ def test_native_lm_eval_publication_handles_race_and_drop_and_retains_failure(
     results = {
         "config": {
             "model": "rwkv7-http",
-            "model_args": {"model": "rwkv7-g1i-1.5b-20260805-ctx16384"},
+            "model_args": {
+                "model": "rwkv7-g1i-1.5b-20260805-ctx16384",
+                "rwkv_prompt_template": "assistant",
+                "rwkv_generation_prompt": "open_think",
+                "rwkv_sampling_mode": "profile",
+                "num_concurrent": 5,
+                "max_length": 16384,
+            },
         },
         "configs": {
-            "race": {"task": "race", "dataset_path": "race", "test_split": "test"},
-            "drop": {"task": "drop", "dataset_path": "drop", "test_split": "validation"},
+            "race": {
+                "task": "race",
+                "dataset_path": "race",
+                "test_split": "test",
+                "output_type": "generate_until",
+                "generation_kwargs": {"max_gen_toks": 32},
+                "metadata": {"wkv_mode": "fp32io16"},
+            },
+            "drop": {
+                "task": "drop",
+                "dataset_path": "drop",
+                "test_split": "validation",
+                "output_type": "generate_until",
+                "generation_kwargs": {"max_gen_toks": 32},
+                "metadata": {"wkv_mode": "fp32io16"},
+            },
         },
         "results": {
             "race": {"acc,none": 0.5},
             "drop": {"f1,none": 0.25},
         },
         "lm_eval_version": "0.4.13.dev0",
+        "n-samples": {
+            "race": {"original": 1, "effective": 1},
+            "drop": {"original": 1, "effective": 1},
+        },
+        "backend_commit": "f" * 40,
+        "backend_version": "0.10.0",
+        "torch_version": "2.11.0+cu130",
+        "gpu": "NVIDIA RTX 4060",
     }
     samples = {
         task_name: [
@@ -538,13 +863,15 @@ def test_native_lm_eval_publication_handles_race_and_drop_and_retains_failure(
                 "acc": 1.0 if task_name == "race" else None,
                 "f1": 1.0 if task_name == "drop" else None,
                 "response_evidence": [
-                    {
-                        "prompt": "prompt",
-                        "input_token_ids": [1],
-                        "output_token_ids": [2],
-                        "raw_response": {"choices": [{"text": "answer"}]},
-                        "post_processed_answer": "answer",
-                    }
+                    [
+                        {
+                            "prompt": "prompt",
+                            "input_token_ids": [1],
+                            "output_token_ids": [2],
+                            "raw_response": {"choices": [{"text": "answer"}]},
+                            "post_processed_answer": "answer",
+                        }
+                    ]
                 ],
             }
         ]
@@ -567,11 +894,17 @@ def test_native_lm_eval_publication_handles_race_and_drop_and_retains_failure(
     assert "publication incomplete" in status["message"]
     campaign = json.loads(Path(status["campaign_path"]).read_text(encoding="utf-8"))
     assert campaign["schema_version"] == MODULE.LM_EVAL_CAMPAIGN_SCHEMA
-    assert campaign["model"] == {
-        "name": "rwkv7-g1i-1.5b-20260805-ctx16384",
-        "revision": "local-e2e-revision",
-        "sha256": "e" * 64,
-    }
-    assert [item["task_name"] for item in campaign["expected_tasks"]] == ["race", "drop"]
-    raw_results = json.loads(Path(status["raw_results_path"]).read_text(encoding="utf-8"))
-    assert raw_results["samples"]["race"][0]["response_evidence"][0]["output_token_ids"] == [2]
+    assert [item["benchmark"] for item in campaign["expected_tasks"]] == [
+        "race",
+        "drop",
+    ]
+    assert all(
+        item["identity"] == f"{'e' * 64}:fp32io16:{item['task_name']}"
+        for item in campaign["expected_tasks"]
+    )
+    raw_results = json.loads(
+        Path(status["raw_results_path"]).read_text(encoding="utf-8")
+    )
+    assert raw_results["samples"]["race"][0]["response_evidence"][0][0][
+        "output_token_ids"
+    ] == [2]
