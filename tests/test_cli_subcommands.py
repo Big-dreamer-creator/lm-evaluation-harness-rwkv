@@ -1286,7 +1286,6 @@ model_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
             "enabled": True,
             "base_url": "https://eval.rwkv.rs/test",
             "token_env": "MY_PUBLICATION_TOKEN",
-            "timeout": 3600.0,
             "finalize": False,
             "model_sha256": "a" * 64,
         }

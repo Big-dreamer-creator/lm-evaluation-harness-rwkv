@@ -118,10 +118,96 @@ _TARGET_SAMPLING: dict[str, Any] = {
 
 SUPPORTED_CAMPAIGN_SCHEMAS = {CAMPAIGN_SCHEMA, LM_EVAL_CAMPAIGN_SCHEMA}
 SUPPORTED_TASK_SCHEMAS = {TASK_SCHEMA, LM_EVAL_TASK_SCHEMA}
+SCOREBOARD_BASE_URL_ENV = "SCOREBOARD_BASE_URL"
+SCOREBOARD_TOKEN_ENV_ENV = "SCOREBOARD_PUBLICATION_TOKEN_ENV"
+SCOREBOARD_TOKEN_ENV = "SCOREBOARD_PUBLICATION_TOKEN"
+SCOREBOARD_TIMEOUT_ENV = "SCOREBOARD_UPLOAD_TIMEOUT"
+SCOREBOARD_FINALIZE_ENV = "SCOREBOARD_UPLOAD_FINALIZE"
+SCOREBOARD_MODEL_SHA256_ENV = "SCOREBOARD_MODEL_SHA256"
+SCOREBOARD_MODEL_REVISION_ENV = "SCOREBOARD_MODEL_REVISION"
 
 
 class ScoreboardError(RuntimeError):
     """An actionable local or remote publication error."""
+
+
+def _environment_text(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _environment_timeout(default: float = 3600.0) -> float:
+    raw = _environment_text(SCOREBOARD_TIMEOUT_ENV)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ScoreboardError(
+            f"{SCOREBOARD_TIMEOUT_ENV} must be a positive number"
+        ) from error
+    if not math.isfinite(value) or value <= 0:
+        raise ScoreboardError(f"{SCOREBOARD_TIMEOUT_ENV} must be a positive number")
+    return value
+
+
+def _environment_finalize(default: bool = True) -> bool:
+    raw = _environment_text(SCOREBOARD_FINALIZE_ENV)
+    if raw is None:
+        return default
+    normalized = raw.lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ScoreboardError(
+        f"{SCOREBOARD_FINALIZE_ENV} must be one of true/false, yes/no, on/off, or 1/0"
+    )
+
+
+def resolve_publication_settings(
+    publication: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve portable publication settings without reading the token itself."""
+
+    resolved = dict(publication or {})
+    if not resolved.get("base_url"):
+        base_url = _environment_text(SCOREBOARD_BASE_URL_ENV)
+        if base_url is not None:
+            resolved["base_url"] = base_url
+    if not resolved.get("token_env"):
+        resolved["token_env"] = (
+            _environment_text(SCOREBOARD_TOKEN_ENV_ENV) or SCOREBOARD_TOKEN_ENV
+        )
+    timeout = resolved.get("timeout")
+    if timeout is None:
+        resolved["timeout"] = _environment_timeout()
+    elif (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ScoreboardError("publication.timeout must be a positive number")
+    else:
+        resolved["timeout"] = float(timeout)
+    finalize = resolved.get("finalize")
+    if finalize is None:
+        resolved["finalize"] = _environment_finalize()
+    elif not isinstance(finalize, bool):
+        raise ScoreboardError("publication.finalize must be a boolean")
+    if not resolved.get("model_sha256"):
+        model_sha256 = _environment_text(SCOREBOARD_MODEL_SHA256_ENV)
+        if model_sha256 is not None:
+            resolved["model_sha256"] = model_sha256
+    if not resolved.get("model_revision"):
+        model_revision = _environment_text(SCOREBOARD_MODEL_REVISION_ENV)
+        if model_revision is not None:
+            resolved["model_revision"] = model_revision
+    return resolved
 
 
 def _reject_json_constant(value: str) -> None:
@@ -1142,7 +1228,7 @@ def publish_lm_eval_evaluation(
 ) -> dict[str, Any]:
     """Persist native evidence and optionally publish it in one recoverable flow."""
 
-    publication = dict(publication or {})
+    publication = resolve_publication_settings(publication)
     result_config = results.get("config")
     result_config = result_config if isinstance(result_config, dict) else {}
     result_model_args = result_config.get("model_args")
@@ -1219,12 +1305,12 @@ def publish_lm_eval_evaluation(
         _write_json_atomic(status_path, status)
         return status
     try:
-        base_url = publication.get("base_url") or os.environ.get("SCOREBOARD_BASE_URL")
-        token_env = publication.get("token_env", "SCOREBOARD_PUBLICATION_TOKEN")
+        base_url = publication.get("base_url")
+        token_env = publication["token_env"]
         token = os.environ.get(token_env)
         if not base_url:
             raise ScoreboardError(
-                "publication.base_url or SCOREBOARD_BASE_URL is required when publication is enabled"
+                f"publication.base_url or {SCOREBOARD_BASE_URL_ENV} is required when publication is enabled"
             )
         if not token:
             raise ScoreboardError(f"publication token is missing from {token_env}")
@@ -1234,14 +1320,14 @@ def publish_lm_eval_evaluation(
         client = ScoreboardClient(
             base_url=base_url,
             token=token,
-            timeout=float(publication.get("timeout", 3600.0)),
+            timeout=publication["timeout"],
         )
         receipt = publish(
             client=client,
             campaign=campaign_payload,
             task_by_identity=task_by_identity,
             expected_identities=expected_identities,
-            finalize=bool(publication.get("finalize", True)),
+            finalize=publication["finalize"],
         )
         status.update(
             {
@@ -1598,13 +1684,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("SCOREBOARD_BASE_URL"),
-        help="scoreboard origin or deployment prefix (env: SCOREBOARD_BASE_URL)",
+        help=f"scoreboard origin or deployment prefix (env: {SCOREBOARD_BASE_URL_ENV})",
     )
     parser.add_argument(
         "--token",
-        default=os.environ.get("SCOREBOARD_PUBLICATION_TOKEN"),
-        help="publication token (env: SCOREBOARD_PUBLICATION_TOKEN)",
+        help=(
+            "publication token override; prefer the environment selected by "
+            f"{SCOREBOARD_TOKEN_ENV_ENV} (default: {SCOREBOARD_TOKEN_ENV})"
+        ),
+    )
+    parser.add_argument(
+        "--token-env",
+        help=(
+            "name of the environment variable containing the publication token "
+            f"(env selector: {SCOREBOARD_TOKEN_ENV_ENV})"
+        ),
     )
     parser.add_argument("--campaign", type=Path, help="lighteval-campaign-v3 JSON file")
     parser.add_argument(
@@ -1634,7 +1728,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="write converted lighteval DTOs here and stop before network upload",
     )
-    parser.add_argument("--timeout", type=float, default=3600.0)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        help=f"HTTP timeout in seconds (env: {SCOREBOARD_TIMEOUT_ENV}; default: 3600)",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1645,22 +1743,45 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="only verify the remote publication contract and token",
     )
-    parser.add_argument(
-        "--no-finalize",
+    finalize = parser.add_mutually_exclusive_group()
+    finalize.add_argument(
+        "--finalize",
+        dest="finalize",
         action="store_true",
+        help=f"finalize the campaign (env: {SCOREBOARD_FINALIZE_ENV}; default: true)",
+    )
+    finalize.add_argument(
+        "--no-finalize",
+        dest="finalize",
+        action="store_false",
         help="upload tasks but leave the campaign incomplete",
     )
+    parser.set_defaults(finalize=None)
     return parser
 
 
-def _require_credentials(args: argparse.Namespace) -> tuple[str, str]:
-    if not args.base_url:
-        raise ScoreboardError("--base-url or SCOREBOARD_BASE_URL is required")
-    if not args.token:
+def _require_credentials(args: argparse.Namespace) -> tuple[str, str, float, bool]:
+    explicit = {
+        key: value
+        for key, value in {
+            "base_url": args.base_url,
+            "token_env": args.token_env,
+            "timeout": args.timeout,
+            "finalize": args.finalize,
+        }.items()
+        if value is not None
+    }
+    settings = resolve_publication_settings(explicit)
+    base_url = settings.get("base_url")
+    if not base_url:
+        raise ScoreboardError(f"--base-url or {SCOREBOARD_BASE_URL_ENV} is required")
+    token_env = settings["token_env"]
+    token = args.token or os.environ.get(token_env)
+    if not token:
         raise ScoreboardError(
-            "--token or SCOREBOARD_PUBLICATION_TOKEN is required; never put the token in a file"
+            f"--token or {token_env} is required; never put the token in a file"
         )
-    return args.base_url, args.token
+    return base_url, token, settings["timeout"], settings["finalize"]
 
 
 def _write_json(value: dict[str, Any], output: TextIO | None = None) -> None:
@@ -1677,10 +1798,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.preflight_only and args.dry_run:
             raise ScoreboardError("--preflight-only and --dry-run cannot be combined")
         if args.preflight_only:
-            base_url, token = _require_credentials(args)
-            client = ScoreboardClient(
-                base_url=base_url, token=token, timeout=args.timeout
-            )
+            base_url, token, timeout, _ = _require_credentials(args)
+            client = ScoreboardClient(base_url=base_url, token=token, timeout=timeout)
             _write_json(client.preflight())
             return 0
         if args.producer_campaign is not None:
@@ -1745,14 +1864,14 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
-        base_url, token = _require_credentials(args)
-        client = ScoreboardClient(base_url=base_url, token=token, timeout=args.timeout)
+        base_url, token, timeout, finalize = _require_credentials(args)
+        client = ScoreboardClient(base_url=base_url, token=token, timeout=timeout)
         result = publish(
             client=client,
             campaign=campaign,
             task_by_identity=task_by_identity,
             expected_identities=expected_identities,
-            finalize=not args.no_finalize,
+            finalize=finalize,
         )
         _write_json(result)
         return 0

@@ -520,21 +520,18 @@ class EvaluatorConfig:
             publication["token_env"] = cls._non_empty_string(
                 publication["token_env"], "publication.token_env"
             )
-        else:
-            token_prefix = "SCOREBOARD"  # noqa: S105
-            token_suffix = "PUBLICATION_TOKEN"  # noqa: S105
-            publication["token_env"] = f"{token_prefix}_{token_suffix}"
-        timeout = publication.get("timeout", 3600.0)
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or timeout <= 0
-        ):
-            raise ValueError("publication.timeout must be positive")
-        publication["timeout"] = timeout
-        publication["finalize"] = cls._boolean(
-            publication.get("finalize", True), "publication.finalize"
-        )
+        if "timeout" in publication:
+            timeout = publication["timeout"]
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or timeout <= 0
+            ):
+                raise ValueError("publication.timeout must be positive")
+        if "finalize" in publication:
+            publication["finalize"] = cls._boolean(
+                publication["finalize"], "publication.finalize"
+            )
         if "model_sha256" in publication:
             model_sha256 = cls._non_empty_string(
                 publication["model_sha256"], "publication.model_sha256"

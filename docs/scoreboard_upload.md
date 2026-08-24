@@ -8,19 +8,27 @@ lm-eval task 都走同一条路径，不需要 `run_rwkv_five_benchmarks.py`：
 ```toml
 [publication]
 enabled = true
-base_url = "https://eval.rwkv.rs"
-token_env = "SCOREBOARD_PUBLICATION_TOKEN"
-finalize = true
-# 启用发布时必须填写权重 SHA-256；不会由系统猜测或伪造。
-model_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
-然后只执行一次正常的评测命令：
+部署地址、token、超时、是否 finalize 和模型版本信息默认从环境变量读取：
 
 ```bash
+export SCOREBOARD_BASE_URL='http://127.0.0.1:7860'
 export SCOREBOARD_PUBLICATION_TOKEN='从看板部署方获取的 token'
+export SCOREBOARD_UPLOAD_TIMEOUT='3600'
+export SCOREBOARD_UPLOAD_FINALIZE='true'
+export SCOREBOARD_MODEL_SHA256='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+export SCOREBOARD_MODEL_REVISION='可选的权重 revision'
+
 uv run --no-sync python -m lm_eval run --config /path/to/eval.toml
 ```
+
+若部署使用自定义 token 变量名，设置
+`SCOREBOARD_PUBLICATION_TOKEN_ENV` 为该变量名即可；脚本不会把 token 本身写入
+配置或结果。TOML 中显式填写的 `base_url`、`token_env`、`timeout`、`finalize`、
+`model_sha256`、`model_revision` 优先于环境变量。手工执行上传脚本时，对应 CLI
+参数再优先于环境变量。启用发布时必须提供真实的 64 位小写权重 SHA-256；系统
+不会猜测或伪造模型身份。
 
 评测器会先保存标准 `results_*.json`、逐任务 `samples_*.jsonl`，再在同一个
 输出目录的 `<model>/publication/` 写入 `raw_results.json`、campaign/task
@@ -156,6 +164,8 @@ publication token 不写入仓库、JSON 或 shell 历史；通过环境变量�
 ```bash
 export SCOREBOARD_BASE_URL=https://eval.rwkv.rs
 export SCOREBOARD_PUBLICATION_TOKEN='从看板部署方获取的 token'
+export SCOREBOARD_UPLOAD_TIMEOUT=3600
+export SCOREBOARD_UPLOAD_FINALIZE=true
 
 uv run python scripts/upload_scoreboard.py \
   --campaign /path/to/campaign.json \
@@ -165,7 +175,9 @@ uv run python scripts/upload_scoreboard.py \
 
 默认流程是 preflight → 创建/恢复 campaign → 按 campaign 顺序上传 task → finalize。
 请求带有 scoreboard-rwkv 规定的 gzip 和幂等键；中断后用相同文件重新执行即可跳过
-服务端已经确认的 task。`--no-finalize` 可只上传并保留 incomplete 状态。
+服务端已经确认的 task。将 `SCOREBOARD_UPLOAD_FINALIZE=false` 或传入
+`--no-finalize` 可只上传并保留 incomplete 状态；`--finalize` 可覆盖环境变量并明确
+完成 campaign。
 
 部署到 `/test` 前缀时，将 `SCOREBOARD_BASE_URL` 改为
 `https://eval.rwkv.rs/test`。先只检查 token 和远端契约：

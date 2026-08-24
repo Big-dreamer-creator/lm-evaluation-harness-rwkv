@@ -257,6 +257,59 @@ def test_main_dry_run_does_not_require_credentials(tmp_path: Path, capsys) -> No
     assert output["expected_task_count"] == 2
 
 
+def test_publication_settings_resolve_environment_with_explicit_precedence(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(MODULE.SCOREBOARD_BASE_URL_ENV, "http://127.0.0.1:7860")
+    monkeypatch.setenv(MODULE.SCOREBOARD_TOKEN_ENV_ENV, "LOCAL_SCOREBOARD_TOKEN")
+    monkeypatch.setenv("LOCAL_SCOREBOARD_TOKEN", "local-publication-token")
+    monkeypatch.setenv(MODULE.SCOREBOARD_TIMEOUT_ENV, "45.5")
+    monkeypatch.setenv(MODULE.SCOREBOARD_FINALIZE_ENV, "false")
+    monkeypatch.setenv(MODULE.SCOREBOARD_MODEL_SHA256_ENV, "e" * 64)
+    monkeypatch.setenv(MODULE.SCOREBOARD_MODEL_REVISION_ENV, "local-revision")
+
+    resolved = MODULE.resolve_publication_settings()
+    args = MODULE._build_parser().parse_args(["--preflight-only"])
+
+    assert resolved == {
+        "base_url": "http://127.0.0.1:7860",
+        "token_env": "LOCAL_SCOREBOARD_TOKEN",
+        "timeout": 45.5,
+        "finalize": False,
+        "model_sha256": "e" * 64,
+        "model_revision": "local-revision",
+    }
+    assert MODULE._require_credentials(args) == (
+        "http://127.0.0.1:7860",
+        "local-publication-token",
+        45.5,
+        False,
+    )
+    assert (
+        MODULE.resolve_publication_settings({"timeout": 12, "finalize": True})[
+            "timeout"
+        ]
+        == 12.0
+    )
+    assert (
+        MODULE.resolve_publication_settings({"timeout": 12, "finalize": True})[
+            "finalize"
+        ]
+        is True
+    )
+
+
+def test_publication_settings_reject_invalid_environment(monkeypatch) -> None:
+    monkeypatch.setenv(MODULE.SCOREBOARD_TIMEOUT_ENV, "never")
+    with pytest.raises(MODULE.ScoreboardError, match=MODULE.SCOREBOARD_TIMEOUT_ENV):
+        MODULE.resolve_publication_settings()
+
+    monkeypatch.setenv(MODULE.SCOREBOARD_TIMEOUT_ENV, "12")
+    monkeypatch.setenv(MODULE.SCOREBOARD_FINALIZE_ENV, "sometimes")
+    with pytest.raises(MODULE.ScoreboardError, match=MODULE.SCOREBOARD_FINALIZE_ENV):
+        MODULE.resolve_publication_settings()
+
+
 class FakeResponse:
     status = 200
 
@@ -390,7 +443,10 @@ def test_publish_uses_scoreboard_contract_transport_and_is_resumable(monkeypatch
 
 def test_native_lm_eval_publication_handles_race_and_drop_and_retains_failure(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv(MODULE.SCOREBOARD_MODEL_SHA256_ENV, "e" * 64)
+    monkeypatch.setenv(MODULE.SCOREBOARD_MODEL_REVISION_ENV, "local-e2e-revision")
     results = {
         "config": {
             "model": "rwkv7-http",
@@ -439,7 +495,6 @@ def test_native_lm_eval_publication_handles_race_and_drop_and_retains_failure(
         publication={
             "enabled": True,
             "token_env": "MISSING_TOKEN",
-            "model_sha256": "e" * 64,
         },
     )
 
@@ -449,6 +504,11 @@ def test_native_lm_eval_publication_handles_race_and_drop_and_retains_failure(
     assert "publication incomplete" in status["message"]
     campaign = json.loads(Path(status["campaign_path"]).read_text(encoding="utf-8"))
     assert campaign["schema_version"] == MODULE.LM_EVAL_CAMPAIGN_SCHEMA
+    assert campaign["model"] == {
+        "name": "rwkv7-g1i-1.5b-20260805-ctx16384",
+        "revision": "local-e2e-revision",
+        "sha256": "e" * 64,
+    }
     assert [item["task_name"] for item in campaign["expected_tasks"]] == ["race", "drop"]
     raw_results = json.loads(Path(status["raw_results_path"]).read_text(encoding="utf-8"))
     assert raw_results["samples"]["race"][0]["response_evidence"][0]["output_token_ids"] == [2]
