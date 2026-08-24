@@ -38,9 +38,9 @@ uv run --no-sync python -m lm_eval run --config /path/to/eval.toml
 不会把“评测完成、发布未完成”显示成已上传。发布载荷使用 task 名称和 task
 配置动态生成，因此不依赖某个固定 benchmark 清单。若后端没有返回原始响应
 及 token evidence，系统同样只保留本地结果并将发布标记为失败。
-部署端需要在 publication preflight 中声明并实现 `lm-eval-campaign-v1`；仍只
-声明旧 LightEval contract 的服务会被明确记录为发布失败，而不会把结果冒充成
-已上传。
+部署端需要在 publication preflight 中声明并实现 `scoreboard-v1`，并包含
+`lm-eval-harness` source；仍声明旧 contract 的服务会被明确记录为发布失败，
+不会把结果冒充成已上传。
 
 ## 旧版五 benchmark producer（兼容保留）
 
@@ -70,10 +70,9 @@ uv run python scripts/run_rwkv_five_benchmarks.py \
 `fake_think` 结果仍然可以作为本地评测结果保存，但转换器会拒绝把它伪装成
 当前 scoreboard DTO。
 
-看板当前 DTO 还要求真实的 `lighteval==0.13.0` 运行依赖。producer 会在启动
-前检查这一点；本仓库环境没有该依赖时会明确停止，而不是把 `lm_eval` 版本
-冒充成 LightEval 版本。要让这个模式真正上传，还需要在项目 `.venv` 中按看板
-契约安装并锁定该版本，或先让 scoreboard-rwkv 提供 lm-eval 原生 DTO。
+旧 producer 保留其真实 evaluator/runtime provenance；转换器将其作为
+`source = "lm-eval-harness"` 的 `scoreboard-v1` 数据发布，不再要求或伪造
+LightEval 运行身份。
 
 只做严格的 lockfile/backend/GPU/service 前置检查：
 
@@ -101,18 +100,18 @@ uv run python scripts/run_rwkv_five_benchmarks.py --verify-only
 
 这些 producer 文件使用 `rwkv-producer-campaign-v1` /
 `rwkv-producer-task-v1`，并标记 `scoreboard_upload_ready: false`。上传入口现在
-包含一个严格的 producer → `lighteval-*` 转换层：它只映射 producer 已经保存的
+包含一个严格的 producer → `scoreboard-v1` 转换层：它只映射 producer 已经保存的
 模型、运行、指标、逐样本响应和 token 证据；缺字段、fake-think、采样参数不匹配
 或缺少双 WKV mode 时直接失败，不会补造数据。
 
 本仓库的上传脚本对接的是 [scoreboard-rwkv](https://github.com/rwkv-rs/scoreboard-rwkv)
-版本化发布 API。统一入口生成 `lm-eval-campaign-v1` /
-`lm-eval-task-v1`；旧 producer 仍使用 `lighteval-campaign-v3` /
-`lighteval-task-v2`。两种载荷都必须包含完整的逐样本详情，原始
+最新 `scoreboard-v1` 发布 API，`source` 固定为 `lm-eval-harness`。campaign/task
+都使用 `scoreboard-v1`，task 载荷使用 `result_files`、`environment`、`metrics`
+和 `samples` 字段。原始
 `results_*.json` 汇总文件仍不能直接上传。
 
 ## 旧 producer 载荷的兼容说明
-当前已部署的旧服务若 preflight 尚未声明 `lm-eval-campaign-v1`，统一 TOML
+当前已部署的旧服务若 preflight 尚未声明 `scoreboard-v1` 和 `lm-eval-harness`，统一 TOML
 流程会保留本地证据并将 `status.json` 标为发布失败；不要为了绕过该检查而
 伪造 LightEval 版本、模型执行信息、逐样本输出或 token 证据。
 
@@ -122,10 +121,9 @@ uv run python scripts/run_rwkv_five_benchmarks.py --verify-only
 `campaign_id` 会由脚本在创建 campaign 后替换成服务端返回的 UUID；其余字段必须与
 campaign 的 `expected_tasks` 完全一致，并满足看板仓库当前 DTO 校验。
 
-campaign 必须使用 `schema_version: "lighteval-campaign-v3"`、
-`lighteval_version: "0.13.0"`，每个 task 必须使用
-`schema_version: "lighteval-task-v2"`。当前服务还要求同一权重同时提交 `fp16` 和
-`fp32io16` 两个 WKV mode。
+campaign/task 必须使用 `schema_version: "scoreboard-v1"`，campaign 的
+`source` 使用 `lm-eval-harness`，并按最新 DTO 计算稳定 `run_key`。每个 task
+identity 必须包含权重 SHA-256、WKV mode 和 task name。
 
 转换与上传是两个独立步骤。转换脚本只读取本地 evaluator artifacts、写出严格
 DTO，不读取看板地址或 token，也不发起网络请求：
@@ -170,6 +168,8 @@ export SCOREBOARD_BASE_URL=https://eval.rwkv.rs
 export SCOREBOARD_PUBLICATION_TOKEN='从看板部署方获取的 token'
 export SCOREBOARD_UPLOAD_TIMEOUT=3600
 export SCOREBOARD_UPLOAD_FINALIZE=true
+export SCOREBOARD_UPLOAD_RETRIES=2
+export SCOREBOARD_UPLOAD_RETRY_DELAY=1
 
 uv run python scripts/upload_scoreboard.py \
   --campaign /path/to/campaign.json \
@@ -178,8 +178,11 @@ uv run python scripts/upload_scoreboard.py \
 ```
 
 默认流程是 preflight → 创建/恢复 campaign → 按 campaign 顺序上传 task → finalize。
-请求带有 scoreboard-rwkv 规定的 gzip 和幂等键；中断后用相同文件重新执行即可跳过
-服务端已经确认的 task。将 `SCOREBOARD_UPLOAD_FINALIZE=false` 或传入
+请求带有 scoreboard-rwkv 规定的 gzip 和幂等键；网络错误和 408/425/429/5xx 会按
+`SCOREBOARD_UPLOAD_RETRIES` 和指数退避自动重试，401/422 等认证或契约错误立即失败。
+中断后用相同文件重新执行即可跳过服务端已经确认的 task。preflight、campaign/status
+和 finalize 等控制请求最多使用 30 秒 timeout；task payload 仍使用
+`SCOREBOARD_UPLOAD_TIMEOUT`。将 `SCOREBOARD_UPLOAD_FINALIZE=false` 或传入
 `--no-finalize` 可只上传并保留 incomplete 状态；`--finalize` 可覆盖环境变量并明确
 完成 campaign。
 

@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sys
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, TextIO
@@ -26,10 +27,6 @@ from urllib.request import Request, urlopen
 try:
     from scripts.convert_scoreboard_payloads import (
         CAMPAIGN_SCHEMA,
-        LIGHTEVAL_VERSION,
-        LM_EVAL_CAMPAIGN_SCHEMA,
-        LM_EVAL_TASK_SCHEMA,
-        TASK_SCHEMA,
         ScoreboardError,
         _artifact_root,
         _json_safe,
@@ -46,10 +43,6 @@ except ModuleNotFoundError as error:
         raise
     from convert_scoreboard_payloads import (  # type: ignore[no-redef]
         CAMPAIGN_SCHEMA,
-        LIGHTEVAL_VERSION,
-        LM_EVAL_CAMPAIGN_SCHEMA,
-        LM_EVAL_TASK_SCHEMA,
-        TASK_SCHEMA,
         ScoreboardError,
         _artifact_root,
         _json_safe,
@@ -63,15 +56,26 @@ except ModuleNotFoundError as error:
     )
 
 
-SUPPORTED_CAMPAIGN_SCHEMAS = {CAMPAIGN_SCHEMA, LM_EVAL_CAMPAIGN_SCHEMA}
-SUPPORTED_TASK_SCHEMAS = {TASK_SCHEMA, LM_EVAL_TASK_SCHEMA}
+SCOREBOARD_SCHEMA = "scoreboard-v1"
+CAMPAIGN_SCHEMA = SCOREBOARD_SCHEMA
+TASK_SCHEMA = SCOREBOARD_SCHEMA
+LM_EVAL_CAMPAIGN_SCHEMA = SCOREBOARD_SCHEMA
+LM_EVAL_TASK_SCHEMA = SCOREBOARD_SCHEMA
+LIGHTEVAL_VERSION = "0.13.0"
+SUPPORTED_CAMPAIGN_SCHEMAS = {SCOREBOARD_SCHEMA}
+SUPPORTED_TASK_SCHEMAS = {SCOREBOARD_SCHEMA}
+SUPPORTED_SOURCES = {"lighteval", "evalscope", "lm-eval-harness"}
 SCOREBOARD_BASE_URL_ENV = "SCOREBOARD_BASE_URL"
-SCOREBOARD_TOKEN_ENV_ENV = "SCOREBOARD_PUBLICATION_TOKEN_ENV"
-SCOREBOARD_TOKEN_ENV = "SCOREBOARD_PUBLICATION_TOKEN"
+SCOREBOARD_TOKEN_ENV_ENV = "SCOREBOARD_PUBLICATION_TOKEN_ENV"  # noqa: S105
+SCOREBOARD_TOKEN_ENV = "SCOREBOARD_PUBLICATION_TOKEN"  # noqa: S105
 SCOREBOARD_TIMEOUT_ENV = "SCOREBOARD_UPLOAD_TIMEOUT"
 SCOREBOARD_FINALIZE_ENV = "SCOREBOARD_UPLOAD_FINALIZE"
 SCOREBOARD_MODEL_SHA256_ENV = "SCOREBOARD_MODEL_SHA256"
 SCOREBOARD_MODEL_REVISION_ENV = "SCOREBOARD_MODEL_REVISION"
+SCOREBOARD_RETRIES_ENV = "SCOREBOARD_UPLOAD_RETRIES"
+SCOREBOARD_RETRY_DELAY_ENV = "SCOREBOARD_UPLOAD_RETRY_DELAY"
+CONTROL_REQUEST_TIMEOUT = 30.0
+RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
 
 def _environment_text(name: str) -> str | None:
@@ -109,6 +113,38 @@ def _environment_finalize(default: bool = True) -> bool:
     raise ScoreboardError(
         f"{SCOREBOARD_FINALIZE_ENV} must be one of true/false, yes/no, on/off, or 1/0"
     )
+
+
+def _environment_retries(default: int = 2) -> int:
+    raw = _environment_text(SCOREBOARD_RETRIES_ENV)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ScoreboardError(
+            f"{SCOREBOARD_RETRIES_ENV} must be a non-negative integer"
+        ) from error
+    if value < 0:
+        raise ScoreboardError(
+            f"{SCOREBOARD_RETRIES_ENV} must be a non-negative integer"
+        )
+    return value
+
+
+def _environment_retry_delay(default: float = 1.0) -> float:
+    raw = _environment_text(SCOREBOARD_RETRY_DELAY_ENV)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ScoreboardError(
+            f"{SCOREBOARD_RETRY_DELAY_ENV} must be a positive number"
+        ) from error
+    if not math.isfinite(value) or value <= 0:
+        raise ScoreboardError(f"{SCOREBOARD_RETRY_DELAY_ENV} must be a positive number")
+    return value
 
 
 def resolve_publication_settings(
@@ -230,7 +266,12 @@ def publish_lm_eval_evaluation(
     incomplete_tasks = [
         payload["task"]["task_name"]
         for payload in task_payloads
-        if payload.get("diagnostics", {}).get("evidence_complete") is not True
+        if any(
+            not isinstance(sample.get("model_response"), dict)
+            or sample["model_response"].get("evidence_complete") is not True
+            for sample in payload.get("samples", [])
+            if isinstance(sample, dict)
+        )
     ]
     if incomplete_tasks:
         status.update(
@@ -338,7 +379,15 @@ def _remote_error(method: str, url: str, status: int, body: bytes) -> Scoreboard
 
 
 class ScoreboardClient:
-    def __init__(self, *, base_url: str, token: str, timeout: float = 3600.0) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        token: str,
+        timeout: float = 3600.0,
+        retries: int | None = None,
+        retry_delay: float | None = None,
+    ) -> None:
         if not token:
             raise ScoreboardError("a publication token is required")
         if timeout <= 0:
@@ -346,6 +395,26 @@ class ScoreboardClient:
         self.api_root = _api_root(base_url)
         self.token = token
         self.timeout = timeout
+        self.retries = _environment_retries() if retries is None else retries
+        self.retry_delay = (
+            _environment_retry_delay() if retry_delay is None else retry_delay
+        )
+        if (
+            isinstance(self.retries, bool)
+            or not isinstance(self.retries, int)
+            or self.retries < 0
+        ):
+            raise ScoreboardError("retries must be a non-negative integer")
+        if (
+            isinstance(self.retry_delay, bool)
+            or not isinstance(self.retry_delay, (int, float))
+            or not math.isfinite(self.retry_delay)
+            or self.retry_delay <= 0
+        ):
+            raise ScoreboardError("retry_delay must be a positive number")
+
+    def _wait_before_retry(self, attempt: int) -> None:
+        time.sleep(min(self.retry_delay * (2**attempt), 30.0))
 
     def _request(
         self,
@@ -354,6 +423,7 @@ class ScoreboardClient:
         *,
         payload: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         url = f"{self.api_root}{path}"
         headers = {"Authorization": f"Bearer {self.token}"}
@@ -369,47 +439,70 @@ class ScoreboardClient:
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
         request = Request(url, data=body, headers=headers, method=method)  # noqa: S310
-        try:
-            with urlopen(request, timeout=self.timeout) as response:  # noqa: S310
-                response_body = response.read()
-                status = getattr(response, "status", 200)
-        except HTTPError as error:
-            raise _remote_error(method, url, error.code, error.read()) from error
-        except URLError as error:
-            raise ScoreboardError(
-                f"cannot reach scoreboard API {method} {url}: {error.reason}"
-            ) from error
-        except OSError as error:
-            raise ScoreboardError(
-                f"cannot reach scoreboard API {method} {url}: {error}"
-            ) from error
-        if status < 200 or status >= 300:
+        request_timeout = (
+            self.timeout if timeout is None else min(self.timeout, timeout)
+        )
+        for attempt in range(self.retries + 1):
+            try:
+                with urlopen(  # noqa: S310
+                    request,
+                    timeout=request_timeout,
+                ) as response:
+                    response_body = response.read()
+                    status = getattr(response, "status", 200)
+            except HTTPError as error:
+                response_body = error.read()
+                if error.code in RETRYABLE_HTTP_STATUSES and attempt < self.retries:
+                    self._wait_before_retry(attempt)
+                    continue
+                raise _remote_error(method, url, error.code, response_body) from error
+            except (URLError, OSError) as error:
+                if attempt < self.retries:
+                    self._wait_before_retry(attempt)
+                    continue
+                reason = error.reason if isinstance(error, URLError) else error
+                raise ScoreboardError(
+                    f"cannot reach scoreboard API {method} {url}: {reason}"
+                ) from error
+            if 200 <= status < 300:
+                return _response_json(response_body, url=url)
+            if status in RETRYABLE_HTTP_STATUSES and attempt < self.retries:
+                self._wait_before_retry(attempt)
+                continue
             raise _remote_error(method, url, status, response_body)
-        return _response_json(response_body, url=url)
+        raise ScoreboardError(
+            f"scoreboard API request exhausted retries: {method} {url}"
+        )
 
-    def preflight(self) -> dict[str, Any]:
-        response = self._request("GET", "/v1/evaluation-publication-preflight")
+    def preflight(
+        self,
+        *,
+        expected_campaign_schema: str | None = None,
+        expected_source: str | None = None,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            "/v1/evaluation-publication-preflight",
+            timeout=CONTROL_REQUEST_TIMEOUT,
+        )
         if response.get("status") != "ready":
             raise ScoreboardError(f"scoreboard preflight is not ready: {response}")
         schema_version = response.get("schema_version")
-        supported_schemas = response.get("supported_schemas")
-        if schema_version not in SUPPORTED_CAMPAIGN_SCHEMAS and not (
-            isinstance(supported_schemas, list)
-            and LM_EVAL_CAMPAIGN_SCHEMA in supported_schemas
-        ):
+        expected = expected_campaign_schema or SCOREBOARD_SCHEMA
+        if schema_version != expected or schema_version != SCOREBOARD_SCHEMA:
             raise ScoreboardError(
-                "scoreboard schema mismatch: "
-                f"expected one of {sorted(SUPPORTED_CAMPAIGN_SCHEMAS)}, "
-                f"got {schema_version!r}"
+                f"scoreboard schema mismatch: expected {expected!r}, got {schema_version!r}"
             )
-        if (
-            schema_version == CAMPAIGN_SCHEMA
-            and response.get("lighteval_version") != LIGHTEVAL_VERSION
+        sources = response.get("sources")
+        if not isinstance(sources, list) or not set(sources).intersection(
+            SUPPORTED_SOURCES
         ):
             raise ScoreboardError(
-                "scoreboard LightEval version mismatch: "
-                f"expected {LIGHTEVAL_VERSION}, "
-                f"got {response.get('lighteval_version')!r}"
+                f"scoreboard preflight has no supported sources: {response}"
+            )
+        if expected_source is not None and expected_source not in sources:
+            raise ScoreboardError(
+                f"scoreboard does not support campaign source {expected_source!r}"
             )
         return response
 
@@ -422,11 +515,14 @@ class ScoreboardClient:
             "/v1/evaluation-campaigns",
             payload=campaign,
             idempotency_key=f"campaign:{run_key}",
+            timeout=CONTROL_REQUEST_TIMEOUT,
         )
 
     def campaign_status(self, campaign_id: str) -> dict[str, Any]:
         return self._request(
-            "GET", f"/v1/evaluation-campaigns/{quote(campaign_id, safe='')}"
+            "GET",
+            f"/v1/evaluation-campaigns/{quote(campaign_id, safe='')}",
+            timeout=CONTROL_REQUEST_TIMEOUT,
         )
 
     def publish_task(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -455,35 +551,199 @@ class ScoreboardClient:
             "POST",
             f"/v1/evaluation-campaigns/{quote(campaign_id, safe='')}/finalize",
             idempotency_key=f"finalize:{campaign_id}",
+            timeout=CONTROL_REQUEST_TIMEOUT,
         )
+
+
+_EXPECTED_TASK_FIELDS = (
+    "identity",
+    "weight_sha256",
+    "weight_display_name",
+    "wkv_mode",
+    "selector",
+    "task_name",
+    "task_version",
+    "module_family",
+    "module",
+    "dataset",
+    "subset",
+    "evaluation_splits",
+    "languages",
+    "upstream_tags",
+)
+_TASK_PUBLICATION_FIELDS = (
+    "result_files",
+    "task_config",
+    "environment",
+    "sampling_config",
+    "primary_metric",
+    "metrics",
+    "diagnostics",
+    "samples",
+)
+
+
+def _require_sha256(value: Any, *, context: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ScoreboardError(f"{context} must be a 64-character lowercase SHA-256")
+    return value
+
+
+def _require_string(value: Any, *, context: str, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        raise ScoreboardError(f"{context} must be a non-empty string")
+    if value != value.strip():
+        raise ScoreboardError(f"{context} must be trimmed")
+    return value
+
+
+def _require_string_list(
+    value: Any, *, context: str, allow_empty: bool = False
+) -> list[str]:
+    if not isinstance(value, list) or (not allow_empty and not value):
+        raise ScoreboardError(f"{context} must be a non-empty string array")
+    if any(
+        not isinstance(item, str) or not item.strip() or item != item.strip()
+        for item in value
+    ):
+        raise ScoreboardError(f"{context} must contain trimmed non-empty strings")
+    if len(value) != len(set(value)):
+        raise ScoreboardError(f"{context} must contain unique strings")
+    return list(value)
+
+
+def _validate_expected_task(task: dict[str, Any], *, context: str) -> None:
+    missing = [field for field in _EXPECTED_TASK_FIELDS if field not in task]
+    if missing:
+        raise ScoreboardError(f"{context} is missing fields: {', '.join(missing)}")
+    _require_string(task["identity"], context=f"{context}.identity")
+    _require_sha256(task["weight_sha256"], context=f"{context}.weight_sha256")
+    _require_string(
+        task["weight_display_name"], context=f"{context}.weight_display_name"
+    )
+    mode = task["wkv_mode"]
+    if mode not in {"fp16", "fp32io16"}:
+        raise ScoreboardError(f"{context}.wkv_mode must be fp16 or fp32io16")
+    for field in (
+        "selector",
+        "task_name",
+        "task_version",
+        "module_family",
+        "module",
+        "dataset",
+    ):
+        _require_string(task[field], context=f"{context}.{field}")
+    _require_string(task["subset"], context=f"{context}.subset", allow_empty=True)
+    for field in ("evaluation_splits", "languages", "upstream_tags"):
+        _require_string_list(task[field], context=f"{context}.{field}")
+    expected_identity = f"{task['weight_sha256']}:{mode}:{task['task_name']}"
+    if task["identity"] != expected_identity:
+        raise ScoreboardError(
+            f"{context}.identity must match weight_sha256:wkv_mode:task_name"
+        )
+
+
+def _validate_lm_eval_expected_task(task: dict[str, Any], *, context: str) -> None:
+    for field in (
+        "identity",
+        "weight_sha256",
+        "weight_display_name",
+        "wkv_mode",
+        "task_name",
+        "selector",
+        "task_version",
+        "module_family",
+        "module",
+    ):
+        _require_string(task.get(field), context=f"{context}.{field}")
+    _require_sha256(task["weight_sha256"], context=f"{context}.weight_sha256")
+    if task["wkv_mode"] not in {"fp16", "fp32io16"}:
+        raise ScoreboardError(f"{context}.wkv_mode must be fp16 or fp32io16")
+    if task["identity"] != (
+        f"{task['weight_sha256']}:{task['wkv_mode']}:{task['task_name']}"
+    ):
+        raise ScoreboardError(
+            f"{context}.identity must match weight_sha256:wkv_mode:task_name"
+        )
+    for field in ("dataset", "subset"):
+        value = task.get(field)
+        if value is not None:
+            _require_string(value, context=f"{context}.{field}", allow_empty=True)
+    for field in ("evaluation_splits", "languages", "upstream_tags"):
+        _require_string_list(
+            task.get(field, []), context=f"{context}.{field}", allow_empty=True
+        )
+
+
+def _validate_scoreboard_task(task: dict[str, Any], *, context: str) -> None:
+    required = (
+        "identity",
+        "weight_sha256",
+        "weight_display_name",
+        "wkv_mode",
+        "benchmark",
+        "task_name",
+        "task_version",
+        "evaluation_splits",
+        "languages",
+        "tags",
+    )
+    missing = [field for field in required if field not in task]
+    if missing:
+        raise ScoreboardError(f"{context} is missing fields: {', '.join(missing)}")
+    _require_string(task["identity"], context=f"{context}.identity")
+    _require_sha256(task["weight_sha256"], context=f"{context}.weight_sha256")
+    _require_string(
+        task["weight_display_name"], context=f"{context}.weight_display_name"
+    )
+    if task["wkv_mode"] not in {"fp16", "fp32io16"}:
+        raise ScoreboardError(f"{context}.wkv_mode must be fp16 or fp32io16")
+    for field in ("benchmark", "task_name", "task_version"):
+        _require_string(task[field], context=f"{context}.{field}")
+    if (
+        task["identity"]
+        != f"{task['weight_sha256']}:{task['wkv_mode']}:{task['task_name']}"
+    ):
+        raise ScoreboardError(f"{context}.identity does not match task dimensions")
+    for field in ("evaluation_splits", "languages", "tags"):
+        _require_string_list(
+            task[field], context=f"{context}.{field}", allow_empty=True
+        )
+    for field in ("dataset", "subset"):
+        if task.get(field) is not None:
+            _require_string(task[field], context=f"{context}.{field}", allow_empty=True)
 
 
 def _validate_campaign(campaign: dict[str, Any]) -> list[str]:
     schema_version = campaign.get("schema_version")
-    if schema_version not in SUPPORTED_CAMPAIGN_SCHEMAS:
-        raise ScoreboardError(
-            f"campaign.schema_version must be one of "
-            f"{sorted(SUPPORTED_CAMPAIGN_SCHEMAS)!r}; run "
-            "scripts/convert_scoreboard_payloads.py before uploading raw evaluator data"
-        )
+    if schema_version != SCOREBOARD_SCHEMA:
+        raise ScoreboardError(f"campaign.schema_version must be {SCOREBOARD_SCHEMA!r}")
     run_key = campaign.get("run_key")
     if not isinstance(run_key, str) or re.fullmatch(r"[0-9a-f]{64}", run_key) is None:
         raise ScoreboardError(
             "campaign.run_key must be a 64-character hexadecimal string"
         )
-    if (
-        schema_version == CAMPAIGN_SCHEMA
-        and campaign.get("lighteval_version") != LIGHTEVAL_VERSION
+    if campaign.get("source") not in SUPPORTED_SOURCES:
+        raise ScoreboardError("campaign.source must be one of scoreboard sources")
+    for field in ("config_sha256", "registry_sha256", "contract_sha256"):
+        _require_sha256(campaign.get(field), context=f"campaign.{field}")
+    configured = _require_string_list(
+        campaign.get("configured_benchmarks"), context="campaign.configured_benchmarks"
+    )
+    resolved = _require_string_list(
+        campaign.get("resolved_benchmarks"), context="campaign.resolved_benchmarks"
+    )
+    skipped = _require_string_list(
+        campaign.get("skipped_benchmarks"),
+        context="campaign.skipped_benchmarks",
+        allow_empty=True,
+    )
+    if set(resolved).intersection(skipped) or set(resolved).union(skipped) != set(
+        configured
     ):
         raise ScoreboardError(
-            f"campaign.lighteval_version must be {LIGHTEVAL_VERSION!r}"
+            "campaign benchmark status must partition configured benchmarks"
         )
-    if schema_version == LM_EVAL_CAMPAIGN_SCHEMA:
-        evaluator = campaign.get("evaluator")
-        if not isinstance(evaluator, dict) or evaluator.get("framework") != "lm-eval":
-            raise ScoreboardError(
-                "lm-eval campaign must declare evaluator.framework='lm-eval'"
-            )
     expected = campaign.get("expected_tasks")
     if not isinstance(expected, list) or not expected:
         raise ScoreboardError("campaign.expected_tasks must be a non-empty array")
@@ -498,21 +758,43 @@ def _validate_campaign(campaign: dict[str, Any]) -> list[str]:
             raise ScoreboardError(
                 f"campaign.expected_tasks[{index}] has empty identity"
             )
+        _validate_scoreboard_task(task, context=f"campaign.expected_tasks[{index}]")
         identities.append(identity)
     if len(identities) != len(set(identities)):
         raise ScoreboardError("campaign.expected_tasks identities must be unique")
+    benchmarks = {task["benchmark"] for task in expected}
+    if benchmarks != set(resolved):
+        raise ScoreboardError(
+            "campaign expected task benchmarks must match resolved_benchmarks"
+        )
+    expected_without_key = dict(campaign)
+    expected_without_key.pop("run_key", None)
+    try:
+        from scripts.convert_scoreboard_payloads import campaign_run_key
+    except ModuleNotFoundError:
+        from convert_scoreboard_payloads import campaign_run_key  # type: ignore
+    if run_key != campaign_run_key(expected_without_key):
+        raise ScoreboardError(
+            "campaign.run_key does not match normalized campaign payload"
+        )
     return identities
 
 
 def _validate_tasks(
-    payloads: list[dict[str, Any]], expected_identities: list[str]
+    payloads: list[dict[str, Any]],
+    expected_identities: list[str],
+    campaign: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
     by_identity: dict[str, dict[str, Any]] = {}
+    expected_tasks = {
+        task["identity"]: task
+        for task in campaign["expected_tasks"]
+        if isinstance(task, dict) and isinstance(task.get("identity"), str)
+    }
     for index, payload in enumerate(payloads):
-        if payload.get("schema_version") not in SUPPORTED_TASK_SCHEMAS:
+        if payload.get("schema_version") != SCOREBOARD_SCHEMA:
             raise ScoreboardError(
-                f"task file {index} schema_version must be one of "
-                f"{sorted(SUPPORTED_TASK_SCHEMAS)!r}"
+                f"task file {index} schema_version must be {SCOREBOARD_SCHEMA!r}"
             )
         task = payload.get("task")
         if not isinstance(task, dict) or not isinstance(task.get("identity"), str):
@@ -522,6 +804,31 @@ def _validate_tasks(
             raise ScoreboardError(f"task file {index} has empty task.identity")
         if identity in by_identity:
             raise ScoreboardError(f"duplicate task payload for identity {identity}")
+        if payload.get("task") != expected_tasks.get(identity):
+            raise ScoreboardError(
+                f"task file {index} task metadata does not match campaign expected_tasks"
+            )
+        campaign_id = payload.get("campaign_id")
+        if campaign_id is not None and (
+            not isinstance(campaign_id, str) or not campaign_id
+        ):
+            raise ScoreboardError(
+                f"task file {index}.campaign_id must be null or a string"
+            )
+        missing = [field for field in _TASK_PUBLICATION_FIELDS if field not in payload]
+        if missing:
+            raise ScoreboardError(
+                f"task file {index} is missing fields: {', '.join(missing)}"
+            )
+        if not isinstance(payload["result_files"], list) or not payload["result_files"]:
+            raise ScoreboardError(f"task file {index}.result_files must be non-empty")
+        for field in ("task_config", "environment", "sampling_config", "diagnostics"):
+            if not isinstance(payload[field], dict):
+                raise ScoreboardError(f"task file {index}.{field} must be an object")
+        if not isinstance(payload["metrics"], dict) or not payload["metrics"]:
+            raise ScoreboardError(f"task file {index}.metrics must be non-empty")
+        if not isinstance(payload["samples"], list):
+            raise ScoreboardError(f"task file {index}.samples must be an array")
         by_identity[identity] = payload
     expected = set(expected_identities)
     actual = set(by_identity)
@@ -547,7 +854,7 @@ def load_publication_inputs(
     campaign = _load_json_object(campaign_path)
     payloads = [_load_json_object(path) for path in task_paths]
     expected_identities = _validate_campaign(campaign)
-    tasks = _validate_tasks(payloads, expected_identities)
+    tasks = _validate_tasks(payloads, expected_identities, campaign)
     return campaign, tasks, expected_identities
 
 
@@ -559,7 +866,15 @@ def publish(
     expected_identities: list[str],
     finalize: bool = True,
 ) -> dict[str, Any]:
-    preflight = client.preflight()
+    schema_version = campaign.get("schema_version")
+    if not isinstance(schema_version, str):
+        raise ScoreboardError(
+            "campaign.schema_version must be a string before publication"
+        )
+    preflight = client.preflight(
+        expected_campaign_schema=schema_version,
+        expected_source=campaign.get("source"),
+    )
     campaign_receipt = client.create_campaign(campaign)
     campaign_id = campaign_receipt.get("campaign_id")
     if not isinstance(campaign_id, str) or not campaign_id:
@@ -569,9 +884,9 @@ def publish(
     status = client.campaign_status(campaign_id)
     if status.get("campaign_id") != campaign_id:
         raise ScoreboardError("campaign status returned a different campaign_id")
-    acknowledged = status.get("acknowledged_task_digests", {})
+    acknowledged = status.get("task_hashes", {})
     if not isinstance(acknowledged, dict):
-        raise ScoreboardError("campaign status has invalid acknowledged_task_digests")
+        raise ScoreboardError("campaign status has invalid task_hashes")
     if status.get("status") == "complete":
         mismatched = []
         for identity in expected_identities:
@@ -589,7 +904,7 @@ def publish(
             "campaign": campaign_receipt,
             "preflight": preflight,
             "tasks": [
-                {"identity": identity, "disposition": "unchanged"}
+                {"identity": identity, "action": "unchanged"}
                 for identity in expected_identities
             ],
             "finalize": {"status": "complete", "task_count": len(expected_identities)},
@@ -604,8 +919,8 @@ def publish(
             task_receipts.append(
                 {
                     "identity": identity,
-                    "disposition": "unchanged",
-                    "content_digest": digest,
+                    "action": "unchanged",
+                    "content_sha256": digest,
                 }
             )
             continue

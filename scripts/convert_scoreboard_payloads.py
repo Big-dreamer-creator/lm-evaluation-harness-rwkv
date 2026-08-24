@@ -19,10 +19,10 @@ from pathlib import Path
 from typing import Any, TextIO
 
 
-CAMPAIGN_SCHEMA = "lighteval-campaign-v3"
-TASK_SCHEMA = "lighteval-task-v2"
-LM_EVAL_CAMPAIGN_SCHEMA = "lm-eval-campaign-v1"
-LM_EVAL_TASK_SCHEMA = "lm-eval-task-v1"
+CAMPAIGN_SCHEMA = "scoreboard-v1"
+TASK_SCHEMA = "scoreboard-v1"
+LM_EVAL_CAMPAIGN_SCHEMA = CAMPAIGN_SCHEMA
+LM_EVAL_TASK_SCHEMA = TASK_SCHEMA
 LIGHTEVAL_VERSION = "0.13.0"
 PRODUCER_CAMPAIGN_SCHEMA = "rwkv-producer-campaign-v1"
 PRODUCER_TASK_SCHEMA = "rwkv-producer-task-v1"
@@ -166,6 +166,38 @@ def content_digest(value: Any) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
+def campaign_run_key(campaign: dict[str, Any]) -> str:
+    payload = deepcopy(campaign)
+    payload.pop("run_key", None)
+    payload.setdefault("rerun_reason", None)
+    for field in (
+        "configured_benchmarks",
+        "resolved_benchmarks",
+        "skipped_benchmarks",
+    ):
+        values = payload.get(field)
+        if isinstance(values, list):
+            payload[field] = sorted(values)
+    expected = payload.get("expected_tasks")
+    if isinstance(expected, list):
+        normalized: list[dict[str, Any]] = []
+        for task in expected:
+            value = deepcopy(task)
+            for field in ("evaluation_splits", "languages", "tags"):
+                values = value.get(field)
+                if isinstance(values, list):
+                    value[field] = sorted(values)
+            normalized.append(value)
+        payload["expected_tasks"] = sorted(
+            normalized,
+            key=lambda value: (
+                str(value.get("identity", "")),
+                canonical_json(value),
+            ),
+        )
+    return content_digest(payload)
+
+
 def _finite_number(value: Any) -> bool:
     return (
         isinstance(value, (int, float))
@@ -261,21 +293,14 @@ def _producer_expected_tasks(
             "weight_sha256": weight_sha256,
             "weight_display_name": weight_display_name,
             "wkv_mode": mode,
+            "benchmark": benchmark,
             "task_name": benchmark,
-            **{
-                key: deepcopy(contract[key])
-                for key in (
-                    "selector",
-                    "task_version",
-                    "module_family",
-                    "module",
-                    "dataset",
-                    "subset",
-                    "evaluation_splits",
-                    "languages",
-                    "upstream_tags",
-                )
-            },
+            "task_version": contract["task_version"],
+            "dataset": contract["dataset"],
+            "subset": contract["subset"],
+            "evaluation_splits": deepcopy(contract["evaluation_splits"]),
+            "languages": deepcopy(contract["languages"]),
+            "tags": deepcopy(contract["upstream_tags"]),
         }
         expected.append(task_descriptor)
         if producer_identity in producer_to_scoreboard:
@@ -687,16 +712,17 @@ def convert_producer_publication(
     model_display_name = _producer_model_display_name(campaign, provenance)
     converted_campaign = {
         "schema_version": CAMPAIGN_SCHEMA,
-        "run_key": campaign.get("run_key"),
-        "config_digest": campaign.get("config_digest"),
-        "registry_digest": campaign.get("registry_digest"),
-        "eval_contract_digest": campaign.get("eval_contract_digest"),
-        "lighteval_version": LIGHTEVAL_VERSION,
-        "configured_selectors": deepcopy(campaign.get("configured_selectors")),
-        "resolved_selectors": deepcopy(campaign.get("resolved_selectors")),
-        "skipped_selectors": deepcopy(campaign.get("skipped_selectors")),
+        "source": "lm-eval-harness",
+        "config_sha256": campaign.get("config_digest"),
+        "registry_sha256": campaign.get("registry_digest"),
+        "contract_sha256": campaign.get("eval_contract_digest"),
+        "configured_benchmarks": deepcopy(campaign.get("configured_selectors")),
+        "resolved_benchmarks": deepcopy(campaign.get("resolved_selectors")),
+        "skipped_benchmarks": deepcopy(campaign.get("skipped_selectors")),
         "expected_tasks": expected,
+        "rerun_reason": None,
     }
+    converted_campaign["run_key"] = campaign_run_key(converted_campaign)
 
     converted_tasks: list[dict[str, Any]] = []
     expected_by_identity = {item["identity"]: item for item in expected}
@@ -767,17 +793,20 @@ def convert_producer_publication(
                 # pretending to know the remote campaign id locally.
                 "campaign_id": "assigned-by-uploader",
                 "task": descriptor,
-                "artifact": {
-                    "lighteval_version": LIGHTEVAL_VERSION,
-                    "results_path": f"results/{model_display_name}/{benchmark}/{descriptor['wkv_mode']}.json",
-                    "details_paths": [
-                        f"details/{model_display_name}/{benchmark}/{descriptor['wkv_mode']}.jsonl"
-                    ],
-                },
+                "result_files": [
+                    {
+                        "role": "metrics",
+                        "path": f"results/{model_display_name}/{benchmark}/{descriptor['wkv_mode']}.json",
+                    },
+                    {
+                        "role": "samples",
+                        "path": f"details/{model_display_name}/{benchmark}/{descriptor['wkv_mode']}.jsonl",
+                    },
+                ],
                 "task_config": _producer_task_config(
                     producer_task, benchmark, len(details)
                 ),
-                "model": {
+                "environment": {
                     "weight_sha256": weight_sha256,
                     "weight_display_name": model_display_name,
                     "wkv_mode": descriptor["wkv_mode"],
@@ -797,14 +826,24 @@ def convert_producer_publication(
                     "dependency_versions": _producer_dependency_versions(
                         campaign, producer_task
                     ),
+                    "source": "lm-eval-harness",
                 },
                 "sampling_config": _producer_sampling(
                     campaign, task_for_sampling, prompt_template=prompt_template
                 ),
                 "primary_metric": primary_metric,
-                "aggregates": aggregates,
+                "metrics": aggregates,
                 "diagnostics": _producer_diagnostics(details, prompt_template),
-                "details": details,
+                "samples": [
+                    {
+                        "sample_index": detail["sample_index"],
+                        "document_index": detail["document_index"],
+                        "document": detail["doc"],
+                        "metrics": detail["metric"],
+                        "model_response": detail["model_response"],
+                    }
+                    for detail in details
+                ],
             }
         )
     return converted_campaign, converted_tasks
@@ -852,9 +891,46 @@ def _task_metric_values(results: dict[str, Any], task_name: str) -> dict[str, fl
     return normalized
 
 
+def _flatten_response_evidence(value: Any, *, context: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise ScoreboardError(f"{context} must be a non-empty evidence array")
+    flattened: list[dict[str, Any]] = []
+    for request_index, request_evidence in enumerate(value):
+        if isinstance(request_evidence, dict):
+            request_items = [request_evidence]
+        elif isinstance(request_evidence, list):
+            request_items = request_evidence
+        else:
+            raise ScoreboardError(
+                f"{context}[{request_index}] must be an object or array"
+            )
+        if not request_items:
+            raise ScoreboardError(f"{context}[{request_index}] must not be empty")
+        for response_index, item in enumerate(request_items):
+            if not isinstance(item, dict):
+                raise ScoreboardError(
+                    f"{context}[{request_index}][{response_index}] must be an object"
+                )
+            flattened.append({"request_index": request_index, **_json_safe(item)})
+    if not flattened:
+        raise ScoreboardError(f"{context} contains no evidence items")
+    return flattened
+
+
+def _token_ids(value: Any, *, context: str, allow_empty: bool = True) -> list[int]:
+    if not isinstance(value, list) or any(
+        isinstance(item, bool) or not isinstance(item, int) for item in value
+    ):
+        raise ScoreboardError(f"{context} must contain integer token IDs")
+    if not allow_empty and not value:
+        raise ScoreboardError(f"{context} must not be empty")
+    return list(value)
+
+
 def _lm_eval_response(sample: dict[str, Any], *, context: str) -> dict[str, Any]:
-    evidence = sample.get("response_evidence")
-    evidence_items = evidence if isinstance(evidence, list) else []
+    evidence_items = _flatten_response_evidence(
+        sample.get("response_evidence"), context=f"{context}.response_evidence"
+    )
 
     def evidence_has_output(item: Any) -> bool:
         if not isinstance(item, dict):
@@ -868,80 +944,349 @@ def _lm_eval_response(sample: dict[str, Any], *, context: str) -> dict[str, Any]
         choice = choices[0]
         if not isinstance(choice, dict):
             return False
-        return isinstance(choice.get("text"), str) or isinstance(
-            choice.get("logprobs"), dict
+        if isinstance(choice.get("text"), str):
+            return isinstance(item.get("post_processed_answer"), str)
+        logprobs = choice.get("logprobs")
+        return isinstance(logprobs, dict) and isinstance(
+            logprobs.get("token_logprobs"), list
+        )
+
+    def token_ids_are_valid(value: Any) -> bool:
+        return isinstance(value, list) and all(
+            isinstance(token, int) and not isinstance(token, bool) for token in value
         )
 
     response: dict[str, Any] = {
         "raw_resps": _json_safe(sample.get("resps", [])),
         "filtered_resps": _json_safe(sample.get("filtered_resps", [])),
         "arguments": _json_safe(sample.get("arguments", [])),
-        "evidence_complete": False,
+        "evidence": _json_safe(evidence_items),
     }
-    if isinstance(evidence, list):
-        response["evidence"] = _json_safe(evidence)
-        prompts = [item.get("prompt") for item in evidence if isinstance(item, dict)]
-        response["input"] = next(
-            (item for item in prompts if isinstance(item, str)), None
-        )
-        response["input_tokens"] = next(
-            (
-                item.get("input_token_ids")
-                for item in evidence
-                if isinstance(item, dict)
-                and isinstance(item.get("input_token_ids"), list)
-            ),
-            [],
-        )
-        texts: list[str] = []
-        output_tokens: list[list[int]] = []
-        answers: list[str] = []
-        logprobs: list[float] = []
-        for index, item in enumerate(evidence):
-            if not isinstance(item, dict):
-                raise ScoreboardError(
-                    f"{context}.response_evidence[{index}] is not an object"
-                )
-            raw = item.get("raw_response")
-            choices = raw.get("choices") if isinstance(raw, dict) else None
-            choice = choices[0] if isinstance(choices, list) and choices else None
-            text = choice.get("text") if isinstance(choice, dict) else None
-            if isinstance(text, str):
-                texts.append(text)
-            choice_logprobs = (
-                choice.get("logprobs") if isinstance(choice, dict) else None
-            )
-            token_logprobs = (
-                choice_logprobs.get("token_logprobs")
-                if isinstance(choice_logprobs, dict)
-                else None
-            )
-            if isinstance(token_logprobs, list):
-                finite = [item for item in token_logprobs if _finite_number(item)]
-                if finite:
-                    logprobs.append(sum(float(item) for item in finite))
-            token_ids = item.get("output_token_ids")
-            if isinstance(token_ids, list) and all(
-                isinstance(token, int) and not isinstance(token, bool)
-                for token in token_ids
-            ):
-                output_tokens.append(token_ids)
-            answer = item.get("post_processed_answer")
-            if isinstance(answer, str):
-                answers.append(answer)
-        response["text"] = texts
-        response["output_tokens"] = output_tokens
-        response["text_post_processed"] = answers
-        if logprobs:
-            response["logprobs"] = logprobs
-        response["evidence_complete"] = bool(evidence_items) and all(
-            isinstance(item, dict)
-            and isinstance(item.get("input_token_ids"), list)
-            and isinstance(item.get("output_token_ids"), list)
-            and evidence_has_output(item)
+    prompts = [item.get("prompt") for item in evidence_items]
+    response["input"] = next((item for item in prompts if isinstance(item, str)), None)
+    response["input_tokens"] = next(
+        (
+            _token_ids(item.get("input_token_ids"), context=f"{context}.input_tokens")
             for item in evidence_items
+            if isinstance(item.get("input_token_ids"), list)
+        ),
+        [],
+    )
+    texts: list[str] = []
+    output_tokens: list[list[int]] = []
+    answers: list[str] = []
+    logprobs: list[float] = []
+    for index, item in enumerate(evidence_items):
+        raw = item.get("raw_response")
+        choices = raw.get("choices") if isinstance(raw, dict) else None
+        choice = choices[0] if isinstance(choices, list) and choices else None
+        text = choice.get("text") if isinstance(choice, dict) else None
+        if isinstance(text, str):
+            texts.append(text)
+        choice_logprobs = choice.get("logprobs") if isinstance(choice, dict) else None
+        token_logprobs = (
+            choice_logprobs.get("token_logprobs")
+            if isinstance(choice_logprobs, dict)
+            else None
         )
+        if isinstance(token_logprobs, list):
+            finite = [item for item in token_logprobs if _finite_number(item)]
+            if finite:
+                logprobs.append(sum(float(item) for item in finite))
+        if isinstance(item.get("output_token_ids"), list):
+            output_tokens.append(
+                _token_ids(
+                    item["output_token_ids"],
+                    context=f"{context}.evidence[{index}].output_token_ids",
+                )
+            )
+        answer = item.get("post_processed_answer")
+        if isinstance(answer, str):
+            answers.append(answer)
+    if texts:
+        response["text"] = texts
+        response["text_post_processed"] = answers
+    if output_tokens:
+        response["output_tokens"] = output_tokens
+    if logprobs:
+        response["logprobs"] = logprobs
+    response["evidence_complete"] = all(
+        isinstance(item.get("input_token_ids"), list)
+        and isinstance(item.get("output_token_ids"), list)
+        and _token_ids(item["input_token_ids"], context=f"{context}.input_token_ids")
+        is not None
+        and _token_ids(item["output_token_ids"], context=f"{context}.output_token_ids")
+        is not None
+        and evidence_has_output(item)
+        for item in evidence_items
+    )
     return response
+
+
+def _native_task_metadata(
+    publication: dict[str, Any], task_name: str, native_config: dict[str, Any]
+) -> dict[str, Any]:
+    task_metadata = publication.get("task_metadata", {})
+    value = task_metadata.get(task_name, {}) if isinstance(task_metadata, dict) else {}
+    if not isinstance(value, dict):
+        value = {}
+    metadata = native_config.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    selector = metadata.get("benchmark_name")
+    selector_value = (
+        task_metadata.get(selector, {})
+        if isinstance(selector, str) and isinstance(task_metadata, dict)
+        else {}
+    )
+    if not isinstance(selector_value, dict):
+        selector_value = {}
+    return {**metadata, **selector_value, **value}
+
+
+def _native_wkv_mode(
+    publication: dict[str, Any], task_name: str, native_config: dict[str, Any]
+) -> str:
+    metadata = _native_task_metadata(publication, task_name, native_config)
+    model_args = native_config.get("model_args")
+    candidates = [
+        metadata.get("wkv_mode"),
+        native_config.get("wkv_mode"),
+        model_args.get("wkv_mode") if isinstance(model_args, dict) else None,
+    ]
+    mode = next((value for value in candidates if isinstance(value, str)), None)
+    if mode not in {"fp16", "fp32io16"}:
+        raise ScoreboardError(
+            f"lm-eval task {task_name} lacks a recorded fp16/fp32io16 WKV mode"
+        )
+    return mode
+
+
+def _native_gpu(results: dict[str, Any], config: dict[str, Any]) -> str | None:
+    for value in (
+        results.get("gpu"),
+        config.get("gpu"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    environment = results.get("pretty_env_info")
+    if isinstance(environment, str):
+        matches = re.findall(r"GPU \d+: ([^\n]+)", environment)
+        if matches:
+            return ", ".join(dict.fromkeys(item.strip() for item in matches))
+    return None
+
+
+def _native_execution(
+    results: dict[str, Any], config: dict[str, Any], *, wkv_mode: str, enabled: bool
+) -> dict[str, Any]:
+    model_args = config.get("model_args")
+    model_args = model_args if isinstance(model_args, dict) else {}
+    execution = results.get("execution")
+    execution = execution if isinstance(execution, dict) else {}
+    backend_revision = (
+        execution.get("backend_revision")
+        or results.get("backend_commit")
+        or config.get("backend_commit")
+        or model_args.get("backend_commit")
+    )
+    backend_version = (
+        execution.get("backend_version")
+        or results.get("backend_version")
+        or config.get("backend_version")
+        or model_args.get("backend_version")
+    )
+    gpu = execution.get("gpu") or _native_gpu(results, config)
+    max_num_seqs = execution.get("max_num_seqs") or model_args.get("num_concurrent")
+    max_num_batched_tokens = (
+        execution.get("max_num_batched_tokens")
+        or model_args.get("max_num_batched_tokens")
+        or model_args.get("max_length")
+    )
+    torch_version = results.get("torch_version")
+    if not isinstance(torch_version, str):
+        environment = results.get("pretty_env_info")
+        match = (
+            re.search(r"^PyTorch version: ([^\n]+)", environment, re.MULTILINE)
+            if isinstance(environment, str)
+            else None
+        )
+        torch_version = match.group(1).strip() if match else None
+    execution_payload: dict[str, Any] = {
+        "wkv_mode": wkv_mode,
+        "prompt_template": model_args.get("rwkv_prompt_template", "assistant"),
+        "gemm_policy": (
+            "fp16-accumulation" if wkv_mode == "fp16" else "fp32-accumulation"
+        ),
+        "evaluator": "lm-eval",
+    }
+    if isinstance(gpu, str) and gpu.strip():
+        execution_payload["gpu"] = gpu.strip()
+    if (
+        isinstance(max_num_seqs, int)
+        and not isinstance(max_num_seqs, bool)
+        and max_num_seqs > 0
+    ):
+        execution_payload["max_num_seqs"] = max_num_seqs
+    if (
+        isinstance(max_num_batched_tokens, int)
+        and not isinstance(max_num_batched_tokens, bool)
+        and max_num_batched_tokens > 0
+    ):
+        execution_payload["max_num_batched_tokens"] = max_num_batched_tokens
+    dependency_versions: dict[str, str] = {}
+    evaluator_version = results.get("lm_eval_version")
+    if isinstance(evaluator_version, str) and evaluator_version.strip():
+        dependency_versions["lm-eval"] = evaluator_version.strip()
+    if isinstance(torch_version, str) and torch_version.strip():
+        dependency_versions["torch"] = torch_version.strip()
+    if isinstance(backend_version, str) and backend_version.strip():
+        dependency_versions["vllm"] = (
+            f"{backend_version.strip()}@{backend_revision.strip()}"
+            if isinstance(backend_revision, str) and backend_revision.strip()
+            else backend_version.strip()
+        )
+    if dependency_versions:
+        execution_payload["dependency_versions"] = dependency_versions
+    if isinstance(backend_revision, str) and backend_revision.strip():
+        execution_payload["backend_revision"] = backend_revision.strip()
+    return execution_payload
+
+
+def _native_task_config(
+    results: dict[str, Any],
+    native_config: dict[str, Any],
+    task_name: str,
+    sample_count: int,
+) -> dict[str, Any]:
+    value = _json_safe(native_config)
+    if not isinstance(value, dict):
+        value = {}
+    counts = results.get("n-samples")
+    counts = counts.get(task_name) if isinstance(counts, dict) else None
+    original = counts.get("original") if isinstance(counts, dict) else None
+    effective = counts.get("effective") if isinstance(counts, dict) else None
+    if not isinstance(original, int) or isinstance(original, bool) or original <= 0:
+        raise ScoreboardError(f"lm-eval task {task_name} lacks original sample count")
+    if not isinstance(effective, int) or isinstance(effective, bool) or effective <= 0:
+        raise ScoreboardError(f"lm-eval task {task_name} lacks effective sample count")
+    if effective != sample_count:
+        raise ScoreboardError(
+            f"lm-eval task {task_name} sample count does not match n-samples.effective"
+        )
+    output_type = value.get("output_type")
+    generation_kwargs = value.get("generation_kwargs")
+    if not isinstance(generation_kwargs, dict):
+        generation_kwargs = {}
+    max_gen_toks = generation_kwargs.get("max_gen_toks") or generation_kwargs.get(
+        "max_tokens"
+    )
+    if not isinstance(max_gen_toks, int) or isinstance(max_gen_toks, bool):
+        max_gen_toks = 1 if output_type != "generate_until" else None
+    if max_gen_toks is None:
+        raise ScoreboardError(f"lm-eval task {task_name} lacks generation size")
+    value.update(
+        {
+            "generation_size": max_gen_toks,
+            "original_num_docs": original,
+            "effective_num_docs": effective,
+            "not_evaluated_num_docs": original - effective,
+        }
+    )
+    return value
+
+
+def _native_sampling(
+    results: dict[str, Any], config: dict[str, Any], native_config: dict[str, Any]
+) -> dict[str, Any]:
+    model_args = config.get("model_args")
+    model_args = model_args if isinstance(model_args, dict) else {}
+    generation_kwargs = native_config.get("generation_kwargs")
+    if not isinstance(generation_kwargs, dict):
+        generation_kwargs = config.get("gen_kwargs", {})
+    if not isinstance(generation_kwargs, dict):
+        generation_kwargs = {}
+    sampling = {
+        "generation_kwargs": _json_safe(generation_kwargs),
+        "rwkv_prompt_template": model_args.get("rwkv_prompt_template"),
+        "rwkv_generation_prompt": model_args.get("rwkv_generation_prompt"),
+        "rwkv_sampling_mode": model_args.get("rwkv_sampling_mode"),
+        "batch_size": config.get("batch_size"),
+        "num_concurrent": model_args.get("num_concurrent"),
+        "max_length": model_args.get("max_length") or results.get("max_length"),
+        "eot_token_id": results.get("eot_token_id"),
+    }
+    prompt = model_args.get("rwkv_prompt_template")
+    generation_prompt = model_args.get("rwkv_generation_prompt")
+    if prompt in {"assistant", "bot", "function_calling"}:
+        sampling["stop"] = [
+            {"assistant": "\nUser:", "bot": "✿", "function_calling": "\n### User"}[
+                prompt
+            ]
+        ]
+    if generation_prompt == "open_think":
+        sampling.update(
+            temperature=0.96,
+            top_p=0.76,
+            top_k=32,
+            presence_penalty=1.0,
+            frequency_penalty=0.1,
+            penalty_decay=0.988,
+        )
+    elif generation_prompt == "fake_think":
+        sampling.update(temperature=1.0, top_p=0.28, top_k=32)
+    return sampling
+
+
+def _native_diagnostics(details: list[dict[str, Any]]) -> dict[str, Any]:
+    completions = 0
+    truncated = 0
+    violations = 0
+    for detail in details:
+        response = detail["model_response"]
+        texts = response.get("text")
+        output_tokens = response.get("output_tokens")
+        logprobs = response.get("logprobs")
+        if not isinstance(output_tokens, list):
+            continue
+        completion_count = (
+            len(texts)
+            if isinstance(texts, list)
+            else (len(logprobs) if isinstance(logprobs, list) else len(output_tokens))
+        )
+        evidence = response.get("evidence")
+        evidence_items = evidence if isinstance(evidence, list) else []
+        for index in range(min(completion_count, len(output_tokens))):
+            tokens = output_tokens[index]
+            if not isinstance(tokens, list):
+                continue
+            completions += 1
+            matching = evidence_items[index] if index < len(evidence_items) else {}
+            truncated += int(
+                isinstance(matching, dict)
+                and (
+                    matching.get("truncation") is True
+                    or matching.get("finish_reason") in {"length", "max_tokens"}
+                )
+            )
+            text = (
+                texts[index] if isinstance(texts, list) and index < len(texts) else ""
+            )
+            violations += int(
+                isinstance(text, str)
+                and any(stop in text for stop in ("✿", "\nUser:", "\n### User"))
+            )
+    return {
+        "samples": len(details),
+        "completions": completions,
+        "truncated": truncated,
+        "non_truncated": completions - truncated,
+        "truncation_rate": truncated / completions if completions else 0.0,
+        "turn_boundary_violations": violations,
+        "turn_boundary_violation_rate": violations / completions
+        if completions
+        else 0.0,
+    }
 
 
 def build_lm_eval_publication(
@@ -980,11 +1325,11 @@ def build_lm_eval_publication(
     task_metadata = task_metadata if isinstance(task_metadata, dict) else {}
     resolved_configs = results.get("configs", {})
     resolved_configs = resolved_configs if isinstance(resolved_configs, dict) else {}
-    evaluator = {
-        "framework": "lm-eval",
-        "version": results.get("lm_eval_version"),
-        "git_hash": results.get("git_hash"),
-    }
+    evaluator_version = results.get("lm_eval_version")
+    if not isinstance(evaluator_version, str) or not evaluator_version.strip():
+        raise ScoreboardError("lm-eval results lack evaluator version")
+    evaluator = {"name": "lm-eval", "version": evaluator_version}
+    enabled = publication.get("enabled") is True
     model_sha256 = publication.get("model_sha256") or config.get("model_sha")
     if publication.get("enabled") and not (
         isinstance(model_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", model_sha256)
@@ -998,6 +1343,10 @@ def build_lm_eval_publication(
         model["sha256"] = model_sha256
     if publication.get("model_revision"):
         model["revision"] = publication["model_revision"]
+    if enabled and "sha256" not in model:
+        raise ScoreboardError(
+            "publication.model_sha256 is required for enabled publication"
+        )
     config_digest = content_digest(
         _json_safe(
             {
@@ -1008,58 +1357,69 @@ def build_lm_eval_publication(
             }
         )
     )
-    run_key = content_digest(
-        {
-            "config_digest": config_digest,
-            "model": model,
-            "tasks": task_names,
-            "results": _json_safe(results.get("results", {})),
-        }
-    )
     expected_tasks: list[dict[str, Any]] = []
     task_payloads: list[dict[str, Any]] = []
     for task_name in task_names:
-        custom_metadata = task_metadata.get(task_name, {})
-        if not isinstance(custom_metadata, dict):
-            custom_metadata = {}
         native_config = resolved_configs.get(task_name, {})
         native_config = native_config if isinstance(native_config, dict) else {}
+        custom_metadata = _native_task_metadata(publication, task_name, native_config)
         native_metadata = native_config.get("metadata", {})
         native_metadata = native_metadata if isinstance(native_metadata, dict) else {}
         native_split = native_config.get("test_split") or native_config.get(
             "validation_split"
         )
-        identity = f"{model_name}:{task_name}"
+        wkv_mode = _native_wkv_mode(publication, task_name, native_config)
+        if "sha256" not in model:
+            raise ScoreboardError(
+                f"lm-eval task {task_name} cannot construct stable identity without model SHA-256"
+            )
+        identity = f"{model['sha256']}:{wkv_mode}:{task_name}"
+        versions = results.get("versions")
+        recorded_version = (
+            versions.get(task_name) if isinstance(versions, dict) else None
+        )
+        task_version = custom_metadata.get(
+            "task_version",
+            recorded_version or native_metadata.get("version", "unknown"),
+        )
+        if not isinstance(task_version, str):
+            task_version = str(task_version)
+        dataset = custom_metadata.get("dataset", native_config.get("dataset_path"))
+        if not isinstance(dataset, str) or not dataset.strip():
+            dataset = None
+        subset = custom_metadata.get("subset", native_config.get("dataset_name"))
+        if subset is None:
+            subset = ""
+        if not isinstance(subset, str):
+            subset = str(subset)
+        evaluation_splits = custom_metadata.get(
+            "evaluation_splits", [native_split] if native_split else ["unknown"]
+        )
+        if not isinstance(evaluation_splits, list) or not evaluation_splits:
+            raise ScoreboardError(f"lm-eval task {task_name} lacks evaluation split")
+        evaluation_splits = [str(value) for value in evaluation_splits]
+        benchmark = custom_metadata.get("benchmark_name", task_name)
+        if not isinstance(benchmark, str) or not benchmark.strip():
+            benchmark = task_name
         descriptor = {
             "identity": identity,
+            "weight_sha256": model["sha256"],
+            "weight_display_name": model_name,
+            "wkv_mode": wkv_mode,
+            "benchmark": benchmark,
             "task_name": task_name,
-            "selector": task_name,
-            "task_version": custom_metadata.get(
-                "task_version", native_metadata.get("version", "native")
-            ),
-            "module_family": custom_metadata.get("module_family", task_name),
-            "module": custom_metadata.get(
-                "module", native_config.get("task", "lm_eval.tasks")
-            ),
-            "dataset": custom_metadata.get(
-                "dataset", native_config.get("dataset_path")
-            ),
-            "subset": custom_metadata.get("subset", native_config.get("dataset_name")),
-            "evaluation_splits": custom_metadata.get(
-                "evaluation_splits", [native_split] if native_split else []
-            ),
-            "languages": custom_metadata.get("languages", []),
-            "upstream_tags": custom_metadata.get("upstream_tags", []),
-            "model": model,
-            "evaluator": evaluator,
+            "task_version": task_version,
+            "dataset": dataset.strip() if isinstance(dataset, str) else None,
+            "subset": subset.strip() or None,
+            "evaluation_splits": evaluation_splits,
+            "languages": [str(value) for value in custom_metadata.get("languages", [])],
+            "tags": [
+                str(value)
+                for value in custom_metadata.get(
+                    "tags", custom_metadata.get("upstream_tags", [])
+                )
+            ],
         }
-        descriptor.update(
-            {
-                key: _json_safe(value)
-                for key, value in custom_metadata.items()
-                if key not in descriptor and key != "identity"
-            }
-        )
         expected_tasks.append(descriptor)
         task_samples = samples.get(task_name)
         if not isinstance(task_samples, list) or not task_samples:
@@ -1076,23 +1436,19 @@ def build_lm_eval_publication(
                 next(iter(metrics)),
             )
         details: list[dict[str, Any]] = []
-        truncated = 0
         for sample_index, sample in enumerate(task_samples):
             if not isinstance(sample, dict):
                 raise ScoreboardError(
                     f"lm-eval task {task_name} sample[{sample_index}] is not an object"
                 )
-            evidence = sample.get("response_evidence")
-            if isinstance(evidence, list):
-                truncated += sum(
-                    int(
-                        isinstance(item, dict)
-                        and (
-                            item.get("truncation") is True
-                            or item.get("finish_reason") in {"length", "max_tokens"}
-                        )
-                    )
-                    for item in evidence
+            document_index = sample.get("doc_id")
+            if (
+                isinstance(document_index, bool)
+                or not isinstance(document_index, int)
+                or document_index < 0
+            ):
+                raise ScoreboardError(
+                    f"lm-eval task {task_name} sample[{sample_index}] lacks valid doc_id"
                 )
             sample_metrics = {
                 key: sample[key]
@@ -1111,56 +1467,121 @@ def build_lm_eval_publication(
             specific.setdefault("helicopter_document_index", sample_index)
             specific["lm_eval_document_index"] = sample.get("doc_id", sample_index)
             doc_value["specific"] = specific
+            doc_value["target"] = _json_safe(sample.get("target"))
             details.append(
                 {
                     "sample_index": sample_index,
-                    "document_index": sample_index,
+                    "document_index": document_index,
                     "doc": doc_value,
-                    "target": _json_safe(sample.get("target")),
                     "metric": _json_safe(sample_metrics),
                     "model_response": _lm_eval_response(
                         sample, context=f"{task_name}.sample[{sample_index}]"
                     ),
                 }
             )
+        sample_count = len(details)
+        task_config = _native_task_config(
+            results, native_config, task_name, sample_count
+        )
+        model_execution = _native_execution(
+            results, config, wkv_mode=wkv_mode, enabled=enabled
+        )
+        model_execution.update(
+            weight_sha256=model["sha256"],
+            weight_display_name=model_name,
+        )
+        evidence_complete = all(
+            detail["model_response"].get("evidence_complete") is True
+            for detail in details
+        )
+        if enabled and not evidence_complete:
+            raise ScoreboardError(
+                f"lm-eval task {task_name} lacks complete raw response/token evidence"
+            )
+        diagnostics = _native_diagnostics(details)
         task_payloads.append(
             {
                 "schema_version": LM_EVAL_TASK_SCHEMA,
                 "campaign_id": None,
                 "task": descriptor,
-                "model": model,
-                "evaluator": evaluator,
-                "primary_metric": primary_metric,
-                "aggregates": metrics,
-                "diagnostics": {
-                    "samples": len(details),
-                    "truncated": truncated,
-                    "truncation_rate": truncated / len(details) if details else 0.0,
-                    "evidence_complete": all(
-                        detail["model_response"].get("evidence_complete") is True
-                        for detail in details
-                    ),
+                "result_files": [
+                    {
+                        "role": "metrics",
+                        "path": "publication/raw_results.json",
+                    },
+                    {
+                        "role": "samples",
+                        "path": [
+                            "publication/tasks/"
+                            + re.sub(r"[^A-Za-z0-9_.-]+", "_", task_name)
+                            + ".json"
+                        ][0],
+                    },
+                ],
+                "task_config": task_config,
+                "environment": {
+                    **model_execution,
+                    "model_name": model_name,
+                    "model_revision": model.get("revision"),
+                    "chat_template_sha": results.get("chat_template_sha"),
+                    "task_hash": (results.get("task_hashes") or {}).get(task_name)
+                    if isinstance(results.get("task_hashes"), dict)
+                    else None,
+                    "git_hash": results.get("git_hash"),
                 },
-                "details": details,
+                "sampling_config": _native_sampling(results, config, native_config),
+                "primary_metric": primary_metric,
+                "metrics": metrics,
+                "diagnostics": diagnostics,
+                "samples": [
+                    {
+                        "sample_index": detail["sample_index"],
+                        "document_index": detail["document_index"],
+                        "document": detail["doc"],
+                        "metrics": detail["metric"],
+                        "model_response": detail["model_response"],
+                    }
+                    for detail in details
+                ],
             }
         )
     campaign = {
-        "schema_version": LM_EVAL_CAMPAIGN_SCHEMA,
-        "run_key": run_key,
-        "config_digest": config_digest,
-        "registry_digest": content_digest({"tasks": task_names}),
-        "eval_contract_digest": content_digest(
+        "schema_version": CAMPAIGN_SCHEMA,
+        "source": "lm-eval-harness",
+        "config_sha256": config_digest,
+        "registry_sha256": content_digest(expected_tasks),
+        "contract_sha256": content_digest(
             {"framework": "lm-eval", "version": evaluator.get("version")}
         ),
-        "evaluator": evaluator,
-        "model": model,
-        "model_name": model_name,
-        "configured_selectors": task_names,
-        "resolved_selectors": task_names,
-        "skipped_selectors": [],
+        "configured_benchmarks": list(
+            dict.fromkeys(
+                [
+                    str(
+                        _native_task_metadata(
+                            publication, task_name, resolved_configs.get(task_name, {})
+                        ).get("benchmark_name", task_name)
+                    )
+                    for task_name in task_names
+                ]
+            )
+        ),
+        "resolved_benchmarks": list(
+            dict.fromkeys(
+                [
+                    str(
+                        _native_task_metadata(
+                            publication, task_name, resolved_configs.get(task_name, {})
+                        ).get("benchmark_name", task_name)
+                    )
+                    for task_name in task_names
+                ]
+            )
+        ),
+        "skipped_benchmarks": [],
         "expected_tasks": expected_tasks,
-        "publication_contract": "lm-eval-native-v1",
+        "rerun_reason": None,
     }
+    campaign["run_key"] = campaign_run_key(campaign)
     return campaign, task_payloads
 
 
