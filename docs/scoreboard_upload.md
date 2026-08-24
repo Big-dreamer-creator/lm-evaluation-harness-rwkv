@@ -127,13 +127,11 @@ campaign 必须使用 `schema_version: "lighteval-campaign-v3"`、
 `schema_version: "lighteval-task-v2"`。当前服务还要求同一权重同时提交 `fp16` 和
 `fp32io16` 两个 WKV mode。
 
-对新生成的 producer artifacts，可以直接转换并上传，不必手工改 JSON：
+转换与上传是两个独立步骤。转换脚本只读取本地 evaluator artifacts、写出严格
+DTO，不读取看板地址或 token，也不发起网络请求：
 
 ```bash
-export SCOREBOARD_BASE_URL=https://eval.rwkv.rs
-export SCOREBOARD_PUBLICATION_TOKEN='从看板部署方获取的 token'
-
-uv run python scripts/upload_scoreboard.py \
+uv run python scripts/convert_scoreboard_payloads.py \
   --producer-campaign results/formal-rwkv-five-benchmarks-20260821/publication/campaign.json \
   --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp16__moral_stories.json \
   --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp16__haerae.json \
@@ -144,18 +142,24 @@ uv run python scripts/upload_scoreboard.py \
   --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp32io16__haerae.json \
   --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp32io16__jsonschema_bench.json \
   --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp32io16__gsm8k_platinum.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp32io16__aexams.json
+  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp32io16__aexams.json \
+  --output-dir /tmp/scoreboard-publication
 ```
 
-先只生成转换后的 DTO，不联网：
+转换成功后，再把输出的 `campaign.json` 和每个 `tasks/*.json` 显式交给上传脚本：
 
 ```bash
+export SCOREBOARD_BASE_URL=https://eval.rwkv.rs
+export SCOREBOARD_PUBLICATION_TOKEN='从看板部署方获取的 token'
+
 uv run python scripts/upload_scoreboard.py \
-  --producer-campaign <producer-campaign.json> \
-  --producer-task <producer-task-1.json> \
-  --producer-task <producer-task-2.json> \
-  --converted-output-dir /tmp/scoreboard-publication
+  --campaign /tmp/scoreboard-publication/campaign.json \
+  --task /tmp/scoreboard-publication/tasks/<task-1>.json \
+  --task /tmp/scoreboard-publication/tasks/<task-2>.json
 ```
+
+`upload_scoreboard.py` 不再接受 `--producer-campaign`、`--producer-task` 或原始
+lm-eval results；传入未转换格式会直接失败并提示先运行转换脚本。
 
 ## 生产环境上传
 

@@ -11,6 +11,15 @@ import pytest
 
 
 ROOT = Path(__file__).parents[2]
+CONVERTER_SCRIPT = ROOT / "scripts/convert_scoreboard_payloads.py"
+CONVERTER_SPEC = importlib.util.spec_from_file_location(
+    "scripts.convert_scoreboard_payloads", CONVERTER_SCRIPT
+)
+CONVERTER = importlib.util.module_from_spec(CONVERTER_SPEC)
+assert CONVERTER_SPEC.loader is not None
+sys.modules[CONVERTER_SPEC.name] = CONVERTER
+CONVERTER_SPEC.loader.exec_module(CONVERTER)
+
 SCRIPT = ROOT / "scripts/upload_scoreboard.py"
 SPEC = importlib.util.spec_from_file_location("upload_scoreboard", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -102,7 +111,7 @@ def _producer_inputs(*, scoreboard_compatible: bool = True) -> tuple[dict, list[
             "generation_prompt": "open_think",
         },
         "sampling_config": {
-            **MODULE._TARGET_SAMPLING,
+            **CONVERTER._TARGET_SAMPLING,
             "stop": ["\nUser:"],
         },
         "generation_config": {"max_gen_toks": 8192, "do_sample": True},
@@ -117,7 +126,7 @@ def _producer_inputs(*, scoreboard_compatible: bool = True) -> tuple[dict, list[
         },
     }
     campaign = {
-        "schema_version": MODULE.PRODUCER_CAMPAIGN_SCHEMA,
+        "schema_version": CONVERTER.PRODUCER_CAMPAIGN_SCHEMA,
         "publication_contract": "rwkv-producer-v1",
         "scoreboard_upload_ready": False,
         "scoreboard_compatible": scoreboard_compatible,
@@ -125,7 +134,7 @@ def _producer_inputs(*, scoreboard_compatible: bool = True) -> tuple[dict, list[
         "config_digest": "b" * 64,
         "registry_digest": "c" * 64,
         "eval_contract_digest": "d" * 64,
-        "lighteval_version": MODULE.LIGHTEVAL_VERSION,
+        "lighteval_version": CONVERTER.LIGHTEVAL_VERSION,
         "configured_selectors": ["moral_stories"],
         "resolved_selectors": ["moral_stories"],
         "skipped_selectors": [],
@@ -150,7 +159,7 @@ def _producer_inputs(*, scoreboard_compatible: bool = True) -> tuple[dict, list[
         identity = f"{provenance['model_name']}:{mode}:moral_stories"
         payloads.append(
             {
-                "schema_version": MODULE.PRODUCER_TASK_SCHEMA,
+                "schema_version": CONVERTER.PRODUCER_TASK_SCHEMA,
                 "campaign_id": None,
                 "task": {
                     "identity": identity,
@@ -211,7 +220,7 @@ def _producer_inputs(*, scoreboard_compatible: bool = True) -> tuple[dict, list[
 def test_producer_payload_is_converted_losslessly_to_scoreboard_dto() -> None:
     producer_campaign, producer_tasks = _producer_inputs()
 
-    campaign_payload, task_payloads = MODULE.convert_producer_publication(
+    campaign_payload, task_payloads = CONVERTER.convert_producer_publication(
         producer_campaign, producer_tasks
     )
 
@@ -231,7 +240,61 @@ def test_producer_payload_is_converted_losslessly_to_scoreboard_dto() -> None:
 def test_producer_conversion_rejects_non_publishable_sampling_contract() -> None:
     campaign_payload, task_payloads = _producer_inputs(scoreboard_compatible=False)
     with pytest.raises(MODULE.ScoreboardError, match="scoreboard-compatible"):
-        MODULE.convert_producer_publication(campaign_payload, task_payloads)
+        CONVERTER.convert_producer_publication(campaign_payload, task_payloads)
+
+
+def test_converter_and_uploader_have_separate_cli_contracts(
+    tmp_path: Path, capsys
+) -> None:
+    producer_campaign, producer_tasks = _producer_inputs()
+    campaign_path = tmp_path / "producer-campaign.json"
+    campaign_path.write_text(json.dumps(producer_campaign), encoding="utf-8")
+    task_paths = []
+    for index, payload in enumerate(producer_tasks):
+        path = tmp_path / f"producer-task-{index}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        task_paths.append(path)
+    converted = tmp_path / "converted"
+
+    assert (
+        CONVERTER.main(
+            [
+                "--producer-campaign",
+                str(campaign_path),
+                "--producer-task",
+                str(task_paths[0]),
+                "--producer-task",
+                str(task_paths[1]),
+                "--output-dir",
+                str(converted),
+            ]
+        )
+        == 0
+    )
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["network_access"] is False
+    assert receipt["task_count"] == 2
+    converted_task_paths = sorted((converted / "tasks").glob("*.json"))
+    assert len(converted_task_paths) == 2
+
+    assert (
+        MODULE.main(
+            [
+                "--campaign",
+                str(converted / "campaign.json"),
+                "--task",
+                str(converted_task_paths[0]),
+                "--task",
+                str(converted_task_paths[1]),
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    upload_dry_run = json.loads(capsys.readouterr().out)
+    assert upload_dry_run["expected_task_count"] == 2
+    assert not hasattr(MODULE, "convert_producer_publication")
+    assert not hasattr(CONVERTER, "ScoreboardClient")
 
 
 def test_main_dry_run_does_not_require_credentials(tmp_path: Path, capsys) -> None:
