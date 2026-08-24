@@ -1250,6 +1250,78 @@ metric = "exact_match"
         with pytest.raises(ValueError, match="Unknown RWKV profile fields: metric"):
             EvaluatorConfig.load_config(config)
 
+    def test_versioned_config_normalizes_publication_settings(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "publication.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["race", "drop"]
+output_dir = "results/publication"
+max_length = 16384
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
+
+[publication]
+enabled = true
+base_url = "https://eval.rwkv.rs/test"
+token_env = "MY_PUBLICATION_TOKEN"
+finalize = false
+model_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+""",
+            encoding="utf-8",
+        )
+
+        loaded = EvaluatorConfig.from_config(config)
+
+        assert loaded.publication == {
+            "enabled": True,
+            "base_url": "https://eval.rwkv.rs/test",
+            "token_env": "MY_PUBLICATION_TOKEN",
+            "timeout": 3600.0,
+            "finalize": False,
+            "model_sha256": "a" * 64,
+        }
+        assert loaded.model_args["record_evidence"] is True
+
+    def test_versioned_config_requires_samples_for_publication(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "publication-without-samples.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/publication"
+max_length = 16384
+log_samples = false
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+sampling_mode = "profile"
+wkv_mode = "fp32io16"
+
+[publication]
+enabled = true
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="requires log_samples"):
+            EvaluatorConfig.from_config(config)
+
     def test_cli_overrides_yaml_overrides_defaults(self, tmp_path):
         """Test full precedence chain: CLI args > YAML config > built-in defaults."""
         from argparse import Namespace

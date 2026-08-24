@@ -50,6 +50,9 @@ VERSIONED_CONFIG_FIELDS = {
     "model_name",
     "num_concurrent",
     "output_dir",
+    "publication",
+    "publish",
+    "scoreboard",
     "rwkv_profile",
     "samples",
     "schema_version",
@@ -77,6 +80,16 @@ RWKV_PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
 RWKV_GENERATION_PROMPTS = {"fake_think", "open_think"}
 RWKV_SAMPLING_MODES = {"profile", "task"}
 RWKV_WKV_MODES = {"fp16", "fp32io16"}
+PUBLICATION_FIELDS = {
+    "enabled",
+    "base_url",
+    "token_env",
+    "timeout",
+    "finalize",
+    "model_sha256",
+    "model_revision",
+    "task_metadata",
+}
 
 
 @dataclass(slots=True)
@@ -250,6 +263,14 @@ class EvaluatorConfig:
     metadata: dict = field(
         default_factory=dict,
         metadata={"help": "Additional metadata for tasks that require it"},
+    )
+
+    # Dashboard publication.  Evaluation remains useful without a configured
+    # publisher; when enabled, the run writes a complete local publication
+    # spool before attempting any network request.
+    publication: dict = field(
+        default_factory=dict,
+        metadata={"help": "Scoreboard publication settings"},
     )
 
     @classmethod
@@ -459,6 +480,90 @@ class EvaluatorConfig:
         ):
             raise ValueError("seed must contain four integers")
 
+        publication_value = config.get("publication")
+        if publication_value is None:
+            # Accept the short aliases for hand-written TOMLs while exposing a
+            # single normalized field to the execution pipeline.
+            publication_value = config.get("scoreboard", config.get("publish", {}))
+        if isinstance(publication_value, bool):
+            publication_value = {"enabled": publication_value}
+        if publication_value is None:
+            publication_value = {}
+        if not isinstance(publication_value, dict):
+            raise TypeError("publication must be a table or boolean")
+        unknown_publication = sorted(set(publication_value) - PUBLICATION_FIELDS)
+        if unknown_publication:
+            raise ValueError(
+                "Unknown publication fields: " + ", ".join(unknown_publication)
+            )
+        publication = dict(publication_value)
+        publication["enabled"] = cls._boolean(
+            publication.get("enabled", False), "publication.enabled"
+        )
+        if "base_url" in publication:
+            publication["base_url"] = cls._non_empty_string(
+                publication["base_url"], "publication.base_url"
+            )
+            parsed_publication_url = urlsplit(publication["base_url"])
+            if (
+                parsed_publication_url.scheme not in {"http", "https"}
+                or not parsed_publication_url.netloc
+                or parsed_publication_url.username is not None
+                or parsed_publication_url.password is not None
+                or parsed_publication_url.query
+                or parsed_publication_url.fragment
+            ):
+                raise ValueError(
+                    "publication.base_url must be an absolute HTTP(S) URL without credentials, query, or fragment"
+                )
+        if "token_env" in publication:
+            publication["token_env"] = cls._non_empty_string(
+                publication["token_env"], "publication.token_env"
+            )
+        else:
+            token_prefix = "SCOREBOARD"  # noqa: S105
+            token_suffix = "PUBLICATION_TOKEN"  # noqa: S105
+            publication["token_env"] = f"{token_prefix}_{token_suffix}"
+        timeout = publication.get("timeout", 3600.0)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        ):
+            raise ValueError("publication.timeout must be positive")
+        publication["timeout"] = timeout
+        publication["finalize"] = cls._boolean(
+            publication.get("finalize", True), "publication.finalize"
+        )
+        if "model_sha256" in publication:
+            model_sha256 = cls._non_empty_string(
+                publication["model_sha256"], "publication.model_sha256"
+            )
+            if len(model_sha256) != 64 or any(
+                character not in "0123456789abcdef" for character in model_sha256
+            ):
+                raise ValueError("publication.model_sha256 must be 64 lowercase hex characters")
+            publication["model_sha256"] = model_sha256
+        if "model_revision" in publication:
+            publication["model_revision"] = cls._non_empty_string(
+                publication["model_revision"], "publication.model_revision"
+            )
+        if "task_metadata" in publication:
+            task_metadata = publication["task_metadata"]
+            if not isinstance(task_metadata, dict):
+                raise TypeError("publication.task_metadata must be a table")
+            for task_name, value in task_metadata.items():
+                if not isinstance(task_name, str) or not task_name.strip():
+                    raise ValueError("publication.task_metadata keys must be non-empty strings")
+                if not isinstance(value, dict):
+                    raise TypeError(
+                        f"publication.task_metadata.{task_name} must be a table"
+                    )
+        if publication["enabled"] and not log_samples:
+            raise ValueError(
+                "publication.enabled requires log_samples = true so per-sample evidence is retained"
+            )
+
         normalized: dict[str, Any] = {
             "model": "rwkv7-http",
             "tasks": benchmarks,
@@ -485,7 +590,13 @@ class EvaluatorConfig:
                 "cot_mode": generation_prompt,
                 "prompt_template": prompt_template,
             },
+            "publication": publication,
         }
+        if publication["enabled"]:
+            # The HTTP backend keeps raw responses and token IDs only when
+            # evidence recording is enabled.  Do not change legacy configs'
+            # model-argument shape unless they opt into publication.
+            normalized["model_args"]["record_evidence"] = True
         if "limit" in config:
             limit = config["limit"]
             if (

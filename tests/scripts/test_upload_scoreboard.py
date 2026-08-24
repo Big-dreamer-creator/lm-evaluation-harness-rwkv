@@ -90,6 +90,150 @@ def test_load_inputs_requires_exact_task_set(tmp_path: Path) -> None:
         MODULE.load_publication_inputs(campaign_path, [task_path])
 
 
+def _producer_inputs(*, scoreboard_compatible: bool = True) -> tuple[dict, list[dict]]:
+    weight = "e" * 64
+    provenance = {
+        "model_name": "rwkv7-g1i-1.5b-20260805-ctx16384",
+        "weight_path": "/mnt/e/code/Weights/rwkv7-g1i-1.5b-20260805-ctx16384.pth",
+        "weight_sha256": weight,
+        "backend_commit": "f" * 40,
+        "prompt": {
+            "template": "assistant",
+            "generation_prompt": "open_think",
+        },
+        "sampling_config": {
+            **MODULE._TARGET_SAMPLING,
+            "stop": ["\nUser:"],
+        },
+        "generation_config": {"max_gen_toks": 8192, "do_sample": True},
+        "scoreboard_compatible": scoreboard_compatible,
+        "gpu": [{"name": "Test GPU"}],
+        "runtime": {
+            "rwkv_max_num_seqs": 24,
+            "max_num_batched_tokens": 16384,
+        },
+        "dependencies": {
+            "packages": {"torch": "2.11.0", "lighteval": "0.13.0"},
+        },
+    }
+    campaign = {
+        "schema_version": MODULE.PRODUCER_CAMPAIGN_SCHEMA,
+        "publication_contract": "rwkv-producer-v1",
+        "scoreboard_upload_ready": False,
+        "scoreboard_compatible": scoreboard_compatible,
+        "run_key": "a" * 64,
+        "config_digest": "b" * 64,
+        "registry_digest": "c" * 64,
+        "eval_contract_digest": "d" * 64,
+        "lighteval_version": MODULE.LIGHTEVAL_VERSION,
+        "configured_selectors": ["moral_stories"],
+        "resolved_selectors": ["moral_stories"],
+        "skipped_selectors": [],
+        "model_name": provenance["model_name"],
+        "weight_sha256": weight,
+        "provenance": provenance,
+        "expected_tasks": [
+            {
+                "identity": f"{provenance['model_name']}:fp16:moral_stories",
+                "task": "moral_stories",
+                "wkv_mode": "fp16",
+            },
+            {
+                "identity": f"{provenance['model_name']}:fp32io16:moral_stories",
+                "task": "moral_stories",
+                "wkv_mode": "fp32io16",
+            },
+        ],
+    }
+    payloads = []
+    for mode in ("fp16", "fp32io16"):
+        identity = f"{provenance['model_name']}:{mode}:moral_stories"
+        payloads.append(
+            {
+                "schema_version": MODULE.PRODUCER_TASK_SCHEMA,
+                "campaign_id": None,
+                "task": {
+                    "identity": identity,
+                    "task_name": "moral_stories",
+                    "model_name": provenance["model_name"],
+                    "wkv_mode": mode,
+                    "results": {
+                        "metrics": {"acc": 1.0},
+                        "sample_count": 1,
+                        "task_config": {
+                            "generation_size": 8192,
+                            "original_num_docs": 1,
+                            "effective_num_docs": 1,
+                            "skipped_multiselect_docs": 0,
+                        },
+                    },
+                    "task_config": {
+                        "generation_size": 8192,
+                        "original_num_docs": 1,
+                        "effective_num_docs": 1,
+                        "skipped_multiselect_docs": 0,
+                    },
+                    "samples": [
+                        {
+                            "doc_id": 0,
+                            "doc": {"query": "Is this right?", "label": 1},
+                            "metrics": ["acc"],
+                            "acc": 1,
+                            "response_evidence": [
+                                {
+                                    "prompt": "Is this right?",
+                                    "input_token_ids": [10],
+                                    "output_token_ids": [11],
+                                    "raw_response": {
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "text": "Yes",
+                                                "logprobs": {
+                                                    "token_logprobs": [None, -0.1]
+                                                },
+                                            }
+                                        ]
+                                    },
+                                    "post_processed_answer": "True",
+                                    "reasoning": None,
+                                }
+                            ],
+                        }
+                    ],
+                    "provenance": {**provenance, "wkv_mode": mode},
+                },
+            }
+        )
+    return campaign, payloads
+
+
+def test_producer_payload_is_converted_losslessly_to_scoreboard_dto() -> None:
+    producer_campaign, producer_tasks = _producer_inputs()
+
+    campaign_payload, task_payloads = MODULE.convert_producer_publication(
+        producer_campaign, producer_tasks
+    )
+
+    assert campaign_payload["schema_version"] == MODULE.CAMPAIGN_SCHEMA
+    assert all(
+        payload["schema_version"] == MODULE.TASK_SCHEMA for payload in task_payloads
+    )
+    assert {
+        payload["task"]["identity"] for payload in task_payloads
+    } == {f"{'e' * 64}:fp16:moral_stories", f"{'e' * 64}:fp32io16:moral_stories"}
+    detail = task_payloads[0]["details"][0]
+    assert detail["model_response"]["logprobs"] == [-0.1]
+    assert detail["model_response"]["output_tokens"] == [[11]]
+    assert detail["doc"]["specific"]["helicopter_document_index"] == 0
+
+
+def test_producer_conversion_rejects_non_publishable_sampling_contract() -> None:
+    campaign_payload, task_payloads = _producer_inputs(scoreboard_compatible=False)
+    with pytest.raises(MODULE.ScoreboardError, match="scoreboard-compatible"):
+        MODULE.convert_producer_publication(campaign_payload, task_payloads)
+
+
 def test_main_dry_run_does_not_require_credentials(tmp_path: Path, capsys) -> None:
     campaign_path, task_paths = write_inputs(tmp_path)
 
@@ -242,3 +386,69 @@ def test_publish_uses_scoreboard_contract_transport_and_is_resumable(monkeypatch
     )
     assert second["tasks"][0]["disposition"] == "unchanged"
     assert not any("/tasks/" in item["path"] for item in requests)
+
+
+def test_native_lm_eval_publication_handles_race_and_drop_and_retains_failure(
+    tmp_path: Path,
+) -> None:
+    results = {
+        "config": {
+            "model": "rwkv7-http",
+            "model_args": {"model": "rwkv7-g1i-1.5b-20260805-ctx16384"},
+        },
+        "configs": {
+            "race": {"task": "race", "dataset_path": "race", "test_split": "test"},
+            "drop": {"task": "drop", "dataset_path": "drop", "test_split": "validation"},
+        },
+        "results": {
+            "race": {"acc,none": 0.5},
+            "drop": {"f1,none": 0.25},
+        },
+        "lm_eval_version": "0.4.13.dev0",
+    }
+    samples = {
+        task_name: [
+            {
+                "doc_id": 0,
+                "doc": {"question": task_name},
+                "target": "answer",
+                "arguments": ["prompt"],
+                "resps": [["answer"]],
+                "filtered_resps": ["answer"],
+                "metrics": ["acc" if task_name == "race" else "f1"],
+                "acc": 1.0 if task_name == "race" else None,
+                "f1": 1.0 if task_name == "drop" else None,
+                "response_evidence": [
+                    {
+                        "prompt": "prompt",
+                        "input_token_ids": [1],
+                        "output_token_ids": [2],
+                        "raw_response": {"choices": [{"text": "answer"}]},
+                        "post_processed_answer": "answer",
+                    }
+                ],
+            }
+        ]
+        for task_name in ("race", "drop")
+    }
+
+    status = MODULE.publish_lm_eval_evaluation(
+        results,
+        samples,
+        output_dir=tmp_path,
+        publication={
+            "enabled": True,
+            "token_env": "MISSING_TOKEN",
+            "model_sha256": "e" * 64,
+        },
+    )
+
+    assert status["evaluation"] == "complete"
+    assert status["publication"] == "failed"
+    assert status["uploaded"] is False
+    assert "publication incomplete" in status["message"]
+    campaign = json.loads(Path(status["campaign_path"]).read_text(encoding="utf-8"))
+    assert campaign["schema_version"] == MODULE.LM_EVAL_CAMPAIGN_SCHEMA
+    assert [item["task_name"] for item in campaign["expected_tasks"]] == ["race", "drop"]
+    raw_results = json.loads(Path(status["raw_results_path"]).read_text(encoding="utf-8"))
+    assert raw_results["samples"]["race"][0]["response_evidence"][0]["output_token_ids"] == [2]
