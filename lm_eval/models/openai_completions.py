@@ -79,9 +79,45 @@ class _VLLMRWKVTokenizer(RemoteTokenizer):
 
 
 class _CompletionGeneration(str):
-    def __new__(cls, text: str, finish_reason: str | None = None):
+    def __new__(
+        cls,
+        text: str,
+        finish_reason: str | None = None,
+        *,
+        raw_response: dict | None = None,
+        prompt_token_ids: list[int] | None = None,
+        output_token_ids: list[int] | None = None,
+        reasoning: str | None = None,
+    ):
         value = super().__new__(cls, text)
         value.finish_reason = finish_reason
+        value.raw_response = raw_response
+        value.prompt_token_ids = prompt_token_ids
+        value.output_token_ids = output_token_ids
+        value.reasoning = reasoning
+        value.truncated = finish_reason in {"length", "max_tokens"}
+        return value
+
+
+class _LogLikelihoodEvidence(tuple):
+    """Tuple-compatible loglikelihood result with optional HTTP evidence."""
+
+    def __new__(
+        cls,
+        logprob: float,
+        is_greedy: bool,
+        *,
+        raw_response: dict | None = None,
+        prompt_token_ids: list[int] | None = None,
+        output_token_ids: list[int] | None = None,
+    ):
+        value = super().__new__(cls, (logprob, is_greedy))
+        value.raw_response = raw_response
+        value.prompt_token_ids = prompt_token_ids
+        value.output_token_ids = output_token_ids
+        value.finish_reason = None
+        value.reasoning = None
+        value.truncated = False
         return value
 
 
@@ -191,7 +227,22 @@ class LocalCompletionsAPI(TemplateAPI):
                     if tok != max(top.values()):
                         is_greedy = False
                         break
-                res.append((logprobs, is_greedy))
+                prompt_ids = choice.get("prompt_token_ids")
+                all_token_ids = choice.get("token_ids") or []
+                output_ids = (
+                    all_token_ids[ctxlen:]
+                    if isinstance(all_token_ids, list)
+                    else None
+                )
+                res.append(
+                    _LogLikelihoodEvidence(
+                        logprobs,
+                        is_greedy,
+                        raw_response=out,
+                        prompt_token_ids=prompt_ids,
+                        output_token_ids=output_ids,
+                    )
+                )
         return res
 
     @staticmethod
@@ -265,6 +316,7 @@ class RWKV7HTTP(LocalCompletionsAPI):
         rwkv_system_prompt=None,
         rwkv_system_prompt_pattern=None,
         cot_mode=None,
+        record_evidence=False,
         tokenized_requests=True,
         verify_certificate=True,
         ca_cert_path=None,
@@ -311,6 +363,7 @@ class RWKV7HTTP(LocalCompletionsAPI):
         self.rwkv_sampling_mode = rwkv_sampling_mode
         self.rwkv_system_prompt = rwkv_system_prompt
         self.rwkv_system_prompt_pattern = rwkv_system_prompt_pattern
+        self.record_evidence = bool(record_evidence)
 
         super().__init__(
             base_url=base_url,
@@ -354,7 +407,8 @@ class RWKV7HTTP(LocalCompletionsAPI):
         return (
             f"{self.model}:{self._chat_template_sha256}:"
             f"{self.rwkv_prompt_template}:{self.rwkv_generation_prompt}:"
-            f"{self.rwkv_sampling_mode}:{system_prompt_sha256}"
+            f"{self.rwkv_sampling_mode}:{system_prompt_sha256}:"
+            f"evidence={int(self.record_evidence)}"
         )
 
     @cached_property
@@ -496,8 +550,21 @@ class RWKV7HTTP(LocalCompletionsAPI):
         for output in outputs:
             choices = [None] * len(output["choices"])
             for choice in output["choices"]:
+                text = choice.get("text", "")
+                reasoning = choice.get("reasoning_content")
+                if reasoning is None and "<think>" in text:
+                    _, remainder = text.split("<think>", 1)
+                    if "</think>" in remainder:
+                        reasoning, _ = remainder.split("</think>", 1)
                 choices[choice["index"]] = _CompletionGeneration(
-                    choice["text"], choice.get("finish_reason")
+                    text,
+                    choice.get("finish_reason"),
+                    raw_response=output,
+                    prompt_token_ids=choice.get("prompt_token_ids")
+                    or output.get("prompt_token_ids"),
+                    output_token_ids=choice.get("token_ids")
+                    or choice.get("output_token_ids"),
+                    reasoning=reasoning,
                 )
             generations.extend(choices)
         return generations
@@ -519,6 +586,11 @@ class RWKV7HTTP(LocalCompletionsAPI):
         )
         payload.pop("seed", None)
         if generate:
+            # vllm-rwkv exposes both prompt and completion IDs in the native
+            # OpenAI-compatible response when this flag is enabled. Keeping it
+            # on the request makes the producer's per-sample evidence complete.
+            if self.record_evidence:
+                payload["return_token_ids"] = True
             for name in (
                 "temperature",
                 "top_p",
@@ -539,6 +611,8 @@ class RWKV7HTTP(LocalCompletionsAPI):
             if not payload["stop"]:
                 payload["stop"] = [self.PROMPT_STOPS[self.rwkv_prompt_template]]
         else:
+            if self.record_evidence:
+                payload["return_token_ids"] = True
             payload["temperature"] = 1
             payload["top_k"] = 1
         return payload

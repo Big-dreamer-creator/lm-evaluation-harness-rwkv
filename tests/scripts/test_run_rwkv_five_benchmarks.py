@@ -34,6 +34,30 @@ def test_evaluation_commands_keep_include_paths_narrow_and_generation_limits():
     assert command[-2:] == ["max_gen_toks=2048", "do_sample=true"]
 
 
+def test_scoreboard_compatible_command_records_open_think_and_full_budget():
+    command = MODULE.evaluation_command(
+        "moral_stories", scoreboard_compatible=True, wkv_mode="fp32io16"
+    )
+    assert "rwkv_generation_prompt=open_think" in command
+    assert command[-2:] == ["max_gen_toks=8192", "do_sample=true"]
+    metadata = json.loads(command[command.index("--metadata") + 1])
+    assert metadata["cot_mode"] == "open_think"
+    assert metadata["scoreboard_compatible"] is True
+
+
+def test_scoreboard_compatible_validation_requires_real_lighteval(monkeypatch):
+    def missing_version(name):
+        raise MODULE.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(MODULE.importlib.metadata, "version", missing_version)
+    try:
+        MODULE.validate(require_backend=False, scoreboard_compatible=True)
+    except RuntimeError as error:
+        assert "real LightEval 0.13.0" in str(error)
+    else:
+        raise AssertionError("scoreboard-compatible validation accepted missing LightEval")
+
+
 def test_milestones_are_atomic_and_recoverable(tmp_path, monkeypatch):
     monkeypatch.setattr(MODULE, "RESULT_ROOT", tmp_path)
     MODULE.write_milestone("server_ready", model_name=MODULE.MODEL)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import logging
@@ -49,6 +50,75 @@ if TYPE_CHECKING:
     _NestedDict = dict[Group, dict[str, Task] | Group] | dict[str, Task]
 
 eval_logger = logging.getLogger(__name__)
+
+
+def _sample_response_evidence(
+    request: Any,
+    filtered_answer: Any,
+    metrics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Serialize model-side evidence without changing native lm-eval fields.
+
+    RWKV7HTTP attaches these attributes to its ``str`` generation objects.  The
+    evaluator normally sanitizes responses to strings before writing samples;
+    keeping a parallel, JSON-native field preserves the raw HTTP response and
+    token IDs for a producer run while remaining compatible with all other
+    model backends.
+    """
+
+    responses = getattr(request, "resps", []) or []
+    prompt = None
+    arguments = getattr(request, "arguments", ())
+    if isinstance(arguments, (tuple, list)) and arguments:
+        prompt = arguments[0]
+    elif arguments is not None:
+        prompt = arguments
+    prompt_text = prompt if isinstance(prompt, str) else str(prompt)
+    filtered_text = (
+        filtered_answer
+        if isinstance(filtered_answer, str)
+        else str(filtered_answer)
+    )
+    evidence: list[dict[str, Any]] = []
+    for response in responses:
+        raw_response = getattr(response, "raw_response", None)
+        if raw_response is not None:
+            raw_bytes = json.dumps(
+                raw_response,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+        else:
+            raw_hash = None
+        output_text = str(response)
+        finish_reason = getattr(response, "finish_reason", None)
+        truncated = bool(
+            getattr(response, "truncated", False)
+            or finish_reason in {"length", "max_tokens"}
+        )
+        evidence.append(
+            {
+                "prompt": prompt_text,
+                "input_token_ids": getattr(response, "prompt_token_ids", None),
+                "output_token_ids": getattr(response, "output_token_ids", None),
+                "raw_response": raw_response,
+                "reasoning": getattr(response, "reasoning", None),
+                "post_processed_answer": filtered_text,
+                "finish_reason": finish_reason,
+                "truncation": truncated,
+                "metrics": metrics,
+                "hashes": {
+                    "prompt_sha256": hash_string(prompt_text),
+                    "output_sha256": hash_string(output_text),
+                    "answer_sha256": hash_string(filtered_text),
+                    "raw_response_sha256": raw_hash,
+                },
+            }
+        )
+    return evidence
 
 
 @positional_deprecated
@@ -637,17 +707,24 @@ def evaluate(
                 )
                 if log_samples:
                     target = task.doc_to_target(doc)
+                    filtered_answers = [
+                        req.filtered_resps[filter_key] for req in requests
+                    ]
                     example = {
                         "doc_id": doc_id_true,
                         "doc": doc,
                         "target": target,
                         "arguments": [req.args for req in requests],
                         "resps": [req.resps for req in requests],
-                        "filtered_resps": [
-                            req.filtered_resps[filter_key] for req in requests
-                        ],
+                        "filtered_resps": filtered_answers,
                         "filter": filter_key,
                         "metrics": list(metrics.keys()),
+                        "response_evidence": [
+                            _sample_response_evidence(req, answer, metrics)
+                            for req, answer in zip(
+                                requests, filtered_answers, strict=True
+                            )
+                        ],
                         "doc_hash": hash_string(
                             json.dumps(
                                 requests[0].doc,
