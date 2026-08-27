@@ -1,204 +1,105 @@
-# 上传成绩到 scoreboard-rwkv
+# 发布评测结果到 scoreboard-rwkv
 
-## 统一 TOML 流程（推荐）
+评测完成并保存标准 lm-eval 结果后，`scripts/upload_scoreboard.py` 在同一进程内完成：
 
-普通的版本化 TOML 可以直接开启看板发布；RACE、DROP 以及其他已经注册的
-lm-eval task 都走同一条路径，不需要 `run_rwkv_five_benchmarks.py`：
+1. 将聚合指标、逐样本证据和 provenance 转换成 `scoreboard-v1`。
+2. 写入 `publication/raw_results.json`、`campaign.json`、`tasks/*.json` 和
+   `status.json`。
+3. 调用 preflight → campaign → task → finalize。
 
-```toml
-[publication]
-enabled = true
-```
+没有独立转换 CLI，也没有第二套上传格式。网络或契约失败不会删除原始结果；
+`status.json` 会记录 `evaluation=complete, publication=failed`。
 
-部署地址、token、超时、是否 finalize 和模型版本信息默认从环境变量读取：
-
-```bash
-export SCOREBOARD_BASE_URL='http://127.0.0.1:7860'
-export SCOREBOARD_PUBLICATION_TOKEN='从看板部署方获取的 token'
-export SCOREBOARD_UPLOAD_TIMEOUT='3600'
-export SCOREBOARD_UPLOAD_FINALIZE='true'
-export SCOREBOARD_MODEL_SHA256='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-export SCOREBOARD_MODEL_REVISION='可选的权重 revision'
-
-uv run --no-sync python -m lm_eval run --config /path/to/eval.toml
-```
-
-若部署使用自定义 token 变量名，设置
-`SCOREBOARD_PUBLICATION_TOKEN_ENV` 为该变量名即可；脚本不会把 token 本身写入
-配置或结果。TOML 中显式填写的 `base_url`、`token_env`、`timeout`、`finalize`、
-`model_sha256`、`model_revision` 优先于环境变量。手工执行上传脚本时，对应 CLI
-参数再优先于环境变量。启用发布时必须提供真实的 64 位小写权重 SHA-256；系统
-不会猜测或伪造模型身份。
-
-评测器会先保存标准 `results_*.json`、逐任务 `samples_*.jsonl`，再在同一个
-输出目录的 `<model>/publication/` 写入 `raw_results.json`、campaign/task
-载荷和 `status.json`，最后调用看板的 preflight → campaign → task → finalize
-流程。`status.json` 明确区分 `evaluation=complete` 与
-`publication=complete|failed|disabled`；网络或契约错误不会删除本地证据，也
-不会把“评测完成、发布未完成”显示成已上传。发布载荷使用 task 名称和 task
-配置动态生成，因此不依赖某个固定 benchmark 清单。若后端没有返回原始响应
-及 token evidence，系统同样只保留本地结果并将发布标记为失败。
-部署端需要在 publication preflight 中声明并实现 `scoreboard-v1`，并包含
-`lm-eval-harness` source；仍声明旧 contract 的服务会被明确记录为发布失败，
-不会把结果冒充成已上传。
-
-## 旧版五 benchmark producer（兼容保留）
-
-producer 不依赖看板服务器。它会检查本地 `vllm-rwkv`、按模式启动服务，默认
-依次运行 `fp16` 和 `fp32io16`，并在已有 task 结果上自动断点恢复：
+## 配置与凭据
 
 ```bash
-uv sync --locked
-uv run python scripts/run_rwkv_five_benchmarks.py --wkv-mode both --verify --digest
+export SCOREBOARD_PUBLICATION_TOKEN=local-publication-token
 ```
 
-只检查命令、服务探测和两组任务展开，不启动推理：
+上传器不读取默认 endpoint、模型或重试环境变量。base URL、token 变量名、模型 SHA、
+revision、timeout 和重试策略都由 publication 配置显式提供；只有 token 值通过配置指定的
+环境变量读取，避免密钥进入配置或结果。
 
-```bash
-uv run python scripts/run_rwkv_five_benchmarks.py --dry-run --wkv-mode both
+## Comparison 配置
+
+标准 lm-eval YAML 通过 `metadata.scoreboard_publication` 提供显式 producer contract。
+支持 `publication` 字段的版本化配置可以直接传入相同对象；其中既有的
+`publication.task_metadata` 与 `publication.tasks` 等价。
+
+```yaml
+metadata:
+  scoreboard_publication:
+    base_url: http://127.0.0.1:7862
+    token_env: SCOREBOARD_PUBLICATION_TOKEN
+    model_sha256: <实际加载权重的 64 位小写 SHA-256>
+    model_revision: <实际权重 revision>
+    timeout: 3600
+    control_timeout: 30
+    retries: 2
+    retry_delay: 1
+    tasks:
+      gsm8k_platinum:
+        outcome_metric: exact_match
+        response_mode: single
+        comparison:
+          model: &model
+            label: RWKV7 G1I 1.5B
+            architecture: RWKV7
+            generation: G1I
+            parameters: 1.5B
+          benchmark:
+            label: GSM8K Platinum
+            categories:
+              - id: math
+                label: 数学
+            evaluation_method: exact_match
+            score_multiplier: 100.0
+          evaluation:
+            prompt_profile: fake_think
+            prompt_template: "User: {task.problem}\n\nAssistant: <think></think>"
+            precision: fp32io16
+          coordinates:
+            - comparison:
+                id: precision
+                label: fp16 vs fp32io16
+                short_label: 精度
+                a_label: fp16
+                b_label: fp32io16
+                contract: 同一权重、prompt、sampling 与输出边界，仅改变 WKV precision。
+              parameter_group:
+                id: 1.5b
+                label: 1.5B
+                a_model: *model
+                b_model: *model
+                parameter_delta_percent: 0.0
+                comparable: true
+              arm: b
 ```
 
-如果这次结果后续要发布到当前 scoreboard-rwkv，评测时必须显式使用看板兼容协议：
+task policy 可使用完整 task name 或 task metadata 中的 `benchmark_name`。以下字段必须由
+配置明确提供，上传器不会从权重名或 tags 猜测：
 
-```bash
-uv run python scripts/run_rwkv_five_benchmarks.py \
-  --wkv-mode both --scoreboard-compatible --verify --digest
-```
+- 当前模型的架构、代际和参数组。
+- comparison ID、A/B 标签、contract、参数组和当前 arm。
+- benchmark 展示名、分类、evaluation method 和 score multiplier。
+- prompt profile、prompt template、precision 和用于判定正确性的 `outcome_metric`。
+- response mode：单次生成使用 `single`，选择题 likelihood 使用 `multiple_choice`。
 
-这个选项会把 `open_think`、看板规定的采样参数、`max_gen_toks=8192`、
-逐样本原始响应和 token 证据记录到 producer provenance 中。默认的
-`fake_think` 结果仍然可以作为本地评测结果保存，但转换器会拒绝把它伪装成
-当前 scoreboard DTO。
+以下字段只使用真实评测结果计算，配置值会被覆盖：
 
-旧 producer 保留其真实 evaluator/runtime provenance；转换器将其作为
-`source = "lm-eval-harness"` 的 `scoreboard-v1` 数据发布，不再要求或伪造
-LightEval 运行身份。
+- `comparison.samples`
+- `comparison.truncation_rate`
+- 每条样本的 `answer.outcome`、标准答案、提取答案、prompt、completion、失败原因、
+  token 数和 latency（若后端提供）
 
-只做严格的 lockfile/backend/GPU/service 前置检查：
+`outcome_metric` 的逐样本值为 `1` 时记录 `correct`，为 `0` 时记录
+`incorrect`；缺失或非二值指标记录为 `unanswered`/`undetermined`，不会伪造判断。
 
-```bash
-uv run python scripts/run_rwkv_five_benchmarks.py --preflight-only --wkv-mode both
-```
+## 严格失败边界
 
-完成后，稳定文件位于 `results/formal-rwkv-five-benchmarks-20260821/`：
-`campaign_manifest.json`、`tasks/<mode>__<task>/{results,samples}.json*`、
-`publication/campaign.json`、`publication/tasks/*.json` 和
-`publication/upload_spool.jsonl`。本地校验可单独执行：
-
-每条 `samples.jsonl` 记录都包含 prompt、input/output token IDs、原始 HTTP
-response、reasoning、后处理答案、finish reason、截断标记、指标和 SHA-256
-字段；loglikelihood 请求同样保留 tuple-compatible 的响应证据。
-
-启动前 producer 会检查 FlashRWKV2 扩展的编译架构与当前 GPU。当前本机
-`FlashRWKV2==0.1.0a6` 扩展含 SM90/SM120 kernels，而 RTX 4060 是 SM89，
-所以会在服务启动前明确失败并写入
-`results/formal-rwkv-five-benchmarks-20260821/preflight.json`，不会生成伪造分数。
-
-```bash
-uv run python scripts/run_rwkv_five_benchmarks.py --verify-only
-```
-
-这些 producer 文件使用 `rwkv-producer-campaign-v1` /
-`rwkv-producer-task-v1`，并标记 `scoreboard_upload_ready: false`。上传入口现在
-包含一个严格的 producer → `scoreboard-v1` 转换层：它只映射 producer 已经保存的
-模型、运行、指标、逐样本响应和 token 证据；缺字段、fake-think、采样参数不匹配
-或缺少双 WKV mode 时直接失败，不会补造数据。
-
-本仓库的上传脚本对接的是 [scoreboard-rwkv](https://github.com/rwkv-rs/scoreboard-rwkv)
-最新 `scoreboard-v1` 发布 API，`source` 固定为 `lm-eval-harness`。campaign/task
-都使用 `scoreboard-v1`，task 载荷使用 `result_files`、`environment`、`metrics`
-和 `samples` 字段。原始
-`results_*.json` 汇总文件仍不能直接上传。
-
-## 旧 producer 载荷的兼容说明
-当前已部署的旧服务若 preflight 尚未声明 `scoreboard-v1` 和 `lm-eval-harness`，统一 TOML
-流程会保留本地证据并将 `status.json` 标为发布失败；不要为了绕过该检查而
-伪造 LightEval 版本、模型执行信息、逐样本输出或 token 证据。
-
-## 准备 payload
-
-准备一个 campaign JSON 和每个 `expected_tasks` 对应的 task JSON。task 文件中的
-`campaign_id` 会由脚本在创建 campaign 后替换成服务端返回的 UUID；其余字段必须与
-campaign 的 `expected_tasks` 完全一致，并满足看板仓库当前 DTO 校验。
-
-campaign/task 必须使用 `schema_version: "scoreboard-v1"`，campaign 的
-`source` 使用 `lm-eval-harness`，并按最新 DTO 计算稳定 `run_key`。每个 task
-identity 必须包含权重 SHA-256、WKV mode 和 task name。
-
-转换与上传是两个独立步骤。转换脚本只读取本地 evaluator artifacts、写出严格
-DTO，不读取看板地址或 token，也不发起网络请求：
-
-```bash
-uv run python scripts/convert_scoreboard_payloads.py \
-  --producer-campaign results/formal-rwkv-five-benchmarks-20260821/publication/campaign.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp16__moral_stories.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp16__haerae.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp16__jsonschema_bench.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp16__gsm8k_platinum.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp16__aexams.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp32io16__moral_stories.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp32io16__haerae.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp32io16__jsonschema_bench.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp32io16__gsm8k_platinum.json \
-  --producer-task results/formal-rwkv-five-benchmarks-20260821/publication/tasks/fp32io16__aexams.json \
-  --output-dir /tmp/scoreboard-publication
-```
-
-转换成功后，再把输出的 `campaign.json` 和每个 `tasks/*.json` 显式交给上传脚本：
-
-```bash
-export SCOREBOARD_BASE_URL=https://eval.rwkv.rs
-export SCOREBOARD_PUBLICATION_TOKEN='从看板部署方获取的 token'
-
-uv run python scripts/upload_scoreboard.py \
-  --campaign /tmp/scoreboard-publication/campaign.json \
-  --task /tmp/scoreboard-publication/tasks/<task-1>.json \
-  --task /tmp/scoreboard-publication/tasks/<task-2>.json
-```
-
-`upload_scoreboard.py` 不再接受 `--producer-campaign`、`--producer-task` 或原始
-lm-eval results；传入未转换格式会直接失败并提示先运行转换脚本。
-
-## 生产环境上传
-
-publication token 不写入仓库、JSON 或 shell 历史；通过环境变量传入：
-
-```bash
-export SCOREBOARD_BASE_URL=https://eval.rwkv.rs
-export SCOREBOARD_PUBLICATION_TOKEN='从看板部署方获取的 token'
-export SCOREBOARD_UPLOAD_TIMEOUT=3600
-export SCOREBOARD_UPLOAD_FINALIZE=true
-export SCOREBOARD_UPLOAD_RETRIES=2
-export SCOREBOARD_UPLOAD_RETRY_DELAY=1
-
-uv run python scripts/upload_scoreboard.py \
-  --campaign /path/to/campaign.json \
-  --task /path/to/task-fp16.json \
-  --task /path/to/task-fp32io16.json
-```
-
-默认流程是 preflight → 创建/恢复 campaign → 按 campaign 顺序上传 task → finalize。
-请求带有 scoreboard-rwkv 规定的 gzip 和幂等键；网络错误和 408/425/429/5xx 会按
-`SCOREBOARD_UPLOAD_RETRIES` 和指数退避自动重试，401/422 等认证或契约错误立即失败。
-中断后用相同文件重新执行即可跳过服务端已经确认的 task。preflight、campaign/status
-和 finalize 等控制请求最多使用 30 秒 timeout；task payload 仍使用
-`SCOREBOARD_UPLOAD_TIMEOUT`。将 `SCOREBOARD_UPLOAD_FINALIZE=false` 或传入
-`--no-finalize` 可只上传并保留 incomplete 状态；`--finalize` 可覆盖环境变量并明确
-完成 campaign。
-
-部署到 `/test` 前缀时，将 `SCOREBOARD_BASE_URL` 改为
-`https://eval.rwkv.rs/test`。先只检查 token 和远端契约：
-
-```bash
-uv run python scripts/upload_scoreboard.py --preflight-only
-```
-
-上传前只做本地校验、不联网：
-
-```bash
-uv run python scripts/upload_scoreboard.py \
-  --campaign /path/to/campaign.json \
-  --task /path/to/task-fp16.json \
-  --task /path/to/task-fp32io16.json \
-  --dry-run
-```
+- 每个 task 都必须有显式 policy；缺失时拒绝发布。
+- 只有显式设置 `history_only: true` 才允许不提供 `comparison`，该结果只进入分数历史。
+- comparison publication 必须为每条样本生成完整 `answer`。
+- 缺少真实模型 SHA-256、WKV mode、聚合指标、原始 response 或 input/output token IDs
+  时拒绝发布。
+- 已完成 campaign 内容不可改变；正式重跑必须提供真实且不同的 `rerun_reason`。
