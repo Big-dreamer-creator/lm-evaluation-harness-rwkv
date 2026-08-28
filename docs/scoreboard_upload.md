@@ -1,6 +1,6 @@
 # 发布评测结果到 scoreboard-rwkv
 
-评测完成并保存标准 lm-eval 结果后，`scripts/upload_scoreboard.py` 在同一进程内完成：
+评测完成并保存标准 lm-eval 结果后，`lm_eval.loggers.scoreboard` 在同一进程内完成：
 
 1. 将聚合指标、逐样本证据和 provenance 转换成 `scoreboard-v1`。
 2. 写入 `publication/raw_results.json`、`campaign.json`、`tasks/*.json` 和

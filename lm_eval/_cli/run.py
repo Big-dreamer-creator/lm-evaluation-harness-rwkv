@@ -482,7 +482,9 @@ class Run(SubCommand):
 
             if publication_samples is not None:
                 try:
-                    from scripts.upload_scoreboard import publish_lm_eval_evaluation
+                    from lm_eval.loggers.scoreboard import (
+                        publish_lm_eval_evaluation,
+                    )
 
                     publication_status = publish_lm_eval_evaluation(
                         results,

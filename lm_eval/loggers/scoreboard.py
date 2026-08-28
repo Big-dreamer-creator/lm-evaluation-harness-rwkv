@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Convert native lm-eval results and publish them to scoreboard-v1."""
 
 from __future__ import annotations
@@ -370,12 +369,10 @@ def _answer_metadata(
     response = detail["model_response"]
     if response_mode == "single" and len(response["output_tokens"]) != 1:
         raise ScoreboardError("single response mode requires exactly one response")
-    answers = response.get("text_post_processed", [])
-    extracted = (
-        answers[0]
-        if len(answers) == 1
-        else _text(sample.get("filtered_resps", answers))
-    )
+    filtered = sample.get("filtered_resps")
+    while isinstance(filtered, list) and len(filtered) == 1:
+        filtered = filtered[0]
+    extracted = _text(filtered)
     metric = detail["metrics"].get(metric_name)
     if _finite(metric) and float(metric) == 1.0:
         outcome, fail_reason = "correct", None
@@ -477,12 +474,28 @@ def _public_model_args(model_args: dict[str, Any]) -> dict[str, Any]:
 def _sampling_config(
     results: dict[str, Any], task_config: dict[str, Any], model_args: dict[str, Any]
 ) -> dict[str, Any]:
-    effective = results.get("sampling_config")
-    return {
-        "model_args": _public_model_args(model_args),
-        "task_generation_kwargs": json_value(task_config.get("generation_kwargs", {})),
-        "effective": json_value(effective) if isinstance(effective, dict) else None,
-    }
+    run_config = results.get("config")
+    run_config = run_config if isinstance(run_config, dict) else {}
+    effective = run_config.get("sampling_config", results.get("sampling_config"))
+    value = json_value(effective) if isinstance(effective, dict) else {}
+    generation = task_config.get("generation_kwargs")
+    generation = generation if isinstance(generation, dict) else {}
+    for source_name, target_name in (
+        ("max_gen_toks", "max_tokens"),
+        ("max_tokens", "max_tokens"),
+        ("until", "stop"),
+        ("stop", "stop"),
+        ("do_sample", "do_sample"),
+    ):
+        if source_name in generation:
+            value[target_name] = json_value(generation[source_name])
+    for name in ("batch_size",):
+        if run_config.get(name) is not None:
+            value[name] = json_value(run_config[name])
+    for name in ("max_length", "num_concurrent"):
+        if model_args.get(name) is not None:
+            value[name] = json_value(model_args[name])
+    return value
 
 
 def _environment(
@@ -929,6 +942,8 @@ def publish_lm_eval_evaluation(
         )
     except (KeyError, ScoreboardError, OSError, TypeError, ValueError) as error:
         status.update(
+            publication="failed",
+            uploaded=False,
             message="evaluation complete, publication incomplete",
             error=f"{type(error).__name__}: {error}",
         )

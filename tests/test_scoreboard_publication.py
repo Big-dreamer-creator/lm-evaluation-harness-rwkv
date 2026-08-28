@@ -1,23 +1,13 @@
 from __future__ import annotations
 
 import gzip
-import importlib.util
 import json
-import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
 
-
-ROOT = Path(__file__).parents[2]
-SPEC = importlib.util.spec_from_file_location(
-    "upload_scoreboard", ROOT / "scripts/upload_scoreboard.py"
-)
-MODULE = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-sys.modules[SPEC.name] = MODULE
-SPEC.loader.exec_module(MODULE)
+import lm_eval.loggers.scoreboard as MODULE
 
 
 def comparison_policy() -> dict:
@@ -97,6 +87,14 @@ def native_results(*, complete: bool = True) -> tuple[dict, dict]:
                 "num_concurrent": 4,
                 "max_length": 1024,
             },
+            "sampling_config": {
+                "temperature": 1.0,
+                "top_p": 0.28,
+                "top_k": 32,
+                "rwkv_sampling_mode": "profile",
+                "rwkv_prompt_template": "assistant",
+                "rwkv_generation_prompt": "fake_think",
+            },
             "batch_size": "1",
         },
         "configs": {
@@ -132,12 +130,13 @@ def native_results(*, complete: bool = True) -> tuple[dict, dict]:
     }
     samples = []
     for index, (answer, acc) in enumerate((("A", 1.0), ("B", 0.0))):
+        completion = f"Reasoning for question {index}. Final Answer: [{answer}]"
         evidence = {
             "prompt": f"Question {index}",
             "input_token_ids": [1, index + 2],
             "output_token_ids": [10 + index],
-            "raw_response": {"choices": [{"text": answer}]},
-            "post_processed_answer": answer,
+            "raw_response": {"choices": [{"text": completion}]},
+            "post_processed_answer": completion,
             "finish_reason": "length" if index else "stop",
             "truncation": bool(index),
         }
@@ -150,7 +149,7 @@ def native_results(*, complete: bool = True) -> tuple[dict, dict]:
                 "target": "A",
                 "metrics": ["acc"],
                 "acc": acc,
-                "resps": [[answer]],
+                "resps": [[completion]],
                 "filtered_resps": [answer],
                 "response_evidence": [[evidence]],
             }
@@ -171,11 +170,25 @@ def test_builds_complete_comparison_and_answers() -> None:
     assert task["metrics"] == {"acc": 0.5, "acc_stderr": 0.5}
     assert task["comparison"]["samples"] == 2
     assert task["comparison"]["truncation_rate"] == 0.5
+    assert task["sampling_config"] == {
+        "temperature": 1.0,
+        "top_p": 0.28,
+        "top_k": 32,
+        "rwkv_sampling_mode": "profile",
+        "rwkv_prompt_template": "assistant",
+        "rwkv_generation_prompt": "fake_think",
+        "max_tokens": 16,
+        "batch_size": "1",
+        "max_length": 1024,
+        "num_concurrent": 4,
+    }
     assert [sample["answer"]["outcome"] for sample in task["samples"]] == [
         "correct",
         "incorrect",
     ]
     assert task["samples"][1]["answer"]["fail_reason"] == "truncated"
+    assert task["samples"][0]["answer"]["extracted_answer"] == "A"
+    assert task["samples"][0]["answer"]["raw_completion"].startswith("Reasoning")
     assert all(
         sample["model_response"]["evidence_complete"] for sample in task["samples"]
     )
@@ -324,3 +337,24 @@ def test_publication_failure_preserves_raw_results(tmp_path: Path) -> None:
     assert status["evaluation"] == "complete"
     assert status["publication"] == "failed"
     assert Path(status["raw_results_path"]).exists()
+
+
+def test_transport_failure_does_not_remain_pending(tmp_path: Path, monkeypatch) -> None:
+    results, samples = native_results()
+    monkeypatch.setenv("TEST_SCOREBOARD_TOKEN", "secret")
+
+    def reject(*_args, **_kwargs):
+        raise MODULE.ScoreboardError("remote rejected publication")
+
+    monkeypatch.setattr(MODULE, "publish", reject)
+    status = MODULE.publish_lm_eval_evaluation(
+        results,
+        samples,
+        output_dir=tmp_path,
+        publication=publication_config(),
+    )
+
+    assert status["evaluation"] == "complete"
+    assert status["publication"] == "failed"
+    assert status["uploaded"] is False
+    assert "remote rejected publication" in status["error"]
