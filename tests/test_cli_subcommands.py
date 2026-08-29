@@ -1274,8 +1274,17 @@ wkv_mode = "fp32io16"
 enabled = true
 base_url = "https://eval.rwkv.rs/test"
 token_env = "MY_PUBLICATION_TOKEN"
-finalize = false
+control_timeout = 15.0
+retries = 4
+retry_delay = 0.5
+finalize = true
 model_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+rerun_reason = "protocol correction"
+configured_benchmarks = ["race", "drop"]
+skipped_benchmarks = []
+
+[publication.tasks.race]
+history_only = true
 """,
             encoding="utf-8",
         )
@@ -1287,8 +1296,15 @@ model_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
             "base_url": "https://eval.rwkv.rs/test",
             "token_env": "MY_PUBLICATION_TOKEN",
             "timeout": 3600.0,
-            "finalize": False,
+            "control_timeout": 15.0,
+            "retries": 4,
+            "retry_delay": 0.5,
+            "finalize": True,
             "model_sha256": "a" * 64,
+            "rerun_reason": "protocol correction",
+            "configured_benchmarks": ["race", "drop"],
+            "skipped_benchmarks": [],
+            "tasks": {"race": {"history_only": True}},
         }
         assert loaded.model_args["record_evidence"] is True
 

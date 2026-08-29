@@ -1,9 +1,9 @@
 import argparse
-import copy
 import json
 import logging
 import os
 import textwrap
+from copy import deepcopy
 from functools import partial
 
 from lm_eval._cli.subcommand import SubCommand
@@ -464,12 +464,14 @@ class Run(SubCommand):
 
         # Process results
         if results is not None:
-            publication_config = getattr(cfg, "publication", {})
-            publication_enabled = (
-                isinstance(publication_config, dict)
-                and publication_config.get("enabled") is True
-            )
             publication_samples = None
+            publication_config = getattr(cfg, "publication", None)
+            if not isinstance(publication_config, dict) or not publication_config:
+                publication_config = cfg.metadata.get("scoreboard_publication", {})
+            publication_requested = (
+                bool(publication_config)
+                and publication_config.get("enabled", True) is True
+            )
             if cfg.log_samples:
                 samples = results.pop("samples")
                 _add_truncation_stats(results, samples)
@@ -477,8 +479,8 @@ class Run(SubCommand):
                 # mutates its input.  Keep an untouched copy for the unified
                 # publication spool so the dashboard receives the same raw
                 # evidence that was produced by the evaluator.
-                if publication_enabled:
-                    publication_samples = copy.deepcopy(samples)
+                if publication_requested:
+                    publication_samples = deepcopy(samples)
 
             dumped = json.dumps(
                 results, indent=2, default=handle_non_serializable, ensure_ascii=False
@@ -519,38 +521,25 @@ class Run(SubCommand):
                         task_name=task_name, samples=samples[task_name]
                     )
 
-            if publication_enabled:
+            if publication_samples is not None:
                 try:
-                    from scripts.upload_scoreboard import publish_lm_eval_evaluation
+                    from lm_eval.loggers.scoreboard import (
+                        publish_lm_eval_evaluation,
+                    )
 
                     publication_status = publish_lm_eval_evaluation(
                         results,
-                        publication_samples or {},
+                        publication_samples,
                         output_dir=cfg.output_path,
                         publication=publication_config,
                     )
-                    eval_logger.info(
-                        "Evaluation publication status: %s",
-                        publication_status.get("publication"),
-                    )
-                    print(
-                        "publication: "
-                        f"{publication_status.get('publication')}"
-                        + (
-                            " (evaluation complete, publication incomplete)"
-                            if publication_status.get("publication") == "failed"
-                            else ""
-                        )
-                    )
+                    print(f"publication: {publication_status['publication']}")
                 except Exception as error:  # noqa: BLE001
-                    # Results and per-sample files were already persisted.  A
-                    # loader/import failure must not turn a completed
-                    # evaluation into an apparently missing run.
-                    eval_logger.error(
-                        "Evaluation complete, but publication setup failed: %s",
-                        error,
+                    print(
+                        "publication: failed "
+                        "(evaluation complete, publication incomplete): "
+                        f"{error}"
                     )
-                    print("publication: failed (evaluation complete, publication incomplete)")
 
             if (
                 evaluation_tracker.push_results_to_hub

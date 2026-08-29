@@ -85,9 +85,16 @@ PUBLICATION_FIELDS = {
     "base_url",
     "token_env",
     "timeout",
+    "control_timeout",
+    "retries",
+    "retry_delay",
     "finalize",
     "model_sha256",
     "model_revision",
+    "rerun_reason",
+    "configured_benchmarks",
+    "skipped_benchmarks",
+    "tasks",
     "task_metadata",
 }
 
@@ -532,6 +539,26 @@ class EvaluatorConfig:
         ):
             raise ValueError("publication.timeout must be positive")
         publication["timeout"] = timeout
+        control_timeout = publication.get("control_timeout", 30.0)
+        if (
+            isinstance(control_timeout, bool)
+            or not isinstance(control_timeout, (int, float))
+            or control_timeout <= 0
+        ):
+            raise ValueError("publication.control_timeout must be positive")
+        publication["control_timeout"] = control_timeout
+        retries = publication.get("retries", 2)
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            raise ValueError("publication.retries must be a non-negative integer")
+        publication["retries"] = retries
+        retry_delay = publication.get("retry_delay", 1.0)
+        if (
+            isinstance(retry_delay, bool)
+            or not isinstance(retry_delay, (int, float))
+            or retry_delay <= 0
+        ):
+            raise ValueError("publication.retry_delay must be positive")
+        publication["retry_delay"] = retry_delay
         publication["finalize"] = cls._boolean(
             publication.get("finalize", True), "publication.finalize"
         )
@@ -548,16 +575,41 @@ class EvaluatorConfig:
             publication["model_revision"] = cls._non_empty_string(
                 publication["model_revision"], "publication.model_revision"
             )
-        if "task_metadata" in publication:
-            task_metadata = publication["task_metadata"]
+        if "rerun_reason" in publication:
+            publication["rerun_reason"] = cls._non_empty_string(
+                publication["rerun_reason"], "publication.rerun_reason"
+            )
+        for field_name in ("configured_benchmarks", "skipped_benchmarks"):
+            if field_name not in publication:
+                continue
+            values = publication[field_name]
+            if (
+                not isinstance(values, list)
+                or any(
+                    not isinstance(value, str)
+                    or not value
+                    or value != value.strip()
+                    for value in values
+                )
+                or len(values) != len(set(values))
+            ):
+                raise ValueError(
+                    f"publication.{field_name} must be an array of unique non-empty trimmed strings"
+                )
+        for field_name in ("tasks", "task_metadata"):
+            if field_name not in publication:
+                continue
+            task_metadata = publication[field_name]
             if not isinstance(task_metadata, dict):
-                raise TypeError("publication.task_metadata must be a table")
+                raise TypeError(f"publication.{field_name} must be a table")
             for task_name, value in task_metadata.items():
                 if not isinstance(task_name, str) or not task_name.strip():
-                    raise ValueError("publication.task_metadata keys must be non-empty strings")
+                    raise ValueError(
+                        f"publication.{field_name} keys must be non-empty strings"
+                    )
                 if not isinstance(value, dict):
                     raise TypeError(
-                        f"publication.task_metadata.{task_name} must be a table"
+                        f"publication.{field_name}.{task_name} must be a table"
                     )
         if publication["enabled"] and not log_samples:
             raise ValueError(
