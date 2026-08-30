@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 from functools import cached_property
@@ -266,11 +267,12 @@ class LocalCompletionsAPI(TemplateAPI):
 
 @register_model("rwkv7-http")
 class RWKV7HTTP(LocalCompletionsAPI):
-    """HTTP adapter for the native vllm-rwkv RWKV7 completion endpoint.
+    """HTTP adapter for native RWKV7 completion endpoints.
 
-    The inference process is intentionally outside this repository.  The adapter
-    sends token ids and prompt logprobs to an OpenAI-compatible vllm-rwkv server
-    and renders the official chat template published by that service.
+    The inference process is intentionally outside this repository. The default
+    vllm-rwkv transport sends token ids and supports prompt logprobs. The
+    transformers-rwkv transport sends rendered strings to ``transformers serve``
+    and supports generation tasks only.
     """
 
     TASK_ADAPTER = "rwkv7-http"
@@ -284,6 +286,11 @@ class RWKV7HTTP(LocalCompletionsAPI):
     }
     GENERATION_PROMPTS = {"open_think", "fake_think"}
     SAMPLING_MODES = {"profile", "task"}
+    SERVICE_BACKENDS = {"transformers", "vllm"}
+    TRANSFORMERS_PROFILE_FILES = {
+        "open_think": "generation_config.json",
+        "fake_think": "fake_think_generation_config.json",
+    }
     SAMPLING_PROFILES = {
         "open_think": {
             "temperature": 0.96,
@@ -305,7 +312,9 @@ class RWKV7HTTP(LocalCompletionsAPI):
         base_url=DEFAULT_BASE_URL,
         model=None,
         pretrained=None,
-        tokenizer_backend="remote",
+        tokenizer=None,
+        tokenizer_backend=None,
+        service_backend="vllm",
         rapid_sampling=True,
         num_concurrent=5,
         batch_size=1,
@@ -317,7 +326,7 @@ class RWKV7HTTP(LocalCompletionsAPI):
         rwkv_system_prompt_pattern=None,
         cot_mode=None,
         record_evidence=False,
-        tokenized_requests=True,
+        tokenized_requests=None,
         verify_certificate=True,
         ca_cert_path=None,
         auth_token=None,
@@ -333,6 +342,11 @@ class RWKV7HTTP(LocalCompletionsAPI):
             )
         if cot_mode is not None:
             rwkv_generation_prompt = cot_mode
+        if service_backend not in self.SERVICE_BACKENDS:
+            raise ValueError(
+                "service_backend must be one of: "
+                + ", ".join(sorted(self.SERVICE_BACKENDS))
+            )
         if rwkv_prompt_template not in self.PROMPT_TEMPLATES:
             raise ValueError(
                 "rwkv_prompt_template must be one of: "
@@ -348,16 +362,44 @@ class RWKV7HTTP(LocalCompletionsAPI):
                 "rwkv_sampling_mode must be one of: "
                 + ", ".join(sorted(self.SAMPLING_MODES))
             )
-        if tokenizer_backend != "remote":
-            raise ValueError(
-                "rwkv7-http requires tokenizer_backend=remote so inference "
-                "stays in vllm-rwkv."
+        if tokenizer_backend is None:
+            tokenizer_backend = (
+                "remote" if service_backend == "vllm" else "huggingface"
             )
-        if not tokenized_requests:
-            raise ValueError("rwkv7-http requires tokenized_requests=True.")
-        if not rapid_sampling:
-            raise ValueError("rwkv7-http requires rapid_sampling=True.")
+        if tokenized_requests is None:
+            tokenized_requests = service_backend == "vllm"
+        if service_backend == "vllm":
+            if tokenizer_backend != "remote":
+                raise ValueError(
+                    "vllm service_backend requires tokenizer_backend=remote."
+                )
+            if not tokenized_requests:
+                raise ValueError(
+                    "vllm service_backend requires tokenized_requests=True."
+                )
+            if not rapid_sampling:
+                raise ValueError(
+                    "vllm service_backend requires rapid_sampling=True."
+                )
+        else:
+            if tokenizer_backend != "huggingface":
+                raise ValueError(
+                    "transformers service_backend requires "
+                    "tokenizer_backend=huggingface."
+                )
+            if tokenized_requests:
+                raise ValueError(
+                    "transformers service_backend requires "
+                    "tokenized_requests=False because transformers serve accepts "
+                    "string prompts."
+                )
+            if record_evidence:
+                raise ValueError(
+                    "transformers service_backend does not expose completion token "
+                    "IDs, so record_evidence=True is unsupported."
+                )
 
+        self.service_backend = service_backend
         self.rwkv_prompt_template = rwkv_prompt_template
         self.rwkv_generation_prompt = rwkv_generation_prompt
         self.rwkv_sampling_mode = rwkv_sampling_mode
@@ -365,33 +407,79 @@ class RWKV7HTTP(LocalCompletionsAPI):
         self.rwkv_system_prompt_pattern = rwkv_system_prompt_pattern
         self.record_evidence = bool(record_evidence)
 
-        super().__init__(
-            base_url=base_url,
-            model=model,
-            tokenizer_backend=None,
-            num_concurrent=num_concurrent,
-            batch_size=batch_size,
-            max_length=max_length,
-            tokenized_requests=False,
-            verify_certificate=verify_certificate,
-            ca_cert_path=ca_cert_path,
-            auth_token=auth_token,
-            timeout=timeout,
-            max_retries=max_retries,
-            **kwargs,
-        )
-        self.tokenizer_backend = "remote"
-        self.tokenized_requests = True
-        self.tokenizer = _VLLMRWKVTokenizer(
-            base_url,
-            model,
-            timeout=timeout,
-            verify_certificate=verify_certificate,
-            ca_cert_path=ca_cert_path,
-            auth_token=auth_token,
-            max_retries=max_retries,
-        )
-        self._chat_template_source = self.tokenizer.tokenizer_info["chat_template"]
+        if service_backend == "vllm":
+            super().__init__(
+                base_url=base_url,
+                model=model,
+                tokenizer_backend=None,
+                num_concurrent=num_concurrent,
+                batch_size=batch_size,
+                max_length=max_length,
+                tokenized_requests=False,
+                verify_certificate=verify_certificate,
+                ca_cert_path=ca_cert_path,
+                auth_token=auth_token,
+                timeout=timeout,
+                max_retries=max_retries,
+                **kwargs,
+            )
+            self.tokenizer_backend = "remote"
+            self.tokenized_requests = True
+            self.tokenizer = _VLLMRWKVTokenizer(
+                base_url,
+                model,
+                timeout=timeout,
+                verify_certificate=verify_certificate,
+                ca_cert_path=ca_cert_path,
+                auth_token=auth_token,
+                max_retries=max_retries,
+            )
+            self._chat_template_source = self.tokenizer.tokenizer_info[
+                "chat_template"
+            ]
+            self._transformers_generation_config = None
+        else:
+            tokenizer = tokenizer or model
+            super().__init__(
+                base_url=base_url,
+                model=model,
+                tokenizer=tokenizer,
+                tokenizer_backend=tokenizer_backend,
+                num_concurrent=num_concurrent,
+                batch_size=batch_size,
+                max_length=max_length,
+                tokenized_requests=tokenized_requests,
+                verify_certificate=verify_certificate,
+                ca_cert_path=ca_cert_path,
+                auth_token=auth_token,
+                timeout=timeout,
+                max_retries=max_retries,
+                **kwargs,
+            )
+            if self._batch_size != 1:
+                raise ValueError(
+                    "transformers service_backend requires batch_size=1; use "
+                    "num_concurrent for parallel HTTP requests."
+                )
+            self._chat_template_source = self.tokenizer.chat_template
+            if not isinstance(self._chat_template_source, str) or not (
+                self._chat_template_source
+            ):
+                raise RuntimeError(
+                    "transformers service_backend tokenizer does not provide a "
+                    "chat template."
+                )
+            from transformers import GenerationConfig
+
+            profile_file = self.TRANSFORMERS_PROFILE_FILES[
+                self.rwkv_generation_prompt
+            ]
+            generation_config = GenerationConfig.from_pretrained(
+                tokenizer,
+                config_file_name=profile_file,
+                local_files_only=os.path.isdir(tokenizer),
+            )
+            self._transformers_generation_config = generation_config.to_dict()
         self._chat_template_sha256 = hashlib.sha256(
             self._chat_template_source.encode("utf-8")
         ).hexdigest()
@@ -578,12 +666,61 @@ class RWKV7HTTP(LocalCompletionsAPI):
     ) -> dict:
         gen_kwargs = dict(gen_kwargs or {})
         do_sample = gen_kwargs.get("do_sample")
+        if self.service_backend == "transformers" and not generate:
+            raise NotImplementedError(
+                "transformers serve does not expose echo prompt logprobs; "
+                "multiple_choice and other loglikelihood tasks are unsupported."
+            )
         payload = super()._create_payload(
             messages,
             generate=generate,
             gen_kwargs=gen_kwargs,
             **kwargs,
         )
+        if self.service_backend == "transformers":
+            generation_config = dict(self._transformers_generation_config)
+            sampling_parameters = {
+                name: gen_kwargs[name]
+                for name in self.SAMPLING_PROFILES["open_think"]
+                if name in gen_kwargs
+            }
+            sampling_parameters.update(
+                {
+                    name: gen_kwargs[name]
+                    for name in self.SAMPLING_PROFILES["fake_think"]
+                    if name in gen_kwargs
+                }
+            )
+            if self.rwkv_sampling_mode == "task":
+                generation_config.update(sampling_parameters)
+                if do_sample is not None:
+                    generation_config["do_sample"] = bool(do_sample)
+                if do_sample is False:
+                    generation_config.update(
+                        {
+                            "temperature": 1.0,
+                            "top_p": 1.0,
+                            "top_k": 1,
+                            "presence_penalty": 0.0,
+                            "frequency_penalty": 0.0,
+                        }
+                    )
+            payload["temperature"] = generation_config.get("temperature", 1.0)
+            payload["generation_config"] = json.dumps(
+                generation_config, separators=(",", ":"), sort_keys=True
+            )
+            for name in (
+                "top_p",
+                "top_k",
+                "presence_penalty",
+                "frequency_penalty",
+                "penalty_decay",
+            ):
+                payload.pop(name, None)
+            if not payload["stop"]:
+                payload["stop"] = [self.PROMPT_STOPS[self.rwkv_prompt_template]]
+            return payload
+
         payload.pop("seed", None)
         if generate:
             # vllm-rwkv exposes both prompt and completion IDs in the native

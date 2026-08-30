@@ -242,6 +242,127 @@ def test_rwkv7_http_template_and_sampling_profiles(monkeypatch):
     assert generations[0].finish_reason == "length"
 
 
+def test_rwkv7_http_transformers_service_payload(monkeypatch):
+    class FakeTokenizer:
+        chat_template = (
+            "{{ rwkv_prompt_template }}|{{ rwkv_generation_prompt }}|"
+            "{{ messages[0]['content'] }}|{{ add_generation_prompt }}"
+        )
+        eos_token = "<eos>"
+        bos_token = "<bos>"
+        eos_token_id = 0
+        bos_token_id = 0
+        pad_token = None
+        pad_token_id = None
+
+        def encode(self, text, add_special_tokens=False):
+            return [ord(character) for character in text]
+
+        def decode(self, tokens, skip_special_tokens=True):
+            return "".join(chr(token) for token in tokens)
+
+    class FakeGenerationConfig:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            assert args == ("/models/rwkv7",)
+            assert kwargs == {
+                "config_file_name": "fake_think_generation_config.json",
+                "local_files_only": False,
+            }
+            return cls()
+
+        @staticmethod
+        def to_dict():
+            return {
+                "bos_token_id": 0,
+                "eos_token_id": 0,
+                "do_sample": True,
+                "temperature": 1.0,
+                "top_p": 0.28,
+                "top_k": 32,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "penalty_decay": 0.996,
+            }
+
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained",
+        lambda *args, **kwargs: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        "lm_eval.models.api_models.configure_pad_token", lambda tokenizer: tokenizer
+    )
+    monkeypatch.setattr("transformers.GenerationConfig", FakeGenerationConfig)
+
+    model = RWKV7HTTP(
+        model="/models/rwkv7",
+        tokenizer="/models/rwkv7",
+        service_backend="transformers",
+        rwkv_generation_prompt="fake_think",
+        num_concurrent=4,
+    )
+
+    assert model.tokenizer_backend == "huggingface"
+    assert model.tokenized_requests is False
+    assert (
+        model.apply_chat_template([{"role": "user", "content": "hello"}])
+        == "assistant|fake_think|hello|True"
+    )
+
+    payload = model._create_payload(
+        "prompt",
+        generate=True,
+        gen_kwargs={"max_gen_toks": 4, "do_sample": True},
+    )
+    assert payload == {
+        "prompt": "prompt",
+        "model": "/models/rwkv7",
+        "max_tokens": 4,
+        "temperature": 1.0,
+        "stop": ["\nUser:"],
+        "seed": 1234,
+        "generation_config": json.dumps(
+            FakeGenerationConfig.to_dict(), separators=(",", ":"), sort_keys=True
+        ),
+    }
+
+    greedy_payload = model._create_payload(
+        "prompt",
+        generate=True,
+        gen_kwargs={"max_gen_toks": 4, "do_sample": False},
+    )
+    greedy_config = json.loads(greedy_payload["generation_config"])
+    assert greedy_config["do_sample"] is True
+    assert greedy_config["top_p"] == 0.28
+
+    model.rwkv_sampling_mode = "task"
+    greedy_payload = model._create_payload(
+        "prompt",
+        generate=True,
+        gen_kwargs={"max_gen_toks": 4, "do_sample": False},
+    )
+    greedy_config = json.loads(greedy_payload["generation_config"])
+    assert {
+        key: greedy_config[key]
+        for key in ("do_sample", "temperature", "top_p", "top_k")
+    } == {
+        "do_sample": False,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 1,
+    }
+
+    with pytest.raises(NotImplementedError, match="prompt logprobs"):
+        model._create_payload("prompt", generate=False)
+
+    with pytest.raises(ValueError, match="record_evidence=True"):
+        RWKV7HTTP(
+            model="/models/rwkv7",
+            service_backend="transformers",
+            record_evidence=True,
+        )
+
+
 def test_vllm_rwkv_tokenizer_uses_native_routes_and_strips_bos(monkeypatch):
     responses = []
 
