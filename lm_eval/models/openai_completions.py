@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import os
 from functools import cached_property
@@ -136,6 +138,246 @@ class LocalCompletionsAPI(TemplateAPI):
     @property
     def api_key(self):
         return os.environ.get("OPENAI_API_KEY", "")
+
+
+class _RWKVCompletion(str):
+    """Completion text retaining the transport details supplied by the server."""
+
+    def __new__(
+        cls,
+        text: str,
+        finish_reason: str | None = None,
+        *,
+        raw_response: dict | None = None,
+    ):
+        value = super().__new__(cls, text)
+        value.finish_reason = finish_reason
+        value.raw_response = raw_response
+        value.prompt_token_ids = None
+        value.output_token_ids = None
+        value.reasoning = None
+        value.truncated = finish_reason in {"length", "max_tokens"}
+        return value
+
+
+@register_model("rwkv7-http")
+class RWKV7HTTP(LocalCompletionsAPI):
+    """RWKV7 adapter for the local ``transformers serve`` completions API.
+
+    ``transformers serve`` accepts rendered text prompts and exposes generation,
+    but not echo prompt logprobs. Consequently this adapter deliberately rejects
+    likelihood workloads such as RACE while retaining native generation evidence
+    for generative tasks such as DROP.
+    """
+
+    TASK_ADAPTER = "rwkv7-http"
+    DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1/completions"
+    PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
+    PROMPT_STOPS = {
+        "assistant": "\nUser:",
+        "bot": "✿",
+        "function_calling": "\n### User",
+    }
+    GENERATION_PROMPTS = {"open_think", "fake_think"}
+    SAMPLING_MODES = {"profile", "task"}
+    PROFILE_FILES = {
+        "open_think": "generation_config.json",
+        "fake_think": "fake_think_generation_config.json",
+    }
+
+    def __init__(
+        self,
+        base_url=DEFAULT_BASE_URL,
+        model=None,
+        pretrained=None,
+        tokenizer=None,
+        service_backend="transformers",
+        tokenizer_backend="huggingface",
+        tokenized_requests=False,
+        rapid_sampling=True,
+        num_concurrent=5,
+        batch_size=1,
+        max_length=16384,
+        rwkv_prompt_template="assistant",
+        rwkv_generation_prompt="fake_think",
+        rwkv_sampling_mode="profile",
+        cot_mode=None,
+        record_evidence=False,
+        **kwargs,
+    ):
+        model = model or pretrained
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("rwkv7-http requires model= or pretrained=.")
+        if service_backend != "transformers":
+            raise ValueError("This checkout supports service_backend=transformers only.")
+        if tokenizer_backend != "huggingface" or tokenized_requests:
+            raise ValueError(
+                "transformers service_backend requires tokenizer_backend=huggingface "
+                "and tokenized_requests=False."
+            )
+        if record_evidence:
+            raise ValueError(
+                "transformers service_backend does not expose completion token IDs; "
+                "record_evidence=True is unsupported."
+            )
+        if cot_mode is not None:
+            rwkv_generation_prompt = cot_mode
+        if rwkv_prompt_template not in self.PROMPT_TEMPLATES:
+            raise ValueError("rwkv_prompt_template must be assistant, bot, or function_calling.")
+        if rwkv_generation_prompt not in self.GENERATION_PROMPTS:
+            raise ValueError("rwkv_generation_prompt must be open_think or fake_think.")
+        if rwkv_sampling_mode not in self.SAMPLING_MODES:
+            raise ValueError("rwkv_sampling_mode must be profile or task.")
+
+        self.rwkv_prompt_template = rwkv_prompt_template
+        self.rwkv_generation_prompt = rwkv_generation_prompt
+        self.rwkv_sampling_mode = rwkv_sampling_mode
+        self.record_evidence = False
+        tokenizer = tokenizer or model
+        super().__init__(
+            base_url=base_url,
+            model=model,
+            tokenizer=tokenizer,
+            tokenizer_backend=tokenizer_backend,
+            tokenized_requests=False,
+            num_concurrent=num_concurrent,
+            batch_size=batch_size,
+            max_length=max_length,
+            **kwargs,
+        )
+        if self._batch_size != 1:
+            raise ValueError(
+                "transformers service_backend requires batch_size=1; use num_concurrent "
+                "for HTTP concurrency."
+            )
+        self._chat_template_source = self.tokenizer.chat_template
+        if not isinstance(self._chat_template_source, str) or not self._chat_template_source:
+            raise RuntimeError("The RWKV tokenizer must provide the official chat template.")
+
+        from transformers import GenerationConfig
+
+        profile = GenerationConfig.from_pretrained(
+            tokenizer,
+            config_file_name=self.PROFILE_FILES[rwkv_generation_prompt],
+            local_files_only=os.path.isdir(tokenizer),
+        )
+        self._generation_profile = profile.to_dict()
+        self._chat_template_sha256 = hashlib.sha256(
+            self._chat_template_source.encode("utf-8")
+        ).hexdigest()
+
+    @property
+    def tokenizer_name(self) -> str:
+        return (
+            f"{self.model}:{self._chat_template_sha256}:"
+            f"{self.rwkv_prompt_template}:{self.rwkv_generation_prompt}:"
+            f"{self.rwkv_sampling_mode}"
+        )
+
+    @cached_property
+    def eot_token_id(self) -> int:
+        return 0
+
+    @cached_property
+    def prefix_token_id(self) -> int:
+        return 0
+
+    @cached_property
+    def eos_string(self) -> None:
+        return None
+
+    def chat_template(self, chat_template: Union[bool, str] = False) -> str:
+        return self._chat_template_source
+
+    def apply_chat_template(
+        self,
+        chat_history: List[Dict[str, str]],
+        add_generation_prompt: bool = True,
+        **kwargs,
+    ) -> str:
+        from lm_eval.utils import env
+
+        rendered = env.from_string(self._chat_template_source).render(
+            messages=chat_history,
+            add_generation_prompt=add_generation_prompt,
+            rwkv_prompt_template=self.rwkv_prompt_template,
+            rwkv_generation_prompt=self.rwkv_generation_prompt,
+            tools=kwargs.pop("tools", None),
+            **kwargs,
+        )
+        if (
+            add_generation_prompt
+            and self.rwkv_generation_prompt == "fake_think"
+            and rendered.endswith("<think></think")
+        ):
+            rendered += ">\n"
+        return rendered
+
+    @staticmethod
+    def parse_generations(outputs: Union[Dict, List[Dict]], **kwargs) -> List[str]:
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+        generations = []
+        for output in outputs:
+            choices = [None] * len(output["choices"])
+            for choice in output["choices"]:
+                choices[choice["index"]] = _RWKVCompletion(
+                    choice.get("text", ""),
+                    choice.get("finish_reason"),
+                    raw_response=output,
+                )
+            generations.extend(choices)
+        return generations
+
+    def _create_payload(
+        self,
+        messages: Union[List[List[int]], List[dict], List[str], str],
+        generate=False,
+        gen_kwargs: Optional[dict] = None,
+        **kwargs,
+    ) -> dict:
+        if not generate:
+            raise NotImplementedError(
+                "transformers serve does not expose echo prompt logprobs; "
+                "multiple_choice and other loglikelihood tasks are unsupported."
+            )
+        effective_kwargs = dict(gen_kwargs or {})
+        do_sample = effective_kwargs.get("do_sample")
+        payload = super()._create_payload(
+            messages,
+            generate=True,
+            gen_kwargs=effective_kwargs,
+            **kwargs,
+        )
+        profile = dict(self._generation_profile)
+        if self.rwkv_sampling_mode == "task":
+            for name in (
+                "temperature",
+                "top_p",
+                "top_k",
+                "presence_penalty",
+                "frequency_penalty",
+                "penalty_decay",
+            ):
+                if name in effective_kwargs:
+                    profile[name] = effective_kwargs[name]
+            if do_sample is not None:
+                profile["do_sample"] = bool(do_sample)
+        payload["temperature"] = profile.get("temperature", 1.0)
+        payload["generation_config"] = json.dumps(
+            profile, separators=(",", ":"), sort_keys=True
+        )
+        for name in (
+            "top_p",
+            "top_k",
+            "presence_penalty",
+            "frequency_penalty",
+            "penalty_decay",
+        ):
+            payload.pop(name, None)
+        if not payload["stop"]:
+            payload["stop"] = [self.PROMPT_STOPS[self.rwkv_prompt_template]]
+        return payload
 
 
 @register_model("local-chat-completions")
