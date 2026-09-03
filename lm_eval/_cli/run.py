@@ -372,6 +372,18 @@ class Run(SubCommand):
             cfg.hf_hub_log_args["token"] = os.environ.get("HF_TOKEN")
 
         evaluation_tracker = EvaluationTracker(**cfg.hf_hub_log_args)
+        scoreboard_callback = None
+        publication = getattr(cfg, "publication", {})
+        if isinstance(publication, dict) and publication.get("enabled", False):
+            from lm_eval.loggers.scoreboard import (
+                PublicationConfig,
+                ScoreboardTaskCallback,
+            )
+
+            publication_config = PublicationConfig.from_mapping(publication)
+            scoreboard_callback = ScoreboardTaskCallback(
+                config=publication_config,
+            )
 
         # Create task manager (metadata already set up in config validation)
         task_manager = cfg.process_tasks(cfg.metadata)
@@ -423,6 +435,7 @@ class Run(SubCommand):
             fewshot_random_seed=cfg.seed[3] if cfg.seed else None,
             confirm_run_unsafe_code=cfg.confirm_run_unsafe_code,
             metadata=cfg.metadata,
+            task_callback=scoreboard_callback,
         )
 
         # Process results
@@ -465,9 +478,10 @@ class Run(SubCommand):
 
             if cfg.log_samples:
                 for task_name in results["configs"]:
-                    evaluation_tracker.save_results_samples(
-                        task_name=task_name, samples=samples[task_name]
-                    )
+                    if task_name not in evaluation_tracker.saved_sample_tasks:
+                        evaluation_tracker.save_results_samples(
+                            task_name=task_name, samples=samples[task_name]
+                        )
 
             if (
                 evaluation_tracker.push_results_to_hub

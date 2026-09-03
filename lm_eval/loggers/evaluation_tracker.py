@@ -175,6 +175,8 @@ class EvaluationTracker:
         self.general_config_tracker = GeneralConfigTracker()
 
         self.output_path = output_path
+        self.date_id = datetime.now().isoformat().replace(":", "-")
+        self.saved_sample_tasks: set[str] = set()
         self.push_results_to_hub = push_results_to_hub
         self.push_samples_to_hub = push_samples_to_hub
         self.public_repo = public_repo
@@ -267,7 +269,6 @@ class EvaluationTracker:
                 )
 
                 path = Path(self.output_path if self.output_path else Path.cwd())
-                self.date_id = datetime.now().isoformat().replace(":", "-")
                 if path.suffix == ".json":
                     path.parent.mkdir(parents=True, exist_ok=True)
                     file_results_aggregated = path.with_name(
@@ -317,11 +318,66 @@ class EvaluationTracker:
                 "Output path not provided, skipping saving results aggregated"
             )
 
+    def save_task_artifacts(
+        self,
+        task_name: str,
+        results: dict[str, Any],
+        samples: list[dict[str, Any]],
+    ) -> dict[str, str] | None:
+        """Persist one completed task for post-evaluation consumers."""
+        if not self.output_path:
+            return None
+        samples_path = self.save_results_samples(task_name, samples)
+        if samples_path is None:
+            return None
+        output_path = Path(self.output_path)
+        if output_path.suffix == ".json":
+            output_path = output_path.parent
+        else:
+            output_path /= str(self.general_config_tracker.model_name_sanitized)
+        root = output_path / "task_artifacts" / sanitize_task_name(task_name)
+        root.mkdir(parents=True, exist_ok=True)
+        paths = {
+            "results": root / "results.json",
+            "samples": Path(samples_path),
+            "metadata": root / "metadata.json",
+        }
+        run_config = results["config"]
+        model_args = run_config["model_args"]
+        task_config = results["configs"][task_name]
+        task_metadata = task_config.get("metadata") or {}
+        metadata = {
+            "framework": "lm-eval-harness",
+            "version": results.get("lm_eval_version"),
+            "model": model_args.get("model")
+            or model_args.get("pretrained")
+            or self.general_config_tracker.model_name,
+            "precision": task_metadata.get("wkv_mode")
+            or task_config.get("wkv_mode")
+            or model_args.get("wkv_mode")
+            or "fp32io16",
+            "backend": run_config.get("model"),
+        }
+        for name, value in (("results", results), ("metadata", metadata)):
+            temporary = paths[name].with_suffix(paths[name].suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=handle_non_serializable,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(paths[name])
+        return {name: str(path) for name, path in paths.items()}
+
     def save_results_samples(
         self,
         task_name: str,
-        samples: dict,
-    ) -> None:
+        samples: list[dict[str, Any]],
+    ) -> str | None:
         """Saves the samples results to the output path.
 
         Pushes them to the Hugging Face hub if requested.
@@ -330,6 +386,7 @@ class EvaluationTracker:
             task_name (str): The task name to save the samples for.
             samples (dict): The samples results to save.
         """
+        file_results_samples = None
         if self.output_path:
             try:
                 eval_logger.debug(f"Saving per-sample results for: {task_name}")
@@ -345,7 +402,7 @@ class EvaluationTracker:
                     path / f"samples_{task_name}_{self.date_id}.jsonl"
                 )
                 info_once(eval_logger, f"Saving per-task samples to {path}/*.jsonl")
-                with open(file_results_samples, "a", encoding="utf-8") as f:
+                with open(file_results_samples, "w", encoding="utf-8") as f:
                     for sample in samples:
                         # we first need to sanitize arguments and resps
                         # otherwise we won't be able to load the dataset
@@ -356,22 +413,24 @@ class EvaluationTracker:
                             for j, tmp in enumerate(arg):
                                 arguments[f"gen_args_{i}"][f"arg_{j}"] = tmp
 
-                        sample["resps"] = sanitize_list(sample["resps"])
-                        sample["filtered_resps"] = sanitize_list(
+                        serialized_sample = dict(sample)
+                        serialized_sample["resps"] = sanitize_list(sample["resps"])
+                        serialized_sample["filtered_resps"] = sanitize_list(
                             sample["filtered_resps"]
                         )
-                        sample["arguments"] = arguments
-                        sample["target"] = str(sample["target"])
+                        serialized_sample["arguments"] = arguments
+                        serialized_sample["target"] = str(sample["target"])
 
                         sample_dump = (
                             json.dumps(
-                                sample,
+                                serialized_sample,
                                 default=handle_non_serializable,
                                 ensure_ascii=False,
                             )
                             + "\n"
                         )
                         f.write(sample_dump)
+                self.saved_sample_tasks.add(task_name)
 
                 if self.api and self.push_samples_to_hub:
                     from huggingface_hub.utils import (
@@ -414,12 +473,14 @@ class EvaluationTracker:
                         f"Successfully pushed sample results for task: {task_name} to the Hugging Face Hub. "
                         f"You can find them at: {repo_id}"
                     )
-
             except Exception as e:
                 eval_logger.warning("Could not save sample results")
                 eval_logger.info(repr(e))
         else:
             eval_logger.info("Output path not provided, skipping saving sample results")
+        return (
+            str(file_results_samples) if task_name in self.saved_sample_tasks else None
+        )
 
     def recreate_metadata_card(self) -> None:
         """Creates a metadata card for the evaluation results dataset.

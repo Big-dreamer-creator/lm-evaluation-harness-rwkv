@@ -99,14 +99,13 @@ param_size: 参数规模, 仅有 0.1b, 0.4b, 1.5b(often used in RL), 2.9b, 7.2b(
 记录详细 (benchmark_name, model_name, n_samples, k_metrics, cot_mode, prompt_template), [_可选完成 wkv_mode fp32io16 vs fp16 对比] 对应的 (正确率, 截断率) , 其中截断率定义为达到输出上限未能完成作答的样本数 / 总样本数
 
 ## 分数上传
-等待 scoreboard-rwkv 仓库完成后会补充详细方法, 暂不执行相关工作.
+分数上传远端实现是https://github.com/rwkv-rs/scoreboard-rwkv，本机的\\wsl.localhost\Ubuntu-24.04\home\creator\code\scoreboard-rwkv路径下有跟远端同步的仓库，
+该仓库严禁在本地修改
+需求：
+新建一个文件放在合适的目录（不是scripts，scripts目录下一般放.sh启动脚本或者安装依赖的脚本），只有以下功能
+1. 某一个benchmark task完成后立即触发回调
+2. 读取该benchmark保存的分数和模型输入输出记录，只读取需要上传的部分
+3. 调取scoreboard-rwkv的http接口上传分数 模型输入输出 解码参数等需要上传的东西，确保所有内容正确显示，上传数量有限制，阅读scoreboard源码了解正确的上传方法
 
 ## Env
 使用 uv 管理本机和远端专属环境 ./.venv, 严禁本项目使用其它环境, 严禁其它项目使用本项目环境, 避免环境污染问题。
-
-## Machine for Testing and Benchmarking
-```bash
-ssh rwkv-sha-pro6000x8
-cd ~/Projects/MachineLearning/lm-evaluation-harness-rwkv
-```
-use git to sync your changes instead of rsync.

@@ -18,6 +18,23 @@ if TYPE_CHECKING:
     from lm_eval.tasks import TaskManager
 
 eval_logger = logging.getLogger(__name__)
+PUBLICATION_FIELDS = {
+    "base_url",
+    "configured_benchmarks",
+    "control_timeout",
+    "dry_run",
+    "enabled",
+    "model_revision",
+    "model_sha256",
+    "rerun_reason",
+    "retries",
+    "retry_delay",
+    "skipped_benchmarks",
+    "task_metadata",
+    "tasks",
+    "timeout",
+    "token_env",
+}
 DICT_KEYS = [
     "wandb_args",
     "wandb_config_args",
@@ -25,6 +42,7 @@ DICT_KEYS = [
     "metadata",
     "model_args",
     "gen_kwargs",
+    "publication",
 ]
 
 
@@ -174,6 +192,10 @@ class EvaluatorConfig:
     trackio_args: dict = field(
         default_factory=dict, metadata={"help": "Arguments for trackio logging"}
     )
+    publication: dict = field(
+        default_factory=dict,
+        metadata={"help": "Scoreboard publication settings"},
+    )
 
     # Reproducibility
     seed: list = field(
@@ -298,6 +320,27 @@ class EvaluatorConfig:
             raise ValueError(
                 "Specify --output_path if providing --log_samples or --predict_only"
             )
+
+        if not isinstance(self.publication, dict):
+            raise TypeError("publication must be a mapping")
+        unknown_publication = sorted(set(self.publication) - PUBLICATION_FIELDS)
+        if unknown_publication:
+            raise ValueError(
+                "Unknown publication fields: " + ", ".join(unknown_publication)
+            )
+        if not isinstance(self.publication.get("dry_run", False), bool):
+            raise TypeError("publication.dry_run must be a boolean")
+        if "tasks" in self.publication and "task_metadata" in self.publication:
+            raise ValueError("publication must not define both tasks and task_metadata")
+        if self.publication.get("enabled", False):
+            if not self.log_samples:
+                raise ValueError(
+                    "publication.enabled requires log_samples so task evidence is saved"
+                )
+            if not self.output_path:
+                raise ValueError(
+                    "publication.enabled requires output_path for saved task artifacts"
+                )
 
         # Handle fewshot_as_multiturn logic:
         # - If None and apply_chat_template is set, default to True
