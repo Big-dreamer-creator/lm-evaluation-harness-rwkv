@@ -508,11 +508,6 @@ class EvaluatorConfig:
             },
             "publication": publication,
         }
-        if isinstance(publication, dict) and publication.get("enabled", False):
-            # The HTTP backend keeps raw responses and token IDs only when
-            # evidence recording is enabled.  Do not change legacy configs'
-            # model-argument shape unless they opt into publication.
-            normalized["model_args"]["record_evidence"] = True
         if "limit" in config:
             limit = config["limit"]
             if (
