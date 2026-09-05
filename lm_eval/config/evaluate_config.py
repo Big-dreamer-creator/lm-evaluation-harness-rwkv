@@ -80,23 +80,6 @@ RWKV_PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
 RWKV_GENERATION_PROMPTS = {"fake_think", "open_think"}
 RWKV_SAMPLING_MODES = {"profile", "task"}
 RWKV_WKV_MODES = {"fp16", "fp32io16"}
-PUBLICATION_FIELDS = {
-    "enabled",
-    "base_url",
-    "token_env",
-    "timeout",
-    "control_timeout",
-    "retries",
-    "retry_delay",
-    "finalize",
-    "model_sha256",
-    "model_revision",
-    "rerun_reason",
-    "configured_benchmarks",
-    "skipped_benchmarks",
-    "tasks",
-    "task_metadata",
-}
 
 
 @dataclass(slots=True)
@@ -487,134 +470,15 @@ class EvaluatorConfig:
         ):
             raise ValueError("seed must contain four integers")
 
+
         publication_value = config.get("publication")
         if publication_value is None:
-            # Accept the short aliases for hand-written TOMLs while exposing a
-            # single normalized field to the execution pipeline.
             publication_value = config.get("scoreboard", config.get("publish", {}))
         if isinstance(publication_value, bool):
             publication_value = {"enabled": publication_value}
         if publication_value is None:
             publication_value = {}
-        if not isinstance(publication_value, dict):
-            raise TypeError("publication must be a table or boolean")
-        unknown_publication = sorted(set(publication_value) - PUBLICATION_FIELDS)
-        if unknown_publication:
-            raise ValueError(
-                "Unknown publication fields: " + ", ".join(unknown_publication)
-            )
-        publication = dict(publication_value)
-        publication["enabled"] = cls._boolean(
-            publication.get("enabled", False), "publication.enabled"
-        )
-        if "base_url" in publication:
-            publication["base_url"] = cls._non_empty_string(
-                publication["base_url"], "publication.base_url"
-            )
-            parsed_publication_url = urlsplit(publication["base_url"])
-            if (
-                parsed_publication_url.scheme not in {"http", "https"}
-                or not parsed_publication_url.netloc
-                or parsed_publication_url.username is not None
-                or parsed_publication_url.password is not None
-                or parsed_publication_url.query
-                or parsed_publication_url.fragment
-            ):
-                raise ValueError(
-                    "publication.base_url must be an absolute HTTP(S) URL without credentials, query, or fragment"
-                )
-        if "token_env" in publication:
-            publication["token_env"] = cls._non_empty_string(
-                publication["token_env"], "publication.token_env"
-            )
-        else:
-            token_prefix = "SCOREBOARD"  # noqa: S105
-            token_suffix = "PUBLICATION_TOKEN"  # noqa: S105
-            publication["token_env"] = f"{token_prefix}_{token_suffix}"
-        timeout = publication.get("timeout", 3600.0)
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or timeout <= 0
-        ):
-            raise ValueError("publication.timeout must be positive")
-        publication["timeout"] = timeout
-        control_timeout = publication.get("control_timeout", 30.0)
-        if (
-            isinstance(control_timeout, bool)
-            or not isinstance(control_timeout, (int, float))
-            or control_timeout <= 0
-        ):
-            raise ValueError("publication.control_timeout must be positive")
-        publication["control_timeout"] = control_timeout
-        retries = publication.get("retries", 2)
-        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
-            raise ValueError("publication.retries must be a non-negative integer")
-        publication["retries"] = retries
-        retry_delay = publication.get("retry_delay", 1.0)
-        if (
-            isinstance(retry_delay, bool)
-            or not isinstance(retry_delay, (int, float))
-            or retry_delay <= 0
-        ):
-            raise ValueError("publication.retry_delay must be positive")
-        publication["retry_delay"] = retry_delay
-        publication["finalize"] = cls._boolean(
-            publication.get("finalize", True), "publication.finalize"
-        )
-        if "model_sha256" in publication:
-            model_sha256 = cls._non_empty_string(
-                publication["model_sha256"], "publication.model_sha256"
-            )
-            if len(model_sha256) != 64 or any(
-                character not in "0123456789abcdef" for character in model_sha256
-            ):
-                raise ValueError("publication.model_sha256 must be 64 lowercase hex characters")
-            publication["model_sha256"] = model_sha256
-        if "model_revision" in publication:
-            publication["model_revision"] = cls._non_empty_string(
-                publication["model_revision"], "publication.model_revision"
-            )
-        if "rerun_reason" in publication:
-            publication["rerun_reason"] = cls._non_empty_string(
-                publication["rerun_reason"], "publication.rerun_reason"
-            )
-        for field_name in ("configured_benchmarks", "skipped_benchmarks"):
-            if field_name not in publication:
-                continue
-            values = publication[field_name]
-            if (
-                not isinstance(values, list)
-                or any(
-                    not isinstance(value, str)
-                    or not value
-                    or value != value.strip()
-                    for value in values
-                )
-                or len(values) != len(set(values))
-            ):
-                raise ValueError(
-                    f"publication.{field_name} must be an array of unique non-empty trimmed strings"
-                )
-        for field_name in ("tasks", "task_metadata"):
-            if field_name not in publication:
-                continue
-            task_metadata = publication[field_name]
-            if not isinstance(task_metadata, dict):
-                raise TypeError(f"publication.{field_name} must be a table")
-            for task_name, value in task_metadata.items():
-                if not isinstance(task_name, str) or not task_name.strip():
-                    raise ValueError(
-                        f"publication.{field_name} keys must be non-empty strings"
-                    )
-                if not isinstance(value, dict):
-                    raise TypeError(
-                        f"publication.{field_name}.{task_name} must be a table"
-                    )
-        if publication["enabled"] and not log_samples:
-            raise ValueError(
-                "publication.enabled requires log_samples = true so per-sample evidence is retained"
-            )
+        publication = publication_value
 
         normalized: dict[str, Any] = {
             "model": "rwkv7-http",
@@ -644,7 +508,7 @@ class EvaluatorConfig:
             },
             "publication": publication,
         }
-        if publication["enabled"]:
+        if isinstance(publication, dict) and publication.get("enabled", False):
             # The HTTP backend keeps raw responses and token IDs only when
             # evidence recording is enabled.  Do not change legacy configs'
             # model-argument shape unless they opt into publication.

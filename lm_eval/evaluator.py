@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import itertools
 import json
 import logging
@@ -18,6 +17,7 @@ from lm_eval.caching.cache import delete_cache
 from lm_eval.defaults import DEFAULT_OTHER_SEED, DEFAULT_RANDOM_SEED, LMEVAL_HASHMM
 from lm_eval.evaluator_utils import (
     ResultAcc,
+    _compute_task_aggregations,
     _handle_back_comp,
     _log_selected_tasks,
     _process_results,
@@ -40,6 +40,8 @@ from lm_eval.utils import (
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from lm_eval.api.group import Group
     from lm_eval.api.model import LM
     from lm_eval.api.task import Task
@@ -50,75 +52,6 @@ if TYPE_CHECKING:
     _NestedDict = dict[Group, dict[str, Task] | Group] | dict[str, Task]
 
 eval_logger = logging.getLogger(__name__)
-
-
-def _sample_response_evidence(
-    request: Any,
-    filtered_answer: Any,
-    metrics: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Serialize model-side evidence without changing native lm-eval fields.
-
-    RWKV7HTTP attaches these attributes to its ``str`` generation objects.  The
-    evaluator normally sanitizes responses to strings before writing samples;
-    keeping a parallel, JSON-native field preserves the raw HTTP response and
-    token IDs for a producer run while remaining compatible with all other
-    model backends.
-    """
-
-    responses = getattr(request, "resps", []) or []
-    prompt = None
-    arguments = getattr(request, "arguments", ())
-    if isinstance(arguments, (tuple, list)) and arguments:
-        prompt = arguments[0]
-    elif arguments is not None:
-        prompt = arguments
-    prompt_text = prompt if isinstance(prompt, str) else str(prompt)
-    filtered_text = (
-        filtered_answer
-        if isinstance(filtered_answer, str)
-        else str(filtered_answer)
-    )
-    evidence: list[dict[str, Any]] = []
-    for response in responses:
-        raw_response = getattr(response, "raw_response", None)
-        if raw_response is not None:
-            raw_bytes = json.dumps(
-                raw_response,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-            raw_hash = hashlib.sha256(raw_bytes).hexdigest()
-        else:
-            raw_hash = None
-        output_text = str(response)
-        finish_reason = getattr(response, "finish_reason", None)
-        truncated = bool(
-            getattr(response, "truncated", False)
-            or finish_reason in {"length", "max_tokens"}
-        )
-        evidence.append(
-            {
-                "prompt": prompt_text,
-                "input_token_ids": getattr(response, "prompt_token_ids", None),
-                "output_token_ids": getattr(response, "output_token_ids", None),
-                "raw_response": raw_response,
-                "reasoning": getattr(response, "reasoning", None),
-                "post_processed_answer": filtered_text,
-                "finish_reason": finish_reason,
-                "truncation": truncated,
-                "metrics": metrics,
-                "hashes": {
-                    "prompt_sha256": hash_string(prompt_text),
-                    "output_sha256": hash_string(output_text),
-                    "answer_sha256": hash_string(filtered_text),
-                    "raw_response_sha256": raw_hash,
-                },
-            }
-        )
-    return evidence
 
 
 @positional_deprecated
@@ -154,6 +87,7 @@ def simple_evaluate(
     fewshot_random_seed: int = DEFAULT_OTHER_SEED,
     confirm_run_unsafe_code: bool = False,
     metadata: dict[str, Any] | None = None,
+    task_callback: Callable[..., Any] | None = None,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -425,6 +359,24 @@ def simple_evaluate(
             fewshot_as_multiturn=fewshot_as_multiturn,
         )
 
+    callback_context: dict[str, Any] = {
+        "config": {
+            "model": model if isinstance(model, str) else type(model).__name__,
+            "model_args": (
+                simple_parse_args_string(model_args)
+                if isinstance(model_args, str)
+                else dict(model_args or {})
+            ),
+            "batch_size": batch_size,
+            "device": device,
+            "gen_kwargs": gen_kwargs,
+        },
+        "lm_eval_version": lm_eval.__version__,
+        "git_hash": get_git_commit_hash(),
+    }
+    if hasattr(lm, "get_model_info"):
+        callback_context["config"].update(lm.get_model_info())  # type: ignore
+
     results = evaluate(
         lm=lm,
         task_dict=loaded,
@@ -440,6 +392,9 @@ def simple_evaluate(
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
+        task_callback=task_callback,
+        task_callback_context=callback_context,
+        evaluation_tracker=evaluation_tracker,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -506,6 +461,9 @@ def evaluate(
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
+    task_callback: Callable[..., Any] | None = None,
+    task_callback_context: dict[str, Any] | None = None,
+    evaluation_tracker: EvaluationTracker | None = None,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -556,6 +514,7 @@ def evaluate(
     # stores the amount to pad out reqs per req. type so that
     # number of fwd passes per distributed rank is equal
     padding_requests = defaultdict(int)
+    task_padding_requests: dict[str, dict[str, int]] = {}
 
     # Initialize groups and tasks
     # handle back_comp. Assume if "tasks" not present, then using old nested.
@@ -626,10 +585,9 @@ def evaluate(
         )
         if write_out:
             print_writeout(task)
-        # aggregate Instances by LM method requested to get output.
-        for instance in task.instances:
-            reqtype = instance.request_type
-            requests[reqtype].append(instance)
+        if task_callback is None:
+            for instance in task.instances:
+                requests[instance.request_type].append(instance)
 
         if lm.world_size > 1:
             import torch
@@ -648,49 +606,33 @@ def evaluate(
             numpad = max(gathered_item) - gathered_item[lm.rank]
             # todo: may not account for padding in cases like SquadV2 which has multiple req types
             padding_requests[reqtype] += numpad
-
-    ### Run LM on inputs, get all outputs ###
-    # execute each type of request
-    for reqtype, reqs in requests.items():
-        eval_logger.info(f"Running {reqtype} requests")
-        # create `K` copies of each request `req` based off `K = req.repeats`
-        cloned_reqs = []
-        for req in reqs:
-            cloned_reqs.extend([req] * req.repeats)
-
-        if (lm.world_size > 1) and (padding_requests[reqtype] > 0):
-            for _ in range(padding_requests[reqtype]):
-                cloned_reqs.extend([req] * req.repeats)
-
-        # run requests through model
-        resps = getattr(lm, reqtype)(cloned_reqs)
-
-        # put responses from model into a list of length K for each request.
-        for x, req in zip(resps, cloned_reqs, strict=True):
-            req.resps.append(x)
-
-        if lm.world_size > 1:
-            lm.barrier()
+            task_padding_requests[task_name] = {reqtype: numpad}
 
     RANK = lm.rank
     WORLD_SIZE = lm.world_size
-    ### Postprocess outputs ###
-    # TODO: del model here, maybe (idea: allow user to specify device of e.g. reward model separately)
-    for (task_name, acc), limit in zip(eval_results_acc.items(), limits, strict=True):
+
+    def run_requests(
+        task_requests: dict[str, list[Any]], task_padding: dict[str, int]
+    ) -> None:
+        for reqtype, reqs in task_requests.items():
+            eval_logger.info(f"Running {reqtype} requests")
+            cloned_reqs = [req for req in reqs for _ in range(req.repeats)]
+            for _ in range(task_padding.get(reqtype, 0)):
+                cloned_reqs.extend([reqs[-1]] * reqs[-1].repeats)
+            resps = getattr(lm, reqtype)(cloned_reqs)
+            for response, request in zip(resps, cloned_reqs, strict=True):
+                request.resps.append(response)
+            if WORLD_SIZE > 1:
+                lm.barrier()
+
+    def finish_benchmark(task_name: str, acc: ResultAcc, limit: int | None) -> None:
         task = acc["task"]
         task.apply_filters()
-
-        ### Collect values of metrics on all datapoints ###
-        # # unpack results and sort back in order and return control to Task
-        # TODO: make it possible to use a different metric per filter
-        # Pre-process task.instances to group by doc_id
         instances_by_doc_id = defaultdict(list)
         for instance in task.instances:
             instances_by_doc_id[instance.doc_id].append(instance)
-        # Sort instances within each group
         for instances in instances_by_doc_id.values():
             instances.sort(key=lambda x: x.idx)
-        # iterate over different filters used
         for filter_key in task.instances[0].filtered_resps:
             indices = samples.get(task_name, None) if samples is not None else None
             doc_iterator = task.doc_iterator(
@@ -701,39 +643,33 @@ def evaluate(
             )
             for doc_id, doc in doc_iterator:
                 doc_id_true = indices[doc_id] if indices else doc_id
-                requests = instances_by_doc_id[doc_id]
+                document_requests = instances_by_doc_id[doc_id]
                 metrics = task.process_results(
-                    doc, [req.filtered_resps[filter_key] for req in requests]
+                    doc,
+                    [req.filtered_resps[filter_key] for req in document_requests],
                 )
                 if log_samples:
                     target = task.doc_to_target(doc)
-                    filtered_answers = [
-                        req.filtered_resps[filter_key] for req in requests
-                    ]
                     example = {
                         "doc_id": doc_id_true,
                         "doc": doc,
                         "target": target,
-                        "arguments": [req.args for req in requests],
-                        "resps": [req.resps for req in requests],
-                        "filtered_resps": filtered_answers,
+                        "arguments": [req.args for req in document_requests],
+                        "resps": [req.resps for req in document_requests],
+                        "filtered_resps": [
+                            req.filtered_resps[filter_key] for req in document_requests
+                        ],
                         "filter": filter_key,
                         "metrics": list(metrics.keys()),
-                        "response_evidence": [
-                            _sample_response_evidence(req, answer, metrics)
-                            for req, answer in zip(
-                                requests, filtered_answers, strict=True
-                            )
-                        ],
                         "doc_hash": hash_string(
                             json.dumps(
-                                requests[0].doc,
+                                document_requests[0].doc,
                                 indent=2,
                                 default=handle_non_serializable,
                                 ensure_ascii=False,
                             )
                         ),
-                        "prompt_hash": hash_string(requests[0].arguments[0]),
+                        "prompt_hash": hash_string(document_requests[0].arguments[0]),
                         "target_hash": hash_string(str(target)),
                     }
                     example.update(metrics)
@@ -741,16 +677,12 @@ def evaluate(
                 for metric, value in metrics.items():
                     acc["raw_metrics"][(metric, filter_key)].append(value)
 
-    if WORLD_SIZE > 1:
-        # Gather all sample metrics across ranks, keyed by task name.
-        if log_samples:
-            rank_samples = {
-                task_name: acc["logged_samples"]
-                for task_name, acc in eval_results_acc.items()
-            }
-            all_samples = lm.gather_object(rank_samples, dst=0)
-            if RANK == 0:
-                for task_name, acc in eval_results_acc.items():
+        if WORLD_SIZE > 1:
+            if log_samples:
+                all_samples = lm.gather_object(
+                    {task_name: acc["logged_samples"]}, dst=0
+                )
+                if RANK == 0:
                     acc["logged_samples"] = list(
                         itertools.chain.from_iterable(
                             rank_data[task_name]
@@ -758,13 +690,8 @@ def evaluate(
                         )
                     )
 
-        rank_metrics = {
-            task_name: dict(acc["raw_metrics"])
-            for task_name, acc in eval_results_acc.items()
-        }
-        all_metrics = lm.gather_object(rank_metrics, dst=0)
-        if RANK == 0:
-            for task_name, acc in eval_results_acc.items():
+            all_metrics = lm.gather_object({task_name: dict(acc["raw_metrics"])}, dst=0)
+            if RANK == 0:
                 for metric_key in acc["raw_metrics"]:
                     acc["raw_metrics"][metric_key] = list(
                         itertools.chain.from_iterable(
@@ -772,6 +699,76 @@ def evaluate(
                             for rank_data in all_metrics  # type: ignore
                         )
                     )
+
+        if RANK == 0 and task_callback is not None:
+            aggregated_metrics, sample_len = _compute_task_aggregations(
+                task, acc["raw_metrics"], bootstrap_iters
+            )
+            task_config = dict(task.dump_config())
+            callback_results = {
+                **(task_callback_context or {}),
+                "results": {
+                    task_name: {
+                        "name": task_name,
+                        "alias": task_config.get("task_alias", task_name),
+                        "sample_len": sample_len,
+                        **aggregated_metrics,
+                    }
+                },
+                "configs": {task_name: task_config},
+                "versions": {task_name: task.VERSION},
+                "n-samples": {
+                    task_name: {
+                        "original": len(task.eval_docs),
+                        "effective": sample_len,
+                    }
+                },
+            }
+            artifact_paths = None
+            if evaluation_tracker is not None:
+                try:
+                    artifact_paths = evaluation_tracker.save_task_artifacts(
+                        task_name, callback_results, acc["logged_samples"]
+                    )
+                except (OSError, TypeError, ValueError) as error:
+                    eval_logger.warning(
+                        "Could not persist task artifacts for %s: %s", task_name, error
+                    )
+            try:
+                callback_status = task_callback(
+                    task_name=task_name,
+                    artifact_paths=artifact_paths,
+                )
+                if isinstance(callback_status, dict):
+                    eval_logger.info(
+                        "Task %s publication=%s uploaded=%s",
+                        task_name,
+                        callback_status.get("publication", "unknown"),
+                        callback_status.get("uploaded", False),
+                    )
+            except Exception as error:  # noqa: BLE001
+                eval_logger.warning("Task callback failed for %s: %s", task_name, error)
+        if WORLD_SIZE > 1:
+            lm.barrier()
+
+    if task_callback is None:
+        run_requests(requests, padding_requests)
+        for (task_name, acc), task_limit in zip(
+            eval_results_acc.items(), limits, strict=True
+        ):
+            finish_benchmark(task_name, acc, task_limit)
+    else:
+        for (task_name, acc), task_limit in zip(
+            eval_results_acc.items(), limits, strict=True
+        ):
+            benchmark_requests = defaultdict(list)
+            for instance in acc["task"].instances:
+                benchmark_requests[instance.request_type].append(instance)
+            run_requests(
+                benchmark_requests,
+                task_padding_requests.get(task_name, {}),
+            )
+            finish_benchmark(task_name, acc, task_limit)
 
     if RANK == 0:
         res = _process_results(eval_results_acc, groups, bootstrap_iters)

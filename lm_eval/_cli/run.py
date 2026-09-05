@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import textwrap
-from copy import deepcopy
 from functools import partial
 
 from lm_eval._cli.subcommand import SubCommand
@@ -14,42 +13,6 @@ from lm_eval._cli.utils import (
     request_caching_arg_to_dict,
     try_parse_json,
 )
-
-
-def _finish_reasons(value) -> list[str]:
-    if isinstance(value, (list, tuple)):
-        return [
-            reason
-            for item in value
-            for reason in _finish_reasons(item)
-        ]
-    reason = getattr(value, "finish_reason", None)
-    return [reason] if isinstance(reason, str) else []
-
-
-def _add_truncation_stats(results: dict, samples: dict) -> dict:
-    task_stats = {}
-    for task_name, task_samples in samples.items():
-        generated_samples = 0
-        truncated_samples = 0
-        for sample in task_samples:
-            finish_reasons = _finish_reasons(sample.get("resps", []))
-            if not finish_reasons:
-                continue
-            generated_samples += 1
-            truncated = "length" in finish_reasons
-            truncated_samples += int(truncated)
-            sample["finish_reasons"] = finish_reasons
-            sample["truncated"] = truncated
-        task_stats[task_name] = {
-            "generated_samples": generated_samples,
-            "truncated_samples": truncated_samples,
-            "truncation_rate": (
-                truncated_samples / generated_samples if generated_samples else None
-            ),
-        }
-    results["config"]["truncation"] = task_stats
-    return task_stats
 
 
 class Run(SubCommand):
@@ -74,7 +37,7 @@ class Run(SubCommand):
                   $ lm-eval run --model hf --model_args pretrained=gpt2 --tasks lambada --gen_kwargs temperature=0.8 top_p=0.95 'stop=["\\n\\n"]'
 
                   # Use configuration file
-                  $ lm-eval run --config my_config.toml
+                  $ lm-eval run --config my_config.yaml --tasks mmlu
 
                 For more information, see: https://github.com/EleutherAI/lm-evaluation-harness
             """),
@@ -94,7 +57,7 @@ class Run(SubCommand):
             default=None,
             type=str,
             metavar="<path>",
-            help="Set initial arguments from TOML or YAML config",
+            help="Set initial arguments from YAML config",
         )
 
         # Model and Tasks
@@ -409,6 +372,18 @@ class Run(SubCommand):
             cfg.hf_hub_log_args["token"] = os.environ.get("HF_TOKEN")
 
         evaluation_tracker = EvaluationTracker(**cfg.hf_hub_log_args)
+        scoreboard_callback = None
+        publication = getattr(cfg, "publication", {})
+        if isinstance(publication, dict) and publication.get("enabled", False):
+            from lm_eval.loggers.scoreboard import (
+                PublicationConfig,
+                ScoreboardTaskCallback,
+            )
+
+            publication_config = PublicationConfig.from_mapping(publication)
+            scoreboard_callback = ScoreboardTaskCallback(
+                config=publication_config,
+            )
 
         # Create task manager (metadata already set up in config validation)
         task_manager = cfg.process_tasks(cfg.metadata)
@@ -460,27 +435,13 @@ class Run(SubCommand):
             fewshot_random_seed=cfg.seed[3] if cfg.seed else None,
             confirm_run_unsafe_code=cfg.confirm_run_unsafe_code,
             metadata=cfg.metadata,
+            task_callback=scoreboard_callback,
         )
 
         # Process results
         if results is not None:
-            publication_samples = None
-            publication_config = getattr(cfg, "publication", None)
-            if not isinstance(publication_config, dict) or not publication_config:
-                publication_config = cfg.metadata.get("scoreboard_publication", {})
-            publication_requested = (
-                bool(publication_config)
-                and publication_config.get("enabled", True) is True
-            )
             if cfg.log_samples:
                 samples = results.pop("samples")
-                _add_truncation_stats(results, samples)
-                # ``EvaluationTracker.save_results_samples`` sanitizes and
-                # mutates its input.  Keep an untouched copy for the unified
-                # publication spool so the dashboard receives the same raw
-                # evidence that was produced by the evaluator.
-                if publication_requested:
-                    publication_samples = deepcopy(samples)
 
             dumped = json.dumps(
                 results, indent=2, default=handle_non_serializable, ensure_ascii=False
@@ -517,29 +478,10 @@ class Run(SubCommand):
 
             if cfg.log_samples:
                 for task_name in results["configs"]:
-                    evaluation_tracker.save_results_samples(
-                        task_name=task_name, samples=samples[task_name]
-                    )
-
-            if publication_samples is not None:
-                try:
-                    from lm_eval.loggers.scoreboard import (
-                        publish_lm_eval_evaluation,
-                    )
-
-                    publication_status = publish_lm_eval_evaluation(
-                        results,
-                        publication_samples,
-                        output_dir=cfg.output_path,
-                        publication=publication_config,
-                    )
-                    print(f"publication: {publication_status['publication']}")
-                except Exception as error:  # noqa: BLE001
-                    print(
-                        "publication: failed "
-                        "(evaluation complete, publication incomplete): "
-                        f"{error}"
-                    )
+                    if task_name not in evaluation_tracker.saved_sample_tasks:
+                        evaluation_tracker.save_results_samples(
+                            task_name=task_name, samples=samples[task_name]
+                        )
 
             if (
                 evaluation_tracker.push_results_to_hub
