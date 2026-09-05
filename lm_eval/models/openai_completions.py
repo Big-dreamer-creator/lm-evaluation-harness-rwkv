@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 from functools import cached_property
@@ -8,117 +9,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from lm_eval.api.registry import register_model
 from lm_eval.models.api_models import TemplateAPI
 from lm_eval.models.utils import handle_stop_sequences
-from lm_eval.utils import RemoteTokenizer
 
 
 eval_logger = logging.getLogger(__name__)
-
-
-class _VLLMRWKVTokenizer(RemoteTokenizer):
-    """Tokenizer client for vllm-rwkv's native tokenizer endpoints."""
-
-    def __init__(self, base_url: str, model: str, *args, **kwargs):
-        self.model = model
-        super().__init__(base_url, *args, **kwargs)
-
-    def _validate_server(self):
-        chat_template = self.tokenizer_info.get("chat_template")
-        if not isinstance(chat_template, str) or not chat_template:
-            raise RuntimeError(
-                "vllm-rwkv /tokenizer_info did not provide a chat template. "
-                "Start the server with --enable-tokenizer-info-endpoint."
-            )
-        self.encode("")
-        self.decode([0])
-
-    @property
-    def eos_token(self) -> None:
-        return None
-
-    @property
-    def bos_token(self) -> None:
-        return None
-
-    @property
-    def eos_token_id(self) -> int:
-        return 0
-
-    @property
-    def bos_token_id(self) -> int:
-        return 0
-
-    def encode(self, text: str) -> List[int]:
-        response = self._request_with_retries(
-            "POST",
-            f"{self.base_url}/tokenize",
-            json={
-                "model": self.model,
-                "prompt": text,
-                "add_special_tokens": False,
-            },
-        )
-        tokens = response.json().get("tokens")
-        if not isinstance(tokens, list) or not all(
-            isinstance(token, int) for token in tokens
-        ):
-            raise RuntimeError("Malformed response from vllm-rwkv /tokenize endpoint.")
-        return tokens[1:] if tokens and tokens[0] == 0 else tokens
-
-    def decode(self, tokens: List[int]) -> str:
-        response = self._request_with_retries(
-            "POST",
-            f"{self.base_url}/detokenize",
-            json={"model": self.model, "tokens": tokens},
-        )
-        prompt = response.json().get("prompt")
-        if not isinstance(prompt, str):
-            raise RuntimeError(
-                "Malformed response from vllm-rwkv /detokenize endpoint."
-            )
-        return prompt
-
-
-class _CompletionGeneration(str):
-    def __new__(
-        cls,
-        text: str,
-        finish_reason: str | None = None,
-        *,
-        raw_response: dict | None = None,
-        prompt_token_ids: list[int] | None = None,
-        output_token_ids: list[int] | None = None,
-        reasoning: str | None = None,
-    ):
-        value = super().__new__(cls, text)
-        value.finish_reason = finish_reason
-        value.raw_response = raw_response
-        value.prompt_token_ids = prompt_token_ids
-        value.output_token_ids = output_token_ids
-        value.reasoning = reasoning
-        value.truncated = finish_reason in {"length", "max_tokens"}
-        return value
-
-
-class _LogLikelihoodEvidence(tuple):
-    """Tuple-compatible loglikelihood result with optional HTTP evidence."""
-
-    def __new__(
-        cls,
-        logprob: float,
-        is_greedy: bool,
-        *,
-        raw_response: dict | None = None,
-        prompt_token_ids: list[int] | None = None,
-        output_token_ids: list[int] | None = None,
-    ):
-        value = super().__new__(cls, (logprob, is_greedy))
-        value.raw_response = raw_response
-        value.prompt_token_ids = prompt_token_ids
-        value.output_token_ids = output_token_ids
-        value.finish_reason = None
-        value.reasoning = None
-        value.truncated = False
-        return value
 
 
 @register_model("local-completions")
@@ -227,22 +120,7 @@ class LocalCompletionsAPI(TemplateAPI):
                     if tok != max(top.values()):
                         is_greedy = False
                         break
-                prompt_ids = choice.get("prompt_token_ids")
-                all_token_ids = choice.get("token_ids") or []
-                output_ids = (
-                    all_token_ids[ctxlen:]
-                    if isinstance(all_token_ids, list)
-                    else None
-                )
-                res.append(
-                    _LogLikelihoodEvidence(
-                        logprobs,
-                        is_greedy,
-                        raw_response=out,
-                        prompt_token_ids=prompt_ids,
-                        output_token_ids=output_ids,
-                    )
-                )
+                res.append((logprobs, is_greedy))
         return res
 
     @staticmethod
@@ -252,10 +130,8 @@ class LocalCompletionsAPI(TemplateAPI):
             outputs = [outputs]
         for out in outputs:
             tmp = [None] * len(out["choices"])
-            for choice in out["choices"]:
-                tmp[choice["index"]] = _CompletionGeneration(
-                    choice["text"], choice.get("finish_reason")
-                )
+            for choices in out["choices"]:
+                tmp[choices["index"]] = choices["text"]
             res = res + tmp
         return res
 
@@ -264,17 +140,37 @@ class LocalCompletionsAPI(TemplateAPI):
         return os.environ.get("OPENAI_API_KEY", "")
 
 
+class _RWKVCompletion(str):
+    """Completion text retaining the transport details supplied by the server."""
+
+    def __new__(
+        cls,
+        text: str,
+        finish_reason: str | None = None,
+        *,
+        raw_response: dict | None = None,
+    ):
+        value = super().__new__(cls, text)
+        value.finish_reason = finish_reason
+        value.raw_response = raw_response
+        value.prompt_token_ids = None
+        value.output_token_ids = None
+        value.reasoning = None
+        value.truncated = finish_reason in {"length", "max_tokens"}
+        return value
+
+
 @register_model("rwkv7-http")
 class RWKV7HTTP(LocalCompletionsAPI):
-    """HTTP adapter for the native vllm-rwkv RWKV7 completion endpoint.
+    """RWKV7 adapter for the local ``transformers serve`` completions API.
 
-    The inference process is intentionally outside this repository.  The adapter
-    sends token ids and prompt logprobs to an OpenAI-compatible vllm-rwkv server
-    and renders the official chat template published by that service.
+    ``transformers serve`` accepts rendered text prompts and exposes generation,
+    but not echo prompt logprobs. Consequently this adapter deliberately rejects
+    likelihood workloads such as RACE while retaining native generation evidence
+    for generative tasks such as DROP.
     """
 
     TASK_ADAPTER = "rwkv7-http"
-    DEFAULT_MODEL = "rwkv7-g1i-1.5b-20260805-ctx16384"
     DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1/completions"
     PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
     PROMPT_STOPS = {
@@ -284,20 +180,9 @@ class RWKV7HTTP(LocalCompletionsAPI):
     }
     GENERATION_PROMPTS = {"open_think", "fake_think"}
     SAMPLING_MODES = {"profile", "task"}
-    SAMPLING_PROFILES = {
-        "open_think": {
-            "temperature": 0.96,
-            "top_p": 0.76,
-            "top_k": 32,
-            "presence_penalty": 1.0,
-            "frequency_penalty": 0.1,
-            "penalty_decay": 0.988,
-        },
-        "fake_think": {
-            "temperature": 1.0,
-            "top_p": 0.28,
-            "top_k": 32,
-        },
+    PROFILE_FILES = {
+        "open_think": "generation_config.json",
+        "fake_think": "fake_think_generation_config.json",
     }
 
     def __init__(
@@ -305,110 +190,88 @@ class RWKV7HTTP(LocalCompletionsAPI):
         base_url=DEFAULT_BASE_URL,
         model=None,
         pretrained=None,
-        tokenizer_backend="remote",
+        tokenizer=None,
+        service_backend="transformers",
+        tokenizer_backend="huggingface",
+        tokenized_requests=False,
         rapid_sampling=True,
         num_concurrent=5,
         batch_size=1,
         max_length=16384,
         rwkv_prompt_template="assistant",
-        rwkv_generation_prompt="open_think",
+        rwkv_generation_prompt="fake_think",
         rwkv_sampling_mode="profile",
-        rwkv_system_prompt=None,
-        rwkv_system_prompt_pattern=None,
         cot_mode=None,
         record_evidence=False,
-        tokenized_requests=True,
-        verify_certificate=True,
-        ca_cert_path=None,
-        auth_token=None,
-        timeout=300,
-        max_retries=3,
         **kwargs,
     ):
         model = model or pretrained
         if not isinstance(model, str) or not model.strip():
+            raise ValueError("rwkv7-http requires model= or pretrained=.")
+        if service_backend != "transformers":
+            raise ValueError("This checkout supports service_backend=transformers only.")
+        if tokenizer_backend != "huggingface" or tokenized_requests:
             raise ValueError(
-                "rwkv7-http requires model= or pretrained= with the complete "
-                "served model name."
+                "transformers service_backend requires tokenizer_backend=huggingface "
+                "and tokenized_requests=False."
+            )
+        if record_evidence:
+            raise ValueError(
+                "transformers service_backend does not expose completion token IDs; "
+                "record_evidence=True is unsupported."
             )
         if cot_mode is not None:
             rwkv_generation_prompt = cot_mode
         if rwkv_prompt_template not in self.PROMPT_TEMPLATES:
-            raise ValueError(
-                "rwkv_prompt_template must be one of: "
-                + ", ".join(sorted(self.PROMPT_TEMPLATES))
-            )
+            raise ValueError("rwkv_prompt_template must be assistant, bot, or function_calling.")
         if rwkv_generation_prompt not in self.GENERATION_PROMPTS:
-            raise ValueError(
-                "rwkv_generation_prompt/cot_mode must be one of: "
-                + ", ".join(sorted(self.GENERATION_PROMPTS))
-            )
+            raise ValueError("rwkv_generation_prompt must be open_think or fake_think.")
         if rwkv_sampling_mode not in self.SAMPLING_MODES:
-            raise ValueError(
-                "rwkv_sampling_mode must be one of: "
-                + ", ".join(sorted(self.SAMPLING_MODES))
-            )
-        if tokenizer_backend != "remote":
-            raise ValueError(
-                "rwkv7-http requires tokenizer_backend=remote so inference "
-                "stays in vllm-rwkv."
-            )
-        if not tokenized_requests:
-            raise ValueError("rwkv7-http requires tokenized_requests=True.")
-        if not rapid_sampling:
-            raise ValueError("rwkv7-http requires rapid_sampling=True.")
+            raise ValueError("rwkv_sampling_mode must be profile or task.")
 
         self.rwkv_prompt_template = rwkv_prompt_template
         self.rwkv_generation_prompt = rwkv_generation_prompt
         self.rwkv_sampling_mode = rwkv_sampling_mode
-        self.rwkv_system_prompt = rwkv_system_prompt
-        self.rwkv_system_prompt_pattern = rwkv_system_prompt_pattern
-        self.record_evidence = bool(record_evidence)
-
+        self.record_evidence = False
+        tokenizer = tokenizer or model
         super().__init__(
             base_url=base_url,
             model=model,
-            tokenizer_backend=None,
+            tokenizer=tokenizer,
+            tokenizer_backend=tokenizer_backend,
+            tokenized_requests=False,
             num_concurrent=num_concurrent,
             batch_size=batch_size,
             max_length=max_length,
-            tokenized_requests=False,
-            verify_certificate=verify_certificate,
-            ca_cert_path=ca_cert_path,
-            auth_token=auth_token,
-            timeout=timeout,
-            max_retries=max_retries,
             **kwargs,
         )
-        self.tokenizer_backend = "remote"
-        self.tokenized_requests = True
-        self.tokenizer = _VLLMRWKVTokenizer(
-            base_url,
-            model,
-            timeout=timeout,
-            verify_certificate=verify_certificate,
-            ca_cert_path=ca_cert_path,
-            auth_token=auth_token,
-            max_retries=max_retries,
+        if self._batch_size != 1:
+            raise ValueError(
+                "transformers service_backend requires batch_size=1; use num_concurrent "
+                "for HTTP concurrency."
+            )
+        self._chat_template_source = self.tokenizer.chat_template
+        if not isinstance(self._chat_template_source, str) or not self._chat_template_source:
+            raise RuntimeError("The RWKV tokenizer must provide the official chat template.")
+
+        from transformers import GenerationConfig
+
+        profile = GenerationConfig.from_pretrained(
+            tokenizer,
+            config_file_name=self.PROFILE_FILES[rwkv_generation_prompt],
+            local_files_only=os.path.isdir(tokenizer),
         )
-        self._chat_template_source = self.tokenizer.tokenizer_info["chat_template"]
+        self._generation_profile = profile.to_dict()
         self._chat_template_sha256 = hashlib.sha256(
             self._chat_template_source.encode("utf-8")
         ).hexdigest()
 
     @property
     def tokenizer_name(self) -> str:
-        system_prompt_sha256 = hashlib.sha256(
-            (
-                f"{self.rwkv_system_prompt or ''}\0"
-                f"{self.rwkv_system_prompt_pattern or ''}"
-            ).encode("utf-8")
-        ).hexdigest()
         return (
             f"{self.model}:{self._chat_template_sha256}:"
             f"{self.rwkv_prompt_template}:{self.rwkv_generation_prompt}:"
-            f"{self.rwkv_sampling_mode}:{system_prompt_sha256}:"
-            f"evidence={int(self.record_evidence)}"
+            f"{self.rwkv_sampling_mode}"
         )
 
     @cached_property
@@ -434,48 +297,13 @@ class RWKV7HTTP(LocalCompletionsAPI):
     ) -> str:
         from lm_eval.utils import env
 
-        use_system_prompt = bool(self.rwkv_system_prompt) and (
-            not self.rwkv_system_prompt_pattern
-            or any(
-                self.rwkv_system_prompt_pattern.casefold()
-                in str(message.get("content", "")).casefold()
-                for message in chat_history
-            )
-        )
-        if use_system_prompt:
-            chat_history = [dict(message) for message in chat_history]
-            if chat_history and chat_history[0]["role"] == "system":
-                chat_history[0]["content"] = (
-                    f"{chat_history[0]['content'].rstrip()}\n\n"
-                    f"{self.rwkv_system_prompt}"
-                )
-            else:
-                chat_history.insert(
-                    0,
-                    {"role": "system", "content": self.rwkv_system_prompt},
-                )
-        if (
-            not add_generation_prompt
-            and self.rwkv_generation_prompt == "fake_think"
-            and chat_history
-            and chat_history[-1]["role"] == "assistant"
-            and not chat_history[-1]["content"].startswith("<think></think>")
-        ):
-            chat_history = [*chat_history]
-            chat_history[-1] = {
-                **chat_history[-1],
-                "content": f"<think></think>\n{chat_history[-1]['content']}",
-            }
-        render_kwargs = {
-            "tools": kwargs.pop("tools", None),
-            "rwkv_prompt_template": self.rwkv_prompt_template,
-            "rwkv_generation_prompt": self.rwkv_generation_prompt,
-            **kwargs,
-        }
         rendered = env.from_string(self._chat_template_source).render(
             messages=chat_history,
             add_generation_prompt=add_generation_prompt,
-            **render_kwargs,
+            rwkv_prompt_template=self.rwkv_prompt_template,
+            rwkv_generation_prompt=self.rwkv_generation_prompt,
+            tools=kwargs.pop("tools", None),
+            **kwargs,
         )
         if (
             add_generation_prompt
@@ -485,86 +313,18 @@ class RWKV7HTTP(LocalCompletionsAPI):
             rendered += ">\n"
         return rendered
 
-    def _encode_pair(
-        self, context: str, continuation: str
-    ) -> Tuple[List[int], List[int]]:
-        if not context:
-            raise ValueError("context cannot be empty")
-        trailing_spaces = len(context) - len(context.rstrip())
-        if trailing_spaces:
-            continuation = context[-trailing_spaces:] + continuation
-            context = context[:-trailing_spaces]
-
-        context_tokens = self.tok_encode(context)
-        boundary_characters = min(1024, max(1, self.max_length // 4))
-        boundary_context = context[-boundary_characters:]
-        boundary_context_tokens = self.tok_encode(boundary_context)
-        boundary_whole_tokens = self.tok_encode(boundary_context + continuation)
-        common_length = 0
-        for context_token, whole_token in zip(
-            boundary_context_tokens, boundary_whole_tokens
-        ):
-            if context_token != whole_token:
-                break
-            common_length += 1
-        replaced_context_tokens = len(boundary_context_tokens) - common_length
-        if replaced_context_tokens > len(context_tokens):
-            raise ValueError("RWKV tokenizer boundary exceeds encoded context")
-        stable_context = (
-            context_tokens[:-replaced_context_tokens]
-            if replaced_context_tokens
-            else context_tokens
-        )
-        return stable_context, boundary_whole_tokens[common_length:]
-
-    def batch_loglikelihood_requests(
-        self, chunks
-    ) -> Tuple[List[List[int]], List[int], List[Tuple[str, str]]]:
-        inputs = []
-        context_lengths = []
-        cache_keys = []
-        for chunk in chunks:
-            for cache_key, context_tokens, continuation_tokens in chunk:
-                scoring_context = (
-                    context_tokens[1:]
-                    if context_tokens
-                    and context_tokens[0] == self.prefix_token_id
-                    else context_tokens
-                )
-                combined = scoring_context + continuation_tokens
-                available_tokens = self.max_length - 1
-                overflow = max(0, len(combined) - available_tokens)
-                truncated = combined[-available_tokens:] if overflow else combined
-                inputs.append([self.prefix_token_id] + truncated)
-                context_lengths.append(
-                    1 + max(0, len(scoring_context) - overflow)
-                )
-                cache_keys.append(cache_key)
-        return inputs, context_lengths, cache_keys
-
     @staticmethod
     def parse_generations(outputs: Union[Dict, List[Dict]], **kwargs) -> List[str]:
-        generations = []
         if not isinstance(outputs, list):
             outputs = [outputs]
+        generations = []
         for output in outputs:
             choices = [None] * len(output["choices"])
             for choice in output["choices"]:
-                text = choice.get("text", "")
-                reasoning = choice.get("reasoning_content")
-                if reasoning is None and "<think>" in text:
-                    _, remainder = text.split("<think>", 1)
-                    if "</think>" in remainder:
-                        reasoning, _ = remainder.split("</think>", 1)
-                choices[choice["index"]] = _CompletionGeneration(
-                    text,
+                choices[choice["index"]] = _RWKVCompletion(
+                    choice.get("text", ""),
                     choice.get("finish_reason"),
                     raw_response=output,
-                    prompt_token_ids=choice.get("prompt_token_ids")
-                    or output.get("prompt_token_ids"),
-                    output_token_ids=choice.get("token_ids")
-                    or choice.get("output_token_ids"),
-                    reasoning=reasoning,
                 )
             generations.extend(choices)
         return generations
@@ -576,21 +336,21 @@ class RWKV7HTTP(LocalCompletionsAPI):
         gen_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> dict:
-        gen_kwargs = dict(gen_kwargs or {})
-        do_sample = gen_kwargs.get("do_sample")
+        if not generate:
+            raise NotImplementedError(
+                "transformers serve does not expose echo prompt logprobs; "
+                "multiple_choice and other loglikelihood tasks are unsupported."
+            )
+        effective_kwargs = dict(gen_kwargs or {})
+        do_sample = effective_kwargs.get("do_sample")
         payload = super()._create_payload(
             messages,
-            generate=generate,
-            gen_kwargs=gen_kwargs,
+            generate=True,
+            gen_kwargs=effective_kwargs,
             **kwargs,
         )
-        payload.pop("seed", None)
-        if generate:
-            # vllm-rwkv exposes both prompt and completion IDs in the native
-            # OpenAI-compatible response when this flag is enabled. Keeping it
-            # on the request makes the producer's per-sample evidence complete.
-            if self.record_evidence:
-                payload["return_token_ids"] = True
+        profile = dict(self._generation_profile)
+        if self.rwkv_sampling_mode == "task":
             for name in (
                 "temperature",
                 "top_p",
@@ -599,22 +359,24 @@ class RWKV7HTTP(LocalCompletionsAPI):
                 "frequency_penalty",
                 "penalty_decay",
             ):
-                if do_sample is False or self.rwkv_sampling_mode == "profile":
-                    payload.pop(name, None)
-            if self.rwkv_sampling_mode == "profile":
-                payload.update(
-                    self.SAMPLING_PROFILES[self.rwkv_generation_prompt]
-                )
-            elif do_sample is False:
-                payload["temperature"] = 1
-                payload["top_k"] = 1
-            if not payload["stop"]:
-                payload["stop"] = [self.PROMPT_STOPS[self.rwkv_prompt_template]]
-        else:
-            if self.record_evidence:
-                payload["return_token_ids"] = True
-            payload["temperature"] = 1
-            payload["top_k"] = 1
+                if name in effective_kwargs:
+                    profile[name] = effective_kwargs[name]
+            if do_sample is not None:
+                profile["do_sample"] = bool(do_sample)
+        payload["temperature"] = profile.get("temperature", 1.0)
+        payload["generation_config"] = json.dumps(
+            profile, separators=(",", ":"), sort_keys=True
+        )
+        for name in (
+            "top_p",
+            "top_k",
+            "presence_penalty",
+            "frequency_penalty",
+            "penalty_decay",
+        ):
+            payload.pop(name, None)
+        if not payload["stop"]:
+            payload["stop"] = [self.PROMPT_STOPS[self.rwkv_prompt_template]]
         return payload
 
 
