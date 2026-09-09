@@ -17,5 +17,3 @@ metric_list:
   - metric: f1
 metadata:
   version: 1.0
-  benchmark_name: mc_taco
-  task_adapter: rwkv7-http

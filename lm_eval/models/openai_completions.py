@@ -2,10 +2,13 @@ import hashlib
 import json
 import logging
 import os
+import re
+from collections import defaultdict
 from functools import cached_property
 from operator import itemgetter
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
 from lm_eval.models.api_models import TemplateAPI
 from lm_eval.models.utils import handle_stop_sequences
@@ -170,7 +173,6 @@ class RWKV7HTTP(LocalCompletionsAPI):
     for generative tasks such as DROP.
     """
 
-    TASK_ADAPTER = "rwkv7-http"
     DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1/completions"
     PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
     PROMPT_STOPS = {
@@ -179,7 +181,6 @@ class RWKV7HTTP(LocalCompletionsAPI):
         "function_calling": "\n### User",
     }
     GENERATION_PROMPTS = {"open_think", "fake_think"}
-    SAMPLING_MODES = {"profile", "task"}
     PROFILE_FILES = {
         "open_think": "generation_config.json",
         "fake_think": "fake_think_generation_config.json",
@@ -200,7 +201,6 @@ class RWKV7HTTP(LocalCompletionsAPI):
         max_length=16384,
         rwkv_prompt_template="assistant",
         rwkv_generation_prompt="fake_think",
-        rwkv_sampling_mode="profile",
         cot_mode=None,
         record_evidence=False,
         **kwargs,
@@ -226,12 +226,9 @@ class RWKV7HTTP(LocalCompletionsAPI):
             raise ValueError("rwkv_prompt_template must be assistant, bot, or function_calling.")
         if rwkv_generation_prompt not in self.GENERATION_PROMPTS:
             raise ValueError("rwkv_generation_prompt must be open_think or fake_think.")
-        if rwkv_sampling_mode not in self.SAMPLING_MODES:
-            raise ValueError("rwkv_sampling_mode must be profile or task.")
 
         self.rwkv_prompt_template = rwkv_prompt_template
         self.rwkv_generation_prompt = rwkv_generation_prompt
-        self.rwkv_sampling_mode = rwkv_sampling_mode
         self.record_evidence = False
         tokenizer = tokenizer or model
         super().__init__(
@@ -270,8 +267,7 @@ class RWKV7HTTP(LocalCompletionsAPI):
     def tokenizer_name(self) -> str:
         return (
             f"{self.model}:{self._chat_template_sha256}:"
-            f"{self.rwkv_prompt_template}:{self.rwkv_generation_prompt}:"
-            f"{self.rwkv_sampling_mode}"
+            f"{self.rwkv_prompt_template}:{self.rwkv_generation_prompt}"
         )
 
     @cached_property
@@ -339,10 +335,10 @@ class RWKV7HTTP(LocalCompletionsAPI):
         if not generate:
             raise NotImplementedError(
                 "transformers serve does not expose echo prompt logprobs; "
-                "multiple_choice and other loglikelihood tasks are unsupported."
+                "loglikelihood requests must go through RWKV7HTTP.loglikelihood's "
+                "generative conversion instead of _create_payload(generate=False)."
             )
         effective_kwargs = dict(gen_kwargs or {})
-        do_sample = effective_kwargs.get("do_sample")
         payload = super()._create_payload(
             messages,
             generate=True,
@@ -350,19 +346,6 @@ class RWKV7HTTP(LocalCompletionsAPI):
             **kwargs,
         )
         profile = dict(self._generation_profile)
-        if self.rwkv_sampling_mode == "task":
-            for name in (
-                "temperature",
-                "top_p",
-                "top_k",
-                "presence_penalty",
-                "frequency_penalty",
-                "penalty_decay",
-            ):
-                if name in effective_kwargs:
-                    profile[name] = effective_kwargs[name]
-            if do_sample is not None:
-                profile["do_sample"] = bool(do_sample)
         payload["temperature"] = profile.get("temperature", 1.0)
         payload["generation_config"] = json.dumps(
             profile, separators=(",", ":"), sort_keys=True
@@ -378,6 +361,104 @@ class RWKV7HTTP(LocalCompletionsAPI):
         if not payload["stop"]:
             payload["stop"] = [self.PROMPT_STOPS[self.rwkv_prompt_template]]
         return payload
+
+    _CHOICE_BOXED_RE = re.compile(r"\\boxed\{\s*\(?([A-Za-z])\)?\s*\}")
+    _CHOICE_EXPLICIT_RE = re.compile(
+        r"(?:answer|answer is|the answer is|answer:)\s*[:\-]?\s*\(?([A-Za-z])\)?",
+        re.IGNORECASE,
+    )
+    _CHOICE_BARE_RE = re.compile(r"\(?([A-Za-z])\)?[.\s]*$")
+
+    def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
+        """Emulate multiple_choice loglikelihood scoring through generation.
+
+        ``transformers serve`` exposes no echo/prompt logprobs, so this is the
+        only way RWKV7HTTP can support ``output_type: multiple_choice`` tasks
+        at all. Mirrors lighteval-rwkv's runtime loglikelihood->generation
+        conversion: ask the model to name a lettered choice once per doc, then
+        encode the parsed answer back into (loglik, is_greedy) pairs so the
+        harness's existing argmax-based acc/acc_norm scoring is unaffected.
+        """
+        results: List[Optional[Tuple[float, bool]]] = [None] * len(requests)
+        groups: Dict[Any, List[int]] = defaultdict(list)
+        for position, request in enumerate(requests):
+            groups[request.doc_id].append(position)
+
+        for positions in groups.values():
+            positions = sorted(positions, key=lambda p: requests[p].idx)
+            group = [requests[p] for p in positions]
+            contexts = {req.args[0] for req in group}
+            if "" in contexts and len(contexts) > 1:
+                eval_logger.warning(
+                    "RWKV7HTTP does not support the unconditional likelihood "
+                    "acc_mutual_info needs; acc_mutual_info results for this "
+                    "task are not meaningful."
+                )
+                kept_positions, kept_group = [], []
+                for position, request in zip(positions, group):
+                    if request.args[0] == "":
+                        results[position] = (0.0, False)
+                    else:
+                        kept_positions.append(position)
+                        kept_group.append(request)
+                positions, group = kept_positions, kept_group
+                if not group:
+                    continue
+
+            context = group[0].args[0]
+            choices = [request.args[1].strip() for request in group]
+            chosen_index = self._resolve_choice(context, choices)
+            for offset, position in enumerate(positions):
+                results[position] = (0.0, True) if offset == chosen_index else (-1e6, False)
+
+        return results
+
+    def _resolve_choice(self, context: str, choices: List[str]) -> int:
+        letters = [chr(ord("A") + i) for i in range(len(choices))]
+        options = "\n".join(
+            f"{letter}. {choice}" for letter, choice in zip(letters, choices)
+        )
+        prompt = (
+            f"{context}\n\n{options}\n\n"
+            "Answer with only the letter of the correct option."
+        )
+        gen_kwargs = {"until": [], "max_gen_toks": self._max_gen_toks}
+        instance = Instance(
+            request_type="generate_until",
+            doc={},
+            arguments=(prompt, gen_kwargs),
+            idx=0,
+        )
+        generated = self.generate_until([instance])[0]
+        return self._parse_choice_index(str(generated), letters, choices)
+
+    def _parse_choice_index(
+        self, generated: str, letters: List[str], choices: List[str]
+    ) -> int:
+        text = generated.strip()
+        for pattern in (
+            self._CHOICE_BOXED_RE,
+            self._CHOICE_EXPLICIT_RE,
+            self._CHOICE_BARE_RE,
+        ):
+            match = pattern.search(text)
+            if match:
+                letter = match.group(1).upper()
+                if letter in letters:
+                    return letters.index(letter)
+
+        lowered = text.lower()
+        best_index, best_len = 0, -1
+        for index, choice in enumerate(choices):
+            choice_lower = choice.lower()
+            if choice_lower and choice_lower in lowered and len(choice_lower) > best_len:
+                best_index, best_len = index, len(choice_lower)
+        if best_len < 0:
+            eval_logger.warning(
+                "RWKV7HTTP could not parse a choice letter from the generated "
+                f"answer {text!r}; defaulting to option {letters[0]!r}."
+            )
+        return best_index
 
 
 @register_model("local-chat-completions")

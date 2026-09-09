@@ -1,16 +1,14 @@
 import asyncio
+import hashlib
 import json
 import pickle
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from lm_eval.api.instance import Instance
 from lm_eval.models.api_models import create_image_prompt
-from lm_eval.models.openai_completions import (
-    RWKV7HTTP,
-    LocalCompletionsAPI,
-    _VLLMRWKVTokenizer,
-)
+from lm_eval.models.openai_completions import RWKV7HTTP, LocalCompletionsAPI
 
 
 @pytest.fixture
@@ -96,235 +94,244 @@ def test_local_completions_preserves_finish_reason(api):
     assert restored[1].finish_reason == "length"
 
 
-def test_rwkv7_http_template_and_sampling_profiles(monkeypatch):
-    class FakeRemoteTokenizer:
+def _build_rwkv7_http(monkeypatch, profile=None, chat_template_source="{{ messages }}", **kwargs):
+    profile = profile or {
+        "temperature": 0.9,
+        "top_p": 0.8,
+        "top_k": 40,
+        "presence_penalty": 0.5,
+        "frequency_penalty": 0.2,
+        "penalty_decay": 0.99,
+    }
+
+    class FakeTokenizer:
+        pad_token_id = 0
         eos_token = "<eos>"
-        bos_token = "<bos>"
         eos_token_id = 0
         bos_token_id = 1
-        tokenizer_info = {
-            "chat_template": (
-                "{{ rwkv_prompt_template }}|{{ rwkv_generation_prompt }}|"
-                "{{ messages[0]['content'] }}|{{ add_generation_prompt }}"
-            )
-        }
+        chat_template = chat_template_source
 
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def encode(self, text):
-            return [1]
-
-        def batch_decode(self, tokens):
-            return ["" for _ in tokens]
+    class FakeGenerationConfig:
+        def to_dict(self):
+            return dict(profile)
 
     monkeypatch.setattr(
-        "lm_eval.models.openai_completions._VLLMRWKVTokenizer",
-        FakeRemoteTokenizer,
+        "transformers.AutoTokenizer.from_pretrained",
+        lambda *args, **kw: FakeTokenizer(),
     )
-    served_model = "rwkv7-g1h-7.2b-20260710-ctx10240"
-    model = RWKV7HTTP(
-        model=served_model,
-        base_url="http://test-url.com/v1/completions",
-        num_concurrent=1,
+    monkeypatch.setattr(
+        "transformers.GenerationConfig.from_pretrained",
+        lambda *args, **kw: FakeGenerationConfig(),
+    )
+    kwargs.setdefault("model", "rwkv7-g1h-test")
+    kwargs.setdefault("base_url", "http://test-url.com/v1/completions")
+    kwargs.setdefault("num_concurrent", 1)
+    return RWKV7HTTP(**kwargs), profile
+
+
+def _mc_instance(doc_id, idx, context, continuation):
+    return Instance(
+        request_type="loglikelihood",
+        doc={},
+        arguments=(context, continuation),
+        idx=idx,
+        metadata=("task", doc_id, 1),
     )
 
-    assert model.model == served_model
-    assert model.tokenizer_name.startswith(f"{served_model}:")
 
-    assert model.apply_chat_template(
-        [{"role": "user", "content": "hello"}]
-    ) == "assistant|open_think|hello|True"
-    model.rwkv_system_prompt = "Copy identifiers exactly."
-    model._chat_template_source = (
-        "{{ messages[0]['role'] }}|{{ messages[0]['content'] }}|"
-        "{{ messages[1]['content'] if messages|length > 1 else '' }}"
-    )
-    assert model.apply_chat_template(
-        [{"role": "user", "content": "hello"}]
-    ) == "system|Copy identifiers exactly.|hello"
-    model.rwkv_system_prompt_pattern = "special magic"
-    assert model.apply_chat_template(
-        [{"role": "user", "content": "hello"}]
-    ) == "user|hello|"
-    assert model.apply_chat_template(
-        [{"role": "user", "content": "Find the special magic key"}]
-    ) == "system|Copy identifiers exactly.|Find the special magic key"
-    model.rwkv_system_prompt = None
-    model.rwkv_system_prompt_pattern = None
-    model._chat_template_source = (
+def test_rwkv7_http_construction_defaults(monkeypatch):
+    model, profile = _build_rwkv7_http(monkeypatch)
+
+    assert model.model == "rwkv7-g1h-test"
+    assert model.rwkv_prompt_template == "assistant"
+    assert model.rwkv_generation_prompt == "fake_think"
+    assert model._batch_size == 1
+    assert model.tokenized_requests is False
+    assert model._generation_profile == profile
+
+    expected_sha = hashlib.sha256("{{ messages }}".encode("utf-8")).hexdigest()
+    assert model.tokenizer_name == f"rwkv7-g1h-test:{expected_sha}:assistant:fake_think"
+
+
+def test_rwkv7_http_rejects_tokenized_requests(monkeypatch):
+    with pytest.raises(ValueError, match="tokenized_requests=False"):
+        RWKV7HTTP(model="rwkv7-g1h-test", tokenized_requests=True)
+
+
+def test_rwkv7_http_apply_chat_template(monkeypatch):
+    template = (
         "{{ rwkv_prompt_template }}|{{ rwkv_generation_prompt }}|"
         "{{ messages[0]['content'] }}|{{ add_generation_prompt }}"
     )
-    assert model._create_payload(
-        ["prompt"], generate=True, gen_kwargs={"max_gen_toks": 4, "temperature": 0.1}
-    ) == {
-        "prompt": ["prompt"],
-        "model": served_model,
-        "max_tokens": 4,
-        "temperature": 0.96,
-        "stop": ["\nUser:"],
-        "top_p": 0.76,
-        "top_k": 32,
-        "presence_penalty": 1.0,
-        "frequency_penalty": 0.1,
-        "penalty_decay": 0.988,
-    }
+    model, _ = _build_rwkv7_http(monkeypatch, chat_template_source=template)
 
-    model.rwkv_generation_prompt = "fake_think"
-    model._chat_template_source = (
-        "{{ '<think></think' if rwkv_generation_prompt == 'fake_think' "
-        "else '<think' }}"
+    assert (
+        model.apply_chat_template([{"role": "user", "content": "hello"}])
+        == "assistant|fake_think|hello|True"
     )
-    assert model.apply_chat_template(
-        [{"role": "user", "content": "hello"}]
-    ) == "<think></think>\n"
-    model._chat_template_source = (
-        "{{ messages[-1]['content'] }}|{{ add_generation_prompt }}"
-    )
-    assert model.apply_chat_template(
-        [{"role": "assistant", "content": "Answer:"}],
-        add_generation_prompt=False,
-    ) == "<think></think>\nAnswer:|False"
-    fake_payload = model._create_payload(
-        ["prompt"], generate=True, gen_kwargs={"max_gen_toks": 4}
-    )
-    assert {
-        key: fake_payload[key]
-        for key in ("temperature", "top_p", "top_k")
-    } == {"temperature": 1.0, "top_p": 0.28, "top_k": 32}
 
-    greedy_payload = model._create_payload(
+
+def test_rwkv7_http_apply_chat_template_appends_fake_think_close(monkeypatch):
+    model, _ = _build_rwkv7_http(monkeypatch, chat_template_source="{{ '<think></think' }}")
+
+    assert (
+        model.apply_chat_template([{"role": "user", "content": "hello"}])
+        == "<think></think>\n"
+    )
+    assert (
+        model.apply_chat_template(
+            [{"role": "assistant", "content": "hi"}], add_generation_prompt=False
+        )
+        == "<think></think"
+    )
+
+
+def test_rwkv7_http_create_payload_generate(monkeypatch):
+    model, profile = _build_rwkv7_http(monkeypatch)
+
+    payload = model._create_payload(
         ["prompt"],
         generate=True,
-        gen_kwargs={
-            "max_gen_toks": 4,
-            "do_sample": False,
-            "temperature": 0.0,
-        },
+        gen_kwargs={"max_gen_toks": 4, "temperature": 0.1, "top_p": 0.99},
     )
-    assert greedy_payload["temperature"] == 1.0
-    assert greedy_payload["top_p"] == 0.28
-    assert greedy_payload["top_k"] == 32
 
-    model.rwkv_sampling_mode = "task"
-    task_payload = model._create_payload(
-        ["prompt"],
-        generate=True,
-        gen_kwargs={
-            "max_gen_toks": 4,
-            "do_sample": True,
-            "temperature": 0.2,
-            "top_p": 0.95,
-        },
+    assert payload["prompt"] == ["prompt"]
+    assert payload["model"] == model.model
+    assert payload["max_tokens"] == 4
+    assert payload["temperature"] == profile["temperature"]
+    assert payload["stop"] == ["\nUser:"]
+    assert payload["generation_config"] == json.dumps(
+        profile, separators=(",", ":"), sort_keys=True
     )
-    assert task_payload["temperature"] == 0.2
-    assert task_payload["top_p"] == 0.95
-    assert "top_k" not in task_payload
+    for key in ("top_p", "top_k", "presence_penalty", "frequency_penalty", "penalty_decay"):
+        assert key not in payload
 
-    logprobs_payload = model._create_payload(
-        [[1, 2]], generate=False, gen_kwargs=None
+
+def test_rwkv7_http_create_payload_generate_preserves_custom_stop(monkeypatch):
+    model, _ = _build_rwkv7_http(monkeypatch)
+
+    payload = model._create_payload(
+        ["prompt"], generate=True, gen_kwargs={"max_gen_toks": 4, "until": ["STOP"]}
     )
-    assert logprobs_payload["temperature"] == 1
-    assert logprobs_payload["top_k"] == 1
-    assert logprobs_payload["echo"] is True
-    assert model.prefix_token_id == 0
-    assert model.tokenized_requests is True
+
+    assert payload["stop"] == ["STOP"]
+
+
+def test_rwkv7_http_create_payload_loglikelihood_not_implemented(monkeypatch):
+    model, _ = _build_rwkv7_http(monkeypatch)
+
+    with pytest.raises(NotImplementedError):
+        model._create_payload(["prompt"], generate=False, gen_kwargs=None)
+
+
+def test_rwkv7_http_parse_generations(monkeypatch):
+    model, _ = _build_rwkv7_http(monkeypatch)
 
     generations = model.parse_generations(
-        {
-            "choices": [
-                {"index": 0, "text": "answer", "finish_reason": "length"}
-            ]
-        }
+        {"choices": [{"index": 0, "text": "answer", "finish_reason": "length"}]}
     )
+
     assert generations == ["answer"]
     assert generations[0].finish_reason == "length"
+    assert model.prefix_token_id == 0
 
 
-def test_vllm_rwkv_tokenizer_uses_native_routes_and_strips_bos(monkeypatch):
-    responses = []
+def test_rwkv7_http_loglikelihood_groups_by_doc_and_scores_argmax(monkeypatch):
+    model, _ = _build_rwkv7_http(monkeypatch)
 
-    def request(method, url, **kwargs):
-        response = MagicMock()
-        if url.endswith("/tokenizer_info"):
-            response.json.return_value = {
-                "tokenizer_class": "RWKVTokenizer",
-                "chat_template": "{{ messages }}",
-            }
-        elif url.endswith("/tokenize"):
-            response.json.return_value = {"tokens": [0, 10, 11]}
+    doc0 = ["Paris", "London", "Berlin"]
+    doc1 = ["Cat", "Dog", "Fish"]
+    requests = [
+        _mc_instance(1, 2, "Context for doc1", doc1[2]),
+        _mc_instance(0, 0, "Context for doc0", doc0[0]),
+        _mc_instance(1, 0, "Context for doc1", doc1[0]),
+        _mc_instance(0, 2, "Context for doc0", doc0[2]),
+        _mc_instance(1, 1, "Context for doc1", doc1[1]),
+        _mc_instance(0, 1, "Context for doc0", doc0[1]),
+    ]
+
+    def fake_generate_until(instances):
+        prompt = instances[0].args[0]
+        return ["The answer is B."] if "doc0" in prompt else ["\\boxed{A}"]
+
+    monkeypatch.setattr(model, "generate_until", fake_generate_until)
+
+    results = model.loglikelihood(requests)
+
+    assert len(results) == len(requests)
+    expected_true = {5, 2}
+    for position, result in enumerate(results):
+        if position in expected_true:
+            assert result == (0.0, True)
         else:
-            response.json.return_value = {"prompt": "decoded"}
-        responses.append((method, url, kwargs.get("json")))
-        return response
-
-    session = MagicMock()
-    session.request.side_effect = request
-    monkeypatch.setattr("lm_eval.utils.requests.Session", lambda: session)
-    tokenizer = _VLLMRWKVTokenizer(
-        "http://test-url.com/v1/completions",
-        RWKV7HTTP.DEFAULT_MODEL,
-    )
-
-    assert tokenizer.encode("hello") == [10, 11]
-    assert tokenizer.decode([0, 10, 11]) == "decoded"
-    assert responses[-2][1:] == (
-        "http://test-url.com/tokenize",
-        {
-            "model": RWKV7HTTP.DEFAULT_MODEL,
-            "prompt": "hello",
-            "add_special_tokens": False,
-        },
-    )
-    assert responses[-1][1:] == (
-        "http://test-url.com/detokenize",
-        {"model": RWKV7HTTP.DEFAULT_MODEL, "tokens": [0, 10, 11]},
-    )
+            assert result == (-1e6, False)
 
 
-def test_rwkv7_http_likelihood_request_adds_one_bos(monkeypatch):
-    class BoundaryTokenizer:
-        tokenizer_info = {"chat_template": "{{ messages }}"}
+@pytest.mark.parametrize(
+    "generated, expected_index",
+    [
+        ("I think the answer is B, based on the clues.", 1),
+        ("Therefore \\boxed{C} is correct.", 2),
+        ("My final choice is (B)", 1),
+        ("The correct one is C.", 2),
+    ],
+)
+def test_rwkv7_http_parse_choice_index_regex_tiers(monkeypatch, generated, expected_index):
+    model, _ = _build_rwkv7_http(monkeypatch)
+    letters = ["A", "B", "C"]
+    choices = ["Paris", "London", "Berlin"]
 
-        def __init__(self, *args, **kwargs):
-            pass
+    assert model._parse_choice_index(generated, letters, choices) == expected_index
 
-        def encode(self, text):
-            return {
-                "hello": [10],
-                "hello world": [12, 13],
-            }[text]
 
-        def batch_decode(self, tokens):
-            return ["" for _ in tokens]
+def test_rwkv7_http_parse_choice_index_substring_fallback(monkeypatch):
+    model, _ = _build_rwkv7_http(monkeypatch)
+    letters = ["A", "B", "C"]
+    choices = ["Paris", "London", "Berlin"]
+    generated = "The city famed for the Eiffel Tower is Paris, and it fits nicely."
 
+    assert model._parse_choice_index(generated, letters, choices) == 0
+
+
+def test_rwkv7_http_parse_choice_index_default_and_warns(monkeypatch):
+    model, _ = _build_rwkv7_http(monkeypatch)
+    warning_mock = MagicMock()
     monkeypatch.setattr(
-        "lm_eval.models.openai_completions._VLLMRWKVTokenizer",
-        BoundaryTokenizer,
+        "lm_eval.models.openai_completions.eval_logger.warning", warning_mock
     )
-    with pytest.raises(ValueError, match="complete served model name"):
-        RWKV7HTTP(num_concurrent=1)
+    letters = ["A", "B", "C"]
+    choices = ["Paris", "London", "Berlin"]
+    generated = "I have no idea what to say here."
 
-    model = RWKV7HTTP(
-        model=RWKV7HTTP.DEFAULT_MODEL,
-        num_concurrent=1,
-    )
-    context, continuation = model._encode_pair("hello", " world")
-    inputs, context_lengths, _ = model.batch_loglikelihood_requests(
-        [[(("hello", " world"), context, continuation)]]
+    assert model._parse_choice_index(generated, letters, choices) == 0
+    warning_mock.assert_called_once()
+
+
+def test_rwkv7_http_loglikelihood_skips_unconditional_context(monkeypatch):
+    model, _ = _build_rwkv7_http(monkeypatch)
+    warning_mock = MagicMock()
+    monkeypatch.setattr(
+        "lm_eval.models.openai_completions.eval_logger.warning", warning_mock
     )
 
-    assert context == []
-    assert continuation == [12, 13]
-    assert inputs == [[0, 12, 13]]
-    assert context_lengths == [1]
+    requests = [
+        _mc_instance(0, 0, "", "unconditional"),
+        _mc_instance(0, 1, "Real context", "Paris"),
+        _mc_instance(0, 2, "Real context", "London"),
+        _mc_instance(0, 3, "Real context", "Berlin"),
+    ]
 
-    empty_inputs, empty_context_lengths, _ = model.batch_loglikelihood_requests(
-        [[(("", "hello"), [0], [10])]]
-    )
-    assert empty_inputs == [[0, 10]]
-    assert empty_context_lengths == [1]
+    generate_until_mock = MagicMock(return_value=["The answer is A."])
+    monkeypatch.setattr(model, "generate_until", generate_until_mock)
+
+    results = model.loglikelihood(requests)
+
+    assert results[0] == (0.0, False)
+    assert results[1] == (0.0, True)
+    assert results[2] == (-1e6, False)
+    assert results[3] == (-1e6, False)
+    generate_until_mock.assert_called_once()
+    warning_mock.assert_called_once()
 
 
 @pytest.mark.parametrize(

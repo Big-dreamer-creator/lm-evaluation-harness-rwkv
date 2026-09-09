@@ -9,5 +9,3 @@ aggregate_metric_list:
     weight_by_size: True
 metadata:
   version: 1
-  benchmark_name: wmdp
-  task_adapter: rwkv7-http

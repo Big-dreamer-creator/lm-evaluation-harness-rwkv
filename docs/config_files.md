@@ -90,7 +90,6 @@ arguments. Unknown fields fail before model or dataset initialization.
 | `rwkv_profile` | table | required | Complete RWKV execution profile |
 | `rwkv_profile.prompt_template` | string | required | Official RWKV template mode |
 | `rwkv_profile.generation_prompt` | string | required | `fake_think` or `open_think` |
-| `rwkv_profile.sampling_mode` | string | required | RWKV profile or task-native sampling |
 | `rwkv_profile.wkv_mode` | string | required | Recorded server WKV mode |
 | `apply_chat_template` | bool | `true` | Render the service's official template |
 | `fewshot_as_multiturn` | bool | chat setting | Render few-shot examples as turns |
@@ -164,13 +163,15 @@ Included paths are relative to the including file. Nested tables are merged, and
 The array order is the run order; do not hide a campaign sequence in a
 model-specific group YAML. Benchmark prompt construction (`doc_to_text`), answer
 extraction and filters, metrics, stop conditions (`until`), and `max_gen_toks`
-belong in each task YAML and are rejected by the versioned global schema. For
-RWKV, task YAML additionally declares `metadata.task_adapter` and
-`metadata.benchmark_name`; the generic task manager uses those declarations to
-resolve each public name to one or more adapted tasks. The `rwkv_profile` table selects
-only the official model template and RWKV sampling profile. The Python CLI
-runner only loads this configuration, selects the model adapter, and executes
-lm-eval; it contains no benchmark-specific strategy.
+belong in each task YAML and are rejected by the versioned global schema. Each
+`benchmarks` entry is a native lm-eval-harness task, group, or tag name,
+resolved directly by `TaskManager` — there is no RWKV-specific adapter or
+renaming layer. The `rwkv_profile` table selects only the official model
+template and RWKV generation profile; sampling parameters (temperature,
+top_p/top_k, penalties) always come from that profile and cannot be
+overridden by task YAML. The Python CLI runner only loads this configuration,
+selects the model adapter, and executes lm-eval; it contains no
+benchmark-specific strategy.
 
 ---
 

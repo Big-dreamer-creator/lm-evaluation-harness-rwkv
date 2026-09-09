@@ -157,14 +157,13 @@ seed = [0, 1234, 1234, 1234]
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 ```
 
 加载器会把这些字段转换为 lm-eval 的 `model`、`tasks`、`model_args`、
 `output_path` 和 `metadata`。`benchmarks` 数组只写普通 benchmark 名称，
-数组顺序就是运行顺序；当模型是 `rwkv7-http` 时，任务管理器会根据 RWKV
-适配 task YAML 的声明自动解析到对应的内部 task。`model_name`、
+数组顺序就是运行顺序；这些名称本身就是原生 lm-eval-harness 的 task/group/tag
+名称，由 `TaskManager` 直接解析，不存在额外的适配层。`model_name`、
 `rwkv_profile.generation_prompt`、`rwkv_profile.prompt_template` 同时生成执行参数
 和结果元数据，避免重复字段分叉；`rwkv_profile.wkv_mode` 只记录服务端模式，
 仍需与 vllm-rwkv 启动日志核对。
@@ -188,10 +187,9 @@ wkv_mode = "fp32io16"
   presence_penalty 1.0、frequency_penalty 0.1、penalty_decay 0.988。
 - `fake_think`：temperature 1.0、top_p 0.28、top_k 32。
 
-`rwkv_profile.sampling_mode = "profile"` 使用上述 RWKV 官方解码参数；
-`rwkv_profile.sampling_mode = "task"` 保留 task YAML 的 temperature、top_p 等设置。
-只有在 benchmark 协议明确要求自己的生成参数时才使用 `task`。判分、过滤器、
-stop 条件和 `max_gen_toks` 仍归 task YAML 所有。具体边界如下：
+采样参数（temperature、top_p、top_k、penalties）固定使用上述 RWKV 官方解码
+参数，不可被 task YAML 覆盖。判分、过滤器、stop 条件和 `max_gen_toks` 仍归
+task YAML 所有。具体边界如下：
 
 - 总 TOML：模型版本、普通 benchmark 清单及顺序、RWKV profile 和运行资源参数。
 - task YAML：prompt、答案抽取/过滤、metric、stop 和 `max_gen_toks`。
@@ -260,8 +258,8 @@ Linux 本地文件系统；WSL 下将 SQLite 缓存放在 `/mnt/c` 或 `/mnt/e` 
 - 模型 ID 不匹配：让 TOML 的 `model_name` 与 `--served-model-name` 完全一致。
 - 请求超过上下文：让服务端 `--max-model-len` 与评估端 `max_length` 匹配，
   并检查 benchmark 的输入与输出 token 上限。
-- 采样参数不生效：检查 `rwkv_profile.sampling_mode` 是 `profile` 还是
-  `task`。
+- 采样参数不生效：采样参数固定来自 `rwkv_profile`，检查
+  `generation_prompt` 是否为期望的 `open_think`/`fake_think`。
 - GPU 空载但评估未结束：检查 SQLite/Hugging Face 缓存是否位于 Windows 挂载盘，
   以及数据集是否在离线模式下反复查询网络元数据。
 

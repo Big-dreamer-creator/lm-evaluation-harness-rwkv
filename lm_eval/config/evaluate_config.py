@@ -73,12 +73,10 @@ VERSIONED_REQUIRED_FIELDS = {
 RWKV_PROFILE_FIELDS = {
     "generation_prompt",
     "prompt_template",
-    "sampling_mode",
     "wkv_mode",
 }
 RWKV_PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
 RWKV_GENERATION_PROMPTS = {"fake_think", "open_think"}
-RWKV_SAMPLING_MODES = {"profile", "task"}
 RWKV_WKV_MODES = {"fp16", "fp32io16"}
 
 
@@ -431,14 +429,6 @@ class EvaluatorConfig:
                 "rwkv_profile.generation_prompt must be one of: "
                 + ", ".join(sorted(RWKV_GENERATION_PROMPTS))
             )
-        sampling_mode = cls._non_empty_string(
-            profile["sampling_mode"], "rwkv_profile.sampling_mode"
-        )
-        if sampling_mode not in RWKV_SAMPLING_MODES:
-            raise ValueError(
-                "rwkv_profile.sampling_mode must be one of: "
-                + ", ".join(sorted(RWKV_SAMPLING_MODES))
-            )
         wkv_mode = cls._non_empty_string(profile["wkv_mode"], "rwkv_profile.wkv_mode")
         if wkv_mode not in RWKV_WKV_MODES:
             raise ValueError(
@@ -496,7 +486,6 @@ class EvaluatorConfig:
                 "base_url": base_url,
                 "rwkv_prompt_template": prompt_template,
                 "rwkv_generation_prompt": generation_prompt,
-                "rwkv_sampling_mode": sampling_mode,
                 "num_concurrent": num_concurrent,
                 "max_length": max_length,
             },
@@ -749,14 +738,6 @@ class EvaluatorConfig:
                 task_names.append(config)
             self.tasks = task_names
             return task_manager
-
-        import lm_eval.models  # noqa: F401
-        from lm_eval.api.registry import get_model
-
-        model_cls = get_model(self.model)
-        task_adapter = getattr(model_cls, "TASK_ADAPTER", None)
-        if task_adapter is not None:
-            task_list = task_manager.resolve_adapter_tasks(task_list, task_adapter)
 
         # Normalize paths and deduplicate
         task_list = [

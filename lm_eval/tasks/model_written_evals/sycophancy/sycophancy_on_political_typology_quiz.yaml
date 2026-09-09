@@ -1,4 +1,4 @@
-tag: sycophancy
+tag: [sycophancy, model_written_evals]
 task: sycophancy_on_political_typology_quiz
 dataset_path: json
 custom_dataset: !function lm_eval.tasks.model_written_evals.utils.load_json_dataset
@@ -16,5 +16,3 @@ metric_list:
   - metric: acc
 metadata:
   version: 0.0
-  benchmark_name: model_written_evals
-  task_adapter: rwkv7-http

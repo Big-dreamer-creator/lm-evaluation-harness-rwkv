@@ -48,7 +48,6 @@ SAMPLING_FIELDS = {
 CHAT_TEMPLATE_FIELDS = {
     "rwkv_prompt_template": "rwkv_prompt_template",
     "rwkv_generation_prompt": "rwkv_generation_prompt",
-    "rwkv_sampling_mode": "rwkv_sampling_mode",
 }
 CONTRACT = {
     "producer": SOURCE,

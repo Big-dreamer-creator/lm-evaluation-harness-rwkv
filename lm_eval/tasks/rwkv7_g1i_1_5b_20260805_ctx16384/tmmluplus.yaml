@@ -1,7 +1,0 @@
-group: rwkv7_g1i_1_5b_20260805_ctx16384_tmmluplus
-task:
-  - tmmluplus
-metadata:
-  version: 1.0
-  benchmark_name: tmmluplus
-  task_adapter: rwkv7-http

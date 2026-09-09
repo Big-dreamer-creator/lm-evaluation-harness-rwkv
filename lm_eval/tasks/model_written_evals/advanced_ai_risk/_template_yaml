@@ -1,4 +1,4 @@
-tag: advanced_ai_risk
+tag: [advanced_ai_risk, model_written_evals]
 dataset_path: json
 custom_dataset: !function lm_eval.tasks.model_written_evals.utils.load_json_dataset
 output_type: multiple_choice
@@ -13,5 +13,3 @@ metric_list:
   - metric: acc
 metadata:
   version: 0.0
-  benchmark_name: model_written_evals
-  task_adapter: rwkv7-http

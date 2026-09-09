@@ -1,5 +1,6 @@
 tag:
   - inverse_scaling_mc
+  - inverse_scaling_prize
 output_type: multiple_choice
 test_split: train
 doc_to_text: prompt
@@ -15,5 +16,3 @@ metric_list:
     higher_is_better: true
 metadata:
   version: 0
-  benchmark_name: inverse_scaling_prize
-  task_adapter: rwkv7-http

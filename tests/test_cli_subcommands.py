@@ -953,7 +953,6 @@ max_length = 16384
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 """,
             encoding="utf-8",
@@ -983,7 +982,6 @@ generation_prompt = "open_think"
             "base_url": "http://127.0.0.1:8000/v1/completions",
             "rwkv_prompt_template": "assistant",
             "rwkv_generation_prompt": "open_think",
-            "rwkv_sampling_mode": "profile",
             "num_concurrent": 5,
             "max_length": 16384,
         }
@@ -1019,7 +1017,6 @@ model_args = "deprecated"
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 """,
             encoding="utf-8",
@@ -1045,7 +1042,6 @@ max_length = 16384
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 """,
             encoding="utf-8",
@@ -1071,7 +1067,6 @@ max_length = 16384
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 
 [samples]
@@ -1103,7 +1098,6 @@ include_path = ["lm_eval/tasks/graphwalks", "lm_eval/tasks/rwkv_adapter"]
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 """,
             encoding="utf-8",
@@ -1135,7 +1129,6 @@ max_length = 16384
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 
 [samples]
@@ -1153,11 +1146,6 @@ rwkv_graphwalks = {indices}
         class OrderedTaskManager:
             def __init__(self, **_kwargs):
                 pass
-
-            @staticmethod
-            def resolve_adapter_tasks(tasks, adapter):
-                assert adapter == "rwkv7-http"
-                return [f"adapted::{task}" for task in tasks]
 
             @staticmethod
             def match_tasks(tasks):
@@ -1179,7 +1167,6 @@ max_length = 16384
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 """,
             encoding="utf-8",
@@ -1188,7 +1175,7 @@ wkv_mode = "fp32io16"
         loaded = EvaluatorConfig.from_config(config)
         loaded.process_tasks()
 
-        assert loaded.tasks == ["adapted::race", "adapted::drop", "adapted::xquad"]
+        assert loaded.tasks == ["race", "drop", "xquad"]
 
     @pytest.mark.parametrize(
         "field",
@@ -1212,7 +1199,6 @@ max_length = 16384
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 """,
             encoding="utf-8",
@@ -1240,7 +1226,6 @@ max_length = 16384
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 metric = "exact_match"
 """,
@@ -1267,7 +1252,6 @@ max_length = 16384
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 
 [publication]
@@ -1326,7 +1310,6 @@ log_samples = false
 [rwkv_profile]
 prompt_template = "assistant"
 generation_prompt = "fake_think"
-sampling_mode = "profile"
 wkv_mode = "fp32io16"
 
 [publication]
