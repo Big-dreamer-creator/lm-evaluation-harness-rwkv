@@ -245,43 +245,43 @@ class EvaluationTracker:
         self.general_config_tracker.log_end_time()
 
         if self.output_path:
-            try:
-                eval_logger.info("Saving results aggregated")
+            eval_logger.info("Saving results aggregated")
 
-                # calculate cumulative hash for each task - only if samples are provided
-                task_hashes = {}
-                if samples:
-                    for task_name, task_samples in samples.items():
-                        sample_hashes = [
-                            s["doc_hash"] + s["prompt_hash"] + s["target_hash"]
-                            for s in task_samples
-                        ]
-                        task_hashes[task_name] = hash_string("".join(sample_hashes))
+            # calculate cumulative hash for each task - only if samples are provided
+            task_hashes = {}
+            if samples:
+                for task_name, task_samples in samples.items():
+                    sample_hashes = [
+                        s["doc_hash"] + s["prompt_hash"] + s["target_hash"]
+                        for s in task_samples
+                    ]
+                    task_hashes[task_name] = hash_string("".join(sample_hashes))
 
-                # update initial results dict
-                results.update({"task_hashes": task_hashes})
-                results.update(asdict(self.general_config_tracker))
-                dumped = json.dumps(
-                    results,
-                    indent=2,
-                    default=handle_non_serializable,
-                    ensure_ascii=False,
+            # update initial results dict
+            results.update({"task_hashes": task_hashes})
+            results.update(asdict(self.general_config_tracker))
+            dumped = json.dumps(
+                results,
+                indent=2,
+                default=handle_non_serializable,
+                ensure_ascii=False,
+            )
+
+            path = Path(self.output_path if self.output_path else Path.cwd())
+            if path.suffix == ".json":
+                path.parent.mkdir(parents=True, exist_ok=True)
+                file_results_aggregated = path.with_name(
+                    f"{path.stem}_{self.date_id}.json"
                 )
+            else:
+                path = path / str(self.general_config_tracker.model_name_sanitized)
+                path.mkdir(parents=True, exist_ok=True)
+                file_results_aggregated = path / f"results_{self.date_id}.json"
 
-                path = Path(self.output_path if self.output_path else Path.cwd())
-                if path.suffix == ".json":
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    file_results_aggregated = path.with_name(
-                        f"{path.stem}_{self.date_id}.json"
-                    )
-                else:
-                    path = path / str(self.general_config_tracker.model_name_sanitized)
-                    path.mkdir(parents=True, exist_ok=True)
-                    file_results_aggregated = path / f"results_{self.date_id}.json"
+            file_results_aggregated.write_text(dumped, encoding="utf-8")
 
-                file_results_aggregated.write_text(dumped, encoding="utf-8")
-
-                if self.api and self.push_results_to_hub:
+            if self.api and self.push_results_to_hub:
+                try:
                     repo_id = (
                         self.results_repo
                         if self.public_repo
@@ -309,10 +309,11 @@ class EvaluationTracker:
                         "Successfully pushed aggregated results to the Hugging Face Hub. "
                         f"You can find them at: {repo_id}"
                     )
-
-            except Exception as e:
-                eval_logger.warning("Could not save results aggregated")
-                eval_logger.info(repr(e))
+                except Exception as e:
+                    eval_logger.warning(
+                        "Could not push aggregated results to the Hugging Face Hub"
+                    )
+                    eval_logger.info(repr(e))
         else:
             eval_logger.info(
                 "Output path not provided, skipping saving results aggregated"
@@ -388,51 +389,49 @@ class EvaluationTracker:
         """
         file_results_samples = None
         if self.output_path:
-            try:
-                eval_logger.debug(f"Saving per-sample results for: {task_name}")
+            eval_logger.debug(f"Saving per-sample results for: {task_name}")
 
-                path = Path(self.output_path if self.output_path else Path.cwd())
-                if path.suffix == ".json":
-                    path = path.parent
-                else:
-                    path = path / str(self.general_config_tracker.model_name_sanitized)
-                path.mkdir(parents=True, exist_ok=True)
+            path = Path(self.output_path if self.output_path else Path.cwd())
+            if path.suffix == ".json":
+                path = path.parent
+            else:
+                path = path / str(self.general_config_tracker.model_name_sanitized)
+            path.mkdir(parents=True, exist_ok=True)
 
-                file_results_samples = (
-                    path / f"samples_{task_name}_{self.date_id}.jsonl"
-                )
-                info_once(eval_logger, f"Saving per-task samples to {path}/*.jsonl")
-                with open(file_results_samples, "w", encoding="utf-8") as f:
-                    for sample in samples:
-                        # we first need to sanitize arguments and resps
-                        # otherwise we won't be able to load the dataset
-                        # using the datasets library
-                        arguments = {}
-                        for i, arg in enumerate(sample["arguments"]):
-                            arguments[f"gen_args_{i}"] = {}
-                            for j, tmp in enumerate(arg):
-                                arguments[f"gen_args_{i}"][f"arg_{j}"] = tmp
+            file_results_samples = path / f"samples_{task_name}_{self.date_id}.jsonl"
+            info_once(eval_logger, f"Saving per-task samples to {path}/*.jsonl")
+            with open(file_results_samples, "w", encoding="utf-8") as f:
+                for sample in samples:
+                    # we first need to sanitize arguments and resps
+                    # otherwise we won't be able to load the dataset
+                    # using the datasets library
+                    arguments = {}
+                    for i, arg in enumerate(sample["arguments"]):
+                        arguments[f"gen_args_{i}"] = {}
+                        for j, tmp in enumerate(arg):
+                            arguments[f"gen_args_{i}"][f"arg_{j}"] = tmp
 
-                        serialized_sample = dict(sample)
-                        serialized_sample["resps"] = sanitize_list(sample["resps"])
-                        serialized_sample["filtered_resps"] = sanitize_list(
-                            sample["filtered_resps"]
+                    serialized_sample = dict(sample)
+                    serialized_sample["resps"] = sanitize_list(sample["resps"])
+                    serialized_sample["filtered_resps"] = sanitize_list(
+                        sample["filtered_resps"]
+                    )
+                    serialized_sample["arguments"] = arguments
+                    serialized_sample["target"] = str(sample["target"])
+
+                    sample_dump = (
+                        json.dumps(
+                            serialized_sample,
+                            default=handle_non_serializable,
+                            ensure_ascii=False,
                         )
-                        serialized_sample["arguments"] = arguments
-                        serialized_sample["target"] = str(sample["target"])
+                        + "\n"
+                    )
+                    f.write(sample_dump)
+            self.saved_sample_tasks.add(task_name)
 
-                        sample_dump = (
-                            json.dumps(
-                                serialized_sample,
-                                default=handle_non_serializable,
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
-                        f.write(sample_dump)
-                self.saved_sample_tasks.add(task_name)
-
-                if self.api and self.push_samples_to_hub:
+            if self.api and self.push_samples_to_hub:
+                try:
                     from huggingface_hub.utils import (
                         build_hf_headers,
                         get_session,
@@ -473,9 +472,11 @@ class EvaluationTracker:
                         f"Successfully pushed sample results for task: {task_name} to the Hugging Face Hub. "
                         f"You can find them at: {repo_id}"
                     )
-            except Exception as e:
-                eval_logger.warning("Could not save sample results")
-                eval_logger.info(repr(e))
+                except Exception as e:
+                    eval_logger.warning(
+                        "Could not push sample results to the Hugging Face Hub"
+                    )
+                    eval_logger.info(repr(e))
         else:
             eval_logger.info("Output path not provided, skipping saving sample results")
         return (

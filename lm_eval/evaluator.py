@@ -625,6 +625,32 @@ def evaluate(
             if WORLD_SIZE > 1:
                 lm.barrier()
 
+    def response_evidence(responses: list[Any]) -> list[dict[str, Any]]:
+        """Fields Scoreboard consumes from a raw model response.
+
+        Must run here, on the live response objects, before evaluation_tracker
+        serializes ``resps`` to plain strings and this data is gone for good.
+        """
+        evidence = []
+        for response in responses:
+            raw_response = getattr(response, "raw_response", None)
+            if raw_response is None:
+                continue
+            choice = next(iter(raw_response.get("choices") or []), {})
+            message = choice.get("message") or {}
+            evidence.append(
+                {
+                    "text": choice.get("text") or message.get("content"),
+                    "tool_calls": message.get("tool_calls") or [],
+                    "finish_reason": getattr(response, "finish_reason", None)
+                    or choice.get("finish_reason"),
+                    "truncated": bool(getattr(response, "truncated", False)),
+                    "output_token_ids": getattr(response, "output_token_ids", None)
+                    or [],
+                }
+            )
+        return evidence
+
     def finish_benchmark(task_name: str, acc: ResultAcc, limit: int | None) -> None:
         task = acc["task"]
         task.apply_filters()
@@ -660,6 +686,13 @@ def evaluate(
                             req.filtered_resps[filter_key] for req in document_requests
                         ],
                         "filter": filter_key,
+                        "response_evidence": response_evidence(
+                            [
+                                resp
+                                for req in document_requests
+                                for resp in req.resps
+                            ]
+                        ),
                         "metrics": list(metrics.keys()),
                         "doc_hash": hash_string(
                             json.dumps(

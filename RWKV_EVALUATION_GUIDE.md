@@ -250,7 +250,119 @@ Linux 本地文件系统；WSL 下将 SQLite 缓存放在 `/mnt/c` 或 `/mnt/e` 
 4. 同参数量 Qwen3.5 使用各自正确后端和同一 benchmark 协议作为独立基线。
 5. 结果目录不与其他权重、smoke run 或旧协议结果混用。
 
-## 10. 常见错误
+## 10. 远程 HTTP 后端（`rwkv7-remote`）
+
+除了自建 `vllm-rwkv` 的 `rwkv7-http` 后端外，仓库还提供 `rwkv7-remote`，用于
+直接对接标准 OpenAI 格式的托管 RWKV 服务（例如 `https://api.rwkv.rs`）。两者
+互不影响：`rwkv7-remote` 是独立新增的 backend，不改动 `rwkv7-http` 的行为。
+
+`rwkv7-remote` 只使用 `/v1/completions`，并假定该端点原生支持标准 OpenAI 的
+`echo`+`logprobs`（用于 loglikelihood/多选任务评分）。这一假设已通过对
+`api.rwkv.rs` 的真实请求验证：`drop`（generate_until）和 `race`
+（loglikelihood/多选，需配合下文的 `tokenizer_name`）均已实测跑通。
+
+### 10.1 仅生成类任务（`generate_until`，如 DROP）
+
+不设置 `tokenizer_name` 时，prompt 按任务模板渲染后的原始文本直接发送，不做
+客户端聊天模板渲染，也不需要本地或 HF Hub 上的官方 tokenizer 文件：
+
+```toml
+schema_version = 1
+backend = "rwkv7-remote"
+
+model_name = "rwkv7-g1j-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["drop"]
+output_dir = "results/rwkv7-g1j-1.5b-remote"
+
+max_length = 16384
+apply_chat_template = false
+fewshot_as_multiturn = false
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+```
+
+要点：
+
+- `apply_chat_template` 必须设为 `false`：未设置 `tokenizer_name` 时
+  `rwkv7-remote` 没有接入任何 tokenizer/chat_template 来源，无法渲染聊天
+  模板。
+- `rwkv_profile` 三个字段仍为必填，但只写入结果 `metadata`
+  （`wkv_mode`、`cot_mode`、`prompt_template`）作为审计记录，不会被发送给
+  模型。
+- 该配置下 `rwkv7-remote` 的 `model_args` 只包含 `model`、`base_url`、
+  `num_concurrent`、`max_length`。
+- `config.truncation` 会输出真实的完成数/截断数/截断率（原理见第 9 节），
+  不再是恒为 `null` 的占位值。
+
+### 10.2 loglikelihood/多选任务（如 RACE）：`tokenizer_name`
+
+`race` 等 `multiple_choice`/loglikelihood 任务需要在本地算出 prompt/continuation
+的 token 边界，因此必须设置 `tokenizer_name` 指向一个 `transformers.AutoTokenizer`
+可加载的分词器（本地目录路径或 HF Hub repo id 均可）：
+
+```toml
+schema_version = 1
+backend = "rwkv7-remote"
+
+model_name = "rwkv7-g1j-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+tokenizer_name = "<与远端权重词表一致的官方 tokenizer 路径或 repo id>"
+# 若该 tokenizer 仓库依赖自定义分词器代码（如社区转换的 RWKV World
+# tokenizer），还需要显式打开：
+# trust_remote_code = true
+benchmarks = ["race"]
+output_dir = "results/rwkv7-g1j-1.5b-remote-race"
+
+max_length = 16384
+apply_chat_template = false
+fewshot_as_multiturn = false
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+```
+
+要点：
+
+- **正确性前提，代码不做校验，必须人工核对**：`tokenizer_name` 必须和
+  `api.rwkv.rs` 上该 `model_name` 实际使用的词表完全一致。设置后请求会以
+  `tokenized_requests=True` 方式发送——本地用该 tokenizer 把 context/continuation
+  编码成 token-id 数组，直接作为 `prompt` 发给服务端，服务端不会重新分词。
+  如果词表不一致，不会报错，只会**静默产生错误的 loglikelihood 分数**。
+  正式测评前应确认这份 tokenizer 与该权重在 `rwkv7-http`/`vllm-rwkv` 侧已经
+  验证过的官方 tokenizer 资产是同一个。
+- `trust_remote_code` 仅在设置了 `tokenizer_name` 时才允许出现，否则报错
+  `trust_remote_code requires tokenizer_name to be set`；在 `rwkv7-http` 上
+  设置 `tokenizer_name`（无论是否带 `trust_remote_code`）会报错
+  `tokenizer_name is only supported for backend = rwkv7-remote`。
+- 设置 `tokenizer_name` 后 `model_args` 会多出 `tokenizer`（以及可选的
+  `trust_remote_code`）两项。
+- 若运行环境访问 HF Hub 需要代理，`AutoTokenizer.from_pretrained` 会按
+  `transformers`/`huggingface_hub` 的标准方式读取 `HTTP_PROXY`/`HTTPS_PROXY`
+  环境变量，不需要仓库代码做任何额外处理；`tokenizer_name` 指向本地目录时
+  同样适用，不依赖网络。
+
+### 10.3 鉴权与未使用的端点
+
+- 鉴权：运行前导出 `RWKV_API_KEY` 环境变量，例如：
+
+  ```bash
+  export RWKV_API_KEY="<your-api-key>"
+  ```
+
+  绝不要把密钥写进 TOML——`RWKV_API_KEY` 只在进程环境中读取，不会进入
+  `model_args` 或结果文件的 metadata。未设置该变量时，`rwkv7-remote` 会在
+  构造模型时直接报错，而不是发送空 Bearer token。
+- 该服务同时暴露的 `/v1/chat/completions`（含 `chat_template_kwargs`）和
+  `/v1/responses` 目前未被本仓库任何 backend 使用；`rwkv7-remote` 只走
+  `/v1/completions`。
+
+## 11. 常见错误
 
 - `rwkv7-http requires tokenizer_backend=remote`：不要给评估端配置本地 tokenizer。
 - `/tokenizer_info` 缺失：服务启动时补上
@@ -260,6 +372,16 @@ Linux 本地文件系统；WSL 下将 SQLite 缓存放在 `/mnt/c` 或 `/mnt/e` 
   并检查 benchmark 的输入与输出 token 上限。
 - 采样参数不生效：采样参数固定来自 `rwkv_profile`，检查
   `generation_prompt` 是否为期望的 `open_think`/`fake_think`。
+- `API key not found. Please set the RWKV_API_KEY environment variable.`：
+  使用 `rwkv7-remote` 前需导出 `RWKV_API_KEY`，见第 10 节。
+- `Tokenizer is required for loglikelihood tasks to compute context lengths.`：
+  `rwkv7-remote` 跑 `race` 等 loglikelihood/多选任务时必须设置
+  `tokenizer_name`，见第 10.2 节。
+- `tokenizer_name is only supported for backend = rwkv7-remote` /
+  `trust_remote_code requires tokenizer_name to be set`：
+  `tokenizer_name`/`trust_remote_code` 的字段依赖关系配置错误，见第 10.2 节。
+- loglikelihood 分数明显不合理但没有报错：优先怀疑 `tokenizer_name` 与远端
+  权重词表不一致（代码不会校验这一点），见第 10.2 节。
 - GPU 空载但评估未结束：检查 SQLite/Hugging Face 缓存是否位于 Windows 挂载盘，
   以及数据集是否在离线模式下反复查询网络元数据。
 

@@ -58,6 +58,8 @@ VERSIONED_CONFIG_FIELDS = {
     "schema_version",
     "seed",
     "task_overrides",
+    "tokenizer_name",
+    "trust_remote_code",
     "use_cache",
 }
 VERSIONED_REQUIRED_FIELDS = {
@@ -78,6 +80,7 @@ RWKV_PROFILE_FIELDS = {
 RWKV_PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
 RWKV_GENERATION_PROMPTS = {"fake_think", "open_think"}
 RWKV_WKV_MODES = {"fp16", "fp32io16"}
+RWKV_BACKENDS = {"rwkv7-http", "rwkv7-remote"}
 
 
 @dataclass(slots=True)
@@ -386,8 +389,19 @@ class EvaluatorConfig:
             raise ValueError("Missing versioned config fields: " + ", ".join(missing))
         if isinstance(config["schema_version"], bool) or config["schema_version"] != 1:
             raise ValueError("schema_version must be 1")
-        if config["backend"] != "rwkv7-http":
-            raise ValueError("backend must be rwkv7-http for schema_version = 1")
+        backend = config["backend"]
+        if backend not in RWKV_BACKENDS:
+            raise ValueError(
+                "backend must be one of: " + ", ".join(sorted(RWKV_BACKENDS))
+            )
+
+        tokenizer_name = config.get("tokenizer_name")
+        if tokenizer_name is not None:
+            tokenizer_name = cls._non_empty_string(tokenizer_name, "tokenizer_name")
+            if backend == "rwkv7-http":
+                raise ValueError(
+                    "tokenizer_name is only supported for backend = rwkv7-remote"
+                )
 
         model_name = cls._non_empty_string(config["model_name"], "model_name")
         base_url = cls._completion_url(config["base_url"])
@@ -470,8 +484,27 @@ class EvaluatorConfig:
             publication_value = {}
         publication = publication_value
 
+        if backend == "rwkv7-http":
+            model_args = {
+                "model": model_name,
+                "base_url": base_url,
+                "rwkv_prompt_template": prompt_template,
+                "rwkv_generation_prompt": generation_prompt,
+                "num_concurrent": num_concurrent,
+                "max_length": max_length,
+            }
+        else:
+            model_args = {
+                "model": model_name,
+                "base_url": base_url,
+                "num_concurrent": num_concurrent,
+                "max_length": max_length,
+            }
+            if tokenizer_name is not None:
+                model_args["tokenizer"] = tokenizer_name
+
         normalized: dict[str, Any] = {
-            "model": "rwkv7-http",
+            "model": backend,
             "tasks": benchmarks,
             "batch_size": batch_size,
             "device": device,
@@ -481,14 +514,7 @@ class EvaluatorConfig:
             "include_defaults": include_defaults,
             "output_path": output_dir,
             "seed": seed,
-            "model_args": {
-                "model": model_name,
-                "base_url": base_url,
-                "rwkv_prompt_template": prompt_template,
-                "rwkv_generation_prompt": generation_prompt,
-                "num_concurrent": num_concurrent,
-                "max_length": max_length,
-            },
+            "model_args": model_args,
             "metadata": {
                 "model_name": model_name,
                 "wkv_mode": wkv_mode,
@@ -556,6 +582,15 @@ class EvaluatorConfig:
             normalized["use_cache"] = cls._non_empty_string(
                 config["use_cache"], "use_cache"
             )
+        if "trust_remote_code" in config:
+            trust_remote_code = cls._boolean(
+                config["trust_remote_code"], "trust_remote_code"
+            )
+            if trust_remote_code and tokenizer_name is None:
+                raise ValueError(
+                    "trust_remote_code requires tokenizer_name to be set"
+                )
+            normalized["trust_remote_code"] = trust_remote_code
         return normalized
 
     @staticmethod

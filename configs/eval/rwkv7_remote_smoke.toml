@@ -1,0 +1,23 @@
+# Smoke-test preset for the rwkv7-remote backend against the hosted
+# api.rwkv.rs service. Not a formal benchmark config -- run with --limit.
+schema_version = 1
+backend = "rwkv7-remote"
+
+model_name = "rwkv7-g1j-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = [
+  "drop",
+]
+output_dir = "results/rwkv7-g1j-1.5b-remote-smoke"
+
+max_length = 16384
+num_concurrent = 5
+
+apply_chat_template = false
+fewshot_as_multiturn = false
+log_samples = true
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"

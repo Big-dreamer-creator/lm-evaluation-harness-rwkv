@@ -988,6 +988,204 @@ generation_prompt = "open_think"
         assert cfg.metadata["wkv_mode"] == "fp32io16"
         assert cfg.metadata["cot_mode"] == "open_think"
 
+    def test_toml_config_rwkv7_remote_backend(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1i-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/rwkv7-g1i-1.5b-remote"
+max_length = 16384
+apply_chat_template = false
+fewshot_as_multiturn = false
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        cfg = EvaluatorConfig.from_config(config)
+
+        assert cfg.model == "rwkv7-remote"
+        assert cfg.model_args == {
+            "model": "rwkv7-g1i-1.5b",
+            "base_url": "https://api.rwkv.rs/v1/completions",
+            "num_concurrent": 5,
+            "max_length": 16384,
+        }
+        assert cfg.metadata["wkv_mode"] == "fp32io16"
+        assert cfg.metadata["cot_mode"] == "fake_think"
+
+    def test_toml_config_rwkv7_remote_backend_with_tokenizer_name(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1i-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/rwkv7-g1i-1.5b-remote"
+max_length = 16384
+apply_chat_template = false
+fewshot_as_multiturn = false
+tokenizer_name = "/opt/rwkv/tokenizers/rwkv7-g1i-1.5b"
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        cfg = EvaluatorConfig.from_config(config)
+
+        assert cfg.model_args == {
+            "model": "rwkv7-g1i-1.5b",
+            "base_url": "https://api.rwkv.rs/v1/completions",
+            "num_concurrent": 5,
+            "max_length": 16384,
+            "tokenizer": "/opt/rwkv/tokenizers/rwkv7-g1i-1.5b",
+        }
+
+    def test_toml_config_rwkv7_remote_tokenizer_name_with_trust_remote_code(
+        self, tmp_path
+    ):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1j-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/rwkv7-g1j-1.5b-remote"
+max_length = 16384
+apply_chat_template = false
+fewshot_as_multiturn = false
+tokenizer_name = "BBuf/rwkv-5-world-1b5"
+trust_remote_code = true
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        cfg = EvaluatorConfig.from_config(config)
+
+        assert cfg.model_args == {
+            "model": "rwkv7-g1j-1.5b",
+            "base_url": "https://api.rwkv.rs/v1/completions",
+            "num_concurrent": 5,
+            "max_length": 16384,
+            "tokenizer": "BBuf/rwkv-5-world-1b5",
+            "trust_remote_code": True,
+        }
+
+    def test_versioned_config_rejects_trust_remote_code_without_tokenizer_name(
+        self, tmp_path
+    ):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1j-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/rwkv7-g1j-1.5b-remote"
+max_length = 16384
+apply_chat_template = false
+fewshot_as_multiturn = false
+trust_remote_code = true
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ValueError, match="trust_remote_code requires tokenizer_name"
+        ):
+            EvaluatorConfig.from_config(config)
+
+    def test_versioned_config_rejects_tokenizer_name_for_rwkv7_http(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-http"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/race"
+max_length = 16384
+tokenizer_name = "some/repo"
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="tokenizer_name is only supported for backend = rwkv7-remote",
+        ):
+            EvaluatorConfig.from_config(config)
+
+    def test_versioned_config_rejects_unknown_backend(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-vllm"
+model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
+base_url = "http://127.0.0.1:8000/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/race"
+max_length = 16384
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ValueError, match="backend must be one of: rwkv7-http, rwkv7-remote"
+        ):
+            EvaluatorConfig.load_config(config)
+
     def test_toml_config_include_cycle_is_rejected(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
 

@@ -46,8 +46,7 @@ SAMPLING_FIELDS = {
     "stop": "stop",
 }
 CHAT_TEMPLATE_FIELDS = {
-    "rwkv_prompt_template": "rwkv_prompt_template",
-    "rwkv_generation_prompt": "rwkv_generation_prompt",
+    "prompt_template": "rwkv_prompt_template",
 }
 CONTRACT = {
     "producer": SOURCE,
@@ -85,12 +84,6 @@ def _text(value: Any) -> str:
     return _json(value).decode("utf-8")
 
 
-def _first(value: Any) -> Any:
-    while isinstance(value, (list, tuple)) and value:
-        value = value[0]
-    return value
-
-
 def _task_policy(
     config: PublicationConfig, task_name: str, benchmark: str
 ) -> dict[str, Any]:
@@ -111,6 +104,30 @@ def _prompt_from_arguments(arguments: Any) -> str:
             return _text(first[0])
         return _text(first)
     return ""
+
+
+def _loglikelihood_argmax(resps: Any) -> int | None:
+    """Index of the highest-logprob choice, if `resps` is a loglikelihood pair list."""
+    if not isinstance(resps, list) or not resps:
+        return None
+    scores = []
+    for item in resps:
+        if not (isinstance(item, (list, tuple)) and len(item) == 2):
+            return None
+        try:
+            scores.append(float(item[0]))
+        except (TypeError, ValueError):
+            return None
+    return max(range(len(scores)), key=lambda i: scores[i])
+
+
+def _mc_choice_text(arguments: Any, index: int) -> str | None:
+    """Continuation text lm-eval sent for a multiple_choice option, by request index."""
+    if isinstance(arguments, dict):
+        entry = arguments.get(f"gen_args_{index}")
+        if isinstance(entry, dict) and "arg_1" in entry:
+            return _text(entry["arg_1"]).strip()
+    return None
 
 
 def _field(
@@ -191,90 +208,60 @@ def _sample(
     metric_name: str,
     include_answer: bool,
 ) -> tuple[dict[str, Any], str, bool]:
-    response_evidence = row.get("response_evidence") or []
-    if isinstance(response_evidence, dict):
-        evidence = [response_evidence]
-    else:
-        evidence = [
-            item
-            for group in response_evidence
-            for item in (group if isinstance(group, list) else [group])
-            if isinstance(item, dict)
-        ]
+    evidence = row.get("response_evidence") or []
     first_evidence = evidence[0] if evidence else {}
-    raw_response = first_evidence.get("raw_response") or {}
-    choices = raw_response.get("choices") or []
-    choice = choices[0] if choices else {}
-    message = choice.get("message") or {}
-    raw_completion = _text(
-        choice.get("text")
-        or message.get("content")
-        or message.get("tool_calls")
-        or row["resps"]
+    mc_index = _loglikelihood_argmax(row["filtered_resps"])
+    mc_choice_text = (
+        _mc_choice_text(row.get("arguments"), mc_index) if mc_index is not None else None
     )
-    extracted_answer = _text(row["filtered_resps"])
+    mc_target_text = None
+    if mc_index is not None:
+        try:
+            mc_target_text = _mc_choice_text(row.get("arguments"), int(row["target"]))
+        except (TypeError, ValueError):
+            mc_target_text = None
+    raw_completion = _text(
+        first_evidence.get("text") or mc_choice_text or row["resps"]
+    )
+    extracted_answer = (
+        mc_choice_text if mc_choice_text is not None else _text(row["filtered_resps"])
+    )
     score = row.get(metric_name)
     outcome = (
         "unanswered"
         if not raw_completion.strip()
         else {1: "correct", 0: "incorrect"}.get(score, "undetermined")
     )
-    stop_reason = str(
-        first_evidence.get("finish_reason")
-        or first_evidence.get("stop_reason")
-        or choice.get("finish_reason")
-        or choice.get("stop_reason")
-        or row.get("finish_reason")
-        or row.get("stop_reason")
-        or _first(row.get("finish_reasons"))
-        or "unknown"
-    )
-    truncated = (
-        first_evidence.get("truncation") is True
-        or _first(row.get("truncated")) is True
-        or stop_reason
-        in {
-            "length",
-            "max_tokens",
-            "model_length",
-        }
-    )
-    document = {
-        **row["doc"],
-        "task_name": task_name,
-        "target": row["target"],
+    stop_reason = str(first_evidence.get("finish_reason") or "unknown")
+    truncated = first_evidence.get("truncated") is True or stop_reason in {
+        "length",
+        "max_tokens",
+        "model_length",
     }
     detail = {
         "sample_index": sample_index,
         "document_index": int(row["doc_id"]),
-        "document": document,
+        "document": {"task_name": task_name},
         "metrics": {name: row[name] for name in row["metrics"]},
         "model_response": {
             "text": raw_completion,
             "stop_reason": stop_reason,
-            "tool_calls": message.get("tool_calls") or [],
+            "tool_calls": first_evidence.get("tool_calls") or [],
         },
     }
     if include_answer:
-        latency = (
-            sum(item.get("latency_ms") or 0 for item in evidence)
-            or row.get("latency_ms")
-            or None
-        )
         generated_tokens = sum(
             len(item.get("output_token_ids") or []) for item in evidence
         )
-        if not generated_tokens:
-            generated_tokens = len(row.get("output_token_ids") or [])
-        prompts = [item["prompt"] for item in evidence if item.get("prompt")]
         detail["answer"] = {
             "outcome": outcome,
             "problem_id": str(row["doc_id"]),
             "repeat_id": int(row.get("repeat_id", 0)),
-            "ground_truth": _text(row["target"]),
+            "ground_truth": (
+                mc_target_text if mc_target_text is not None else _text(row["target"])
+            ),
             "extracted_answer": extracted_answer,
-            "assembled_prompt": _text(prompts)
-            or _prompt_from_arguments(row.get("arguments")),
+            "assembled_prompt": _prompt_from_arguments(row.get("arguments")),
             "raw_completion": raw_completion,
             "fail_reason": (
                 None
@@ -288,7 +275,8 @@ def _sample(
                 else "undetermined"
             ),
             "generated_tokens": generated_tokens,
-            "latency_ms": latency,
+            # no per-request timing instrumentation exists upstream yet
+            "latency_ms": None,
         }
     return detail, outcome, truncated
 
@@ -330,7 +318,10 @@ def _samples(
 
 
 def _sampling_config(
-    results: dict[str, Any], task_config: dict[str, Any], model_args: dict[str, Any]
+    results: dict[str, Any],
+    task_config: dict[str, Any],
+    model_args: dict[str, Any],
+    task_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     run_config = results["config"]
     effective = {
@@ -339,6 +330,7 @@ def _sampling_config(
         **(run_config.get("sampling_config") or {}),
         **(run_config.get("gen_kwargs") or {}),
         **(task_config.get("generation_kwargs") or {}),
+        **task_metadata,
     }
     sampling = {
         target: effective[source]
@@ -441,7 +433,9 @@ def build_task_publication(
             "precision": precision,
             "backend": metadata.get("backend") or run_config["model"],
         },
-        "sampling_config": _sampling_config(results, task_config, model_args),
+        "sampling_config": _sampling_config(
+            results, task_config, model_args, task_metadata
+        ),
         "primary_metric": primary_metric,
         "metrics": metrics,
         "diagnostics": diagnostics,
@@ -482,8 +476,12 @@ def _api_root(base_url: str) -> str:
 
 def _encode(payload: dict[str, Any]) -> tuple[str, bytes]:
     raw = _json(payload)
+    if len(raw) > MAX_UNCOMPRESSED_BYTES:
+        raise ScoreboardError(
+            "Scoreboard publication exceeds the 64 MiB compressed or 256 MiB raw limit"
+        )
     compressed = gzip.compress(raw)
-    if len(raw) > MAX_UNCOMPRESSED_BYTES or len(compressed) > MAX_COMPRESSED_BYTES:
+    if len(compressed) > MAX_COMPRESSED_BYTES:
         raise ScoreboardError(
             "Scoreboard publication exceeds the 64 MiB compressed or 256 MiB raw limit"
         )
@@ -540,7 +538,7 @@ class ScoreboardPublisher:
                         f"cannot reach scoreboard: {error}"
                     ) from error
             time.sleep(min(self.config.retry_delay * 2**attempt, 30))
-        raise ScoreboardError("scoreboard retries exhausted")
+        raise AssertionError("unreachable: loop always returns or raises")
 
     def publish(
         self, campaign: dict[str, Any], publication: dict[str, Any]
