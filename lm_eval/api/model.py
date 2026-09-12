@@ -29,12 +29,15 @@ class LM(abc.ABC):
     Inputs and outputs should be tokenization-agnostic.
     """
 
+    _supports_checkpoint_items = False
+
     def __init__(self) -> None:
         # set rank and world size to a single process, by default.
         self._rank = 0
         self._world_size = 1
         self._device = None
         self.cache_hook: CacheHook = CacheHook(None)
+        self.checkpoint_store = None
 
     @abc.abstractmethod
     def loglikelihood(self, requests: list["Instance"]) -> list[tuple[float, bool]]:
@@ -225,6 +228,15 @@ class LM(abc.ABC):
     def set_cache_hook(self, cache_hook: "CacheHook") -> None:
         self.cache_hook = cache_hook
 
+    def set_checkpoint_store(self, checkpoint_store: Any) -> None:
+        """Attach a ``CheckpointStore`` for crash-safe resume.
+
+        Only meaningful for subclasses with ``_supports_checkpoint_items = True``
+        (currently ``TemplateAPI``); other backends simply store the
+        reference unused.
+        """
+        self.checkpoint_store = checkpoint_store
+
 
 ### SQLite-based caching of LM responses
 def hash_args(attr: str, args: Iterable[Any]) -> str:
@@ -413,7 +425,10 @@ class TemplateLM(LM):
         return context_enc, continuation_enc
 
     def loglikelihood(
-        self, requests: list["Instance"], disable_tqdm: bool = False
+        self,
+        requests: list["Instance"],
+        disable_tqdm: bool = False,
+        item_keys: Optional[list] = None,
     ) -> list[tuple[float, bool]]:
         """Compute log-likelihood of continuations given contexts.
 
@@ -424,6 +439,9 @@ class TemplateLM(LM):
         Args:
             requests: List of ``Instance`` objects. Each ``Instance.args`` is a ``(context, continuation)`` tuple.
             disable_tqdm: Whether to suppress the progress bar.
+            item_keys: Optional, parallel to ``requests``. Checkpoint identity
+                (see ``lm_eval.api.checkpoint.ItemKey``) for crash-safe resume;
+                only consumed by backends with ``_supports_checkpoint_items = True``.
 
         Returns:
             A list of ``(logprob, is_greedy)`` tuples, one per request.
@@ -450,7 +468,10 @@ class TemplateLM(LM):
 
             new_reqs.append(((context, continuation), context_enc, continuation_enc))
 
-        return self._loglikelihood_tokens(new_reqs, disable_tqdm=disable_tqdm)
+        kwargs = {"disable_tqdm": disable_tqdm}
+        if self._supports_checkpoint_items:
+            kwargs["item_keys"] = item_keys
+        return self._loglikelihood_tokens(new_reqs, **kwargs)
 
     @abc.abstractmethod
     def loglikelihood_rolling(

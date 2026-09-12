@@ -21,3 +21,12 @@ log_samples = true
 prompt_template = "assistant"
 generation_prompt = "fake_think"
 wkv_mode = "fp32io16"
+
+# Crash-safe resume: run with `--resume` (or set enabled = true here) to
+# durably checkpoint each item's result under output_dir/checkpoints/run.sqlite3.
+# Re-running the same command after a crash/kill skips already-completed
+# benchmarks/items instead of redispatching them. See RWKV_EVALUATION_GUIDE.md.
+[checkpoint]
+enabled = false
+# dir = "results/rwkv7-g1j-1.5b-remote-smoke/checkpoints"
+# fresh = false

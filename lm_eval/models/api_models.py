@@ -36,6 +36,7 @@ from importlib.util import find_spec
 from io import BytesIO
 
 from lm_eval import utils
+from lm_eval.api.checkpoint import ItemKey, serialize_response
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
 from lm_eval.models.utils import Collator, chunks, configure_pad_token
@@ -110,6 +111,7 @@ def create_image_prompt(
 
 class TemplateAPI(TemplateLM):
     MULTIMODAL = True
+    _supports_checkpoint_items = True
 
     def __init__(
         self,
@@ -146,9 +148,11 @@ class TemplateAPI(TemplateLM):
         timeout: int = 300,
         header: Optional[Dict[str, str]] = None,
         max_images: int = 1,
+        send_idempotency_key: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
+        self.send_idempotency_key = send_idempotency_key
         missing_packages = [
             pkg
             for pkg in ["aiohttp", "tqdm", "tenacity", "requests"]
@@ -459,10 +463,12 @@ class TemplateAPI(TemplateLM):
         *,
         generate: bool = True,
         gen_kwargs: Optional[Dict] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> Optional[dict]:
         # !!! Copy: shared dict for each request, need new object !!!
         gen_kwargs = copy.deepcopy(gen_kwargs)
+        headers = {**self.header, **extra_headers} if extra_headers else self.header
         try:
             response = requests.post(
                 self.base_url,
@@ -474,7 +480,7 @@ class TemplateAPI(TemplateLM):
                     eos=self.eos_string,
                     **kwargs,
                 ),
-                headers=self.header,
+                headers=headers,
                 verify=self.verify_certificate,
             )
             if not response.ok:
@@ -497,6 +503,7 @@ class TemplateAPI(TemplateLM):
         *,
         generate: bool = True,
         cache_keys: list = None,
+        item_keys: Optional[List[Optional[ItemKey]]] = None,
         ctxlens: Optional[List[int]] = None,
         gen_kwargs: Optional[Dict] = None,
         **kwargs,
@@ -511,12 +518,22 @@ class TemplateAPI(TemplateLM):
             **kwargs,
         )
         cache_method = "generate_until" if generate else "loglikelihood"
+        extra_headers = None
+        if (
+            self.send_idempotency_key
+            and item_keys
+            and len(item_keys) == 1
+            and item_keys[0] is not None
+        ):
+            extra_headers = {"Idempotency-Key": item_keys[0].idempotency_key}
         acquired = await sem.acquire()
         try:
             async with session.post(
                 self.base_url,
                 json=payload,
-                headers=self.header,
+                headers=(
+                    {**self.header, **extra_headers} if extra_headers else self.header
+                ),
             ) as response:
                 if not response.ok:
                     error_text = await response.text()
@@ -553,6 +570,14 @@ class TemplateAPI(TemplateLM):
             if cache_keys:
                 for res, cache in zip(answers, cache_keys):
                     self.cache_hook.add_partial(cache_method, cache, res)
+            if item_keys and self.checkpoint_store is not None:
+                completed = [
+                    (key.item_id, serialize_response(res))
+                    for key, res in zip(item_keys, answers)
+                    if key is not None
+                ]
+                if completed:
+                    await self.checkpoint_store.mark_items_completed_async(completed)
             return answers
         # If the retries also fail
         except BaseException as e:
@@ -564,12 +589,15 @@ class TemplateAPI(TemplateLM):
 
     def batch_loglikelihood_requests(
         self, chunks: Iterable[List[LogLikelihoodInputs]]
-    ) -> Tuple[List[List[int]], List[int], List[Tuple[str, str]]]:
+    ) -> Tuple[List[List[int]], List[int], List[Tuple[str, str]], List[Optional[ItemKey]]]:
         inputs = []
         ctxlens = []
         cache_keys = []
+        item_keys = []
         for chunk in chunks:
-            for cache_key, context_enc, continuation_enc in chunk:
+            for item in chunk:
+                cache_key, context_enc, continuation_enc = item[:3]
+                item_key = item[3] if len(item) > 3 else None
                 # max_length - 1 as we always have 1 token for generation
                 inp = (context_enc + continuation_enc)[-self.max_length :]
                 if len(inp) < len(context_enc + continuation_enc):
@@ -583,7 +611,8 @@ class TemplateAPI(TemplateLM):
                 inputs.append(inp)
                 ctxlens.append(ctxlen)
                 cache_keys.append(cache_key)
-        return inputs, ctxlens, cache_keys
+                item_keys.append(item_key)
+        return inputs, ctxlens, cache_keys, item_keys
 
     async def get_batched_requests(
         self,
@@ -592,9 +621,11 @@ class TemplateAPI(TemplateLM):
         *,
         generate: bool = True,
         ctxlens: List[int] = None,
+        item_keys: Optional[List[Optional[ItemKey]]] = None,
         **kwargs,
     ) -> Union[List[List[str]], List[List[Tuple[float, bool]]]]:
         ctxlens = ctxlens if ctxlens else [None] * len(requests)
+        item_keys = item_keys if item_keys else [None] * len(requests)
         conn = TCPConnector(limit=self._concurrent, ssl=self.verify_certificate)
         sem = asyncio.Semaphore(self._concurrent)
         async with ClientSession(
@@ -616,15 +647,17 @@ class TemplateAPI(TemplateLM):
                         sem=sem,
                         messages=message,
                         cache_keys=cache_key,
+                        item_keys=item_key,
                         generate=generate,
                         ctxlens=ctxlen,
                         **kwargs,
                     )
                 )
-                for message, cache_key, ctxlen in zip(
+                for message, cache_key, ctxlen, item_key in zip(
                     chunks(requests, n=self._batch_size),
                     chunks(cache_keys, n=self._batch_size),
                     chunks(ctxlens, n=self._batch_size),
+                    chunks(item_keys, n=self._batch_size),
                 )
             ]
 
@@ -635,6 +668,11 @@ class TemplateAPI(TemplateLM):
             "Tokenizer is required for loglikelihood tasks to compute context lengths."
         )
         res = []
+        item_keys = kwargs.pop("item_keys", None)
+        if item_keys:
+            requests = [
+                (*req, key) for req, key in zip(requests, item_keys, strict=True)
+            ]
 
         def _collate(req: LogLikelihoodInputs):
             """Defines the key for the sorted method"""
@@ -658,7 +696,9 @@ class TemplateAPI(TemplateLM):
         if self._concurrent <= 1:
             pbar = tqdm(desc="Requesting API", total=len(requests))
             for chunk in chunked:
-                inputs, ctxlens, cache_keys = self.batch_loglikelihood_requests([chunk])
+                inputs, ctxlens, cache_keys, item_keys = (
+                    self.batch_loglikelihood_requests([chunk])
+                )
 
                 outputs = retry(
                     stop=stop_after_attempt(self.max_retries),
@@ -667,11 +707,12 @@ class TemplateAPI(TemplateLM):
                 )(self.model_call)(messages=inputs, generate=False)
                 if isinstance(outputs, dict):
                     outputs = [outputs]
-                for answer_, cache_key in zip(
+                for answer_, cache_key, item_key in zip(
                     self.parse_logprobs(
                         outputs=outputs, tokens=inputs, ctxlens=ctxlens
                     ),
                     cache_keys,
+                    item_keys,
                 ):
                     if answer_ is not None:
                         res.append(answer_)
@@ -680,13 +721,23 @@ class TemplateAPI(TemplateLM):
                             self.cache_hook.add_partial(
                                 "loglikelihood", cache_key, answer_
                             )
+                        if item_key is not None and self.checkpoint_store is not None:
+                            self.checkpoint_store.mark_items_completed(
+                                [(item_key.item_id, serialize_response(answer_))]
+                            )
                         pbar.update(1)
         else:
-            inputs, ctxlens, cache_keys = self.batch_loglikelihood_requests(chunked)
+            inputs, ctxlens, cache_keys, item_keys = self.batch_loglikelihood_requests(
+                chunked
+            )
             res = itertools.chain.from_iterable(
                 asyncio.run(
                     self.get_batched_requests(
-                        inputs, cache_keys, generate=False, ctxlens=ctxlens
+                        inputs,
+                        cache_keys,
+                        generate=False,
+                        ctxlens=ctxlens,
+                        item_keys=item_keys,
                     )
                 )
             )
@@ -694,9 +745,14 @@ class TemplateAPI(TemplateLM):
         return re_ord.get_original(res)
 
     def generate_until(
-        self, requests: List[Instance], disable_tqdm: bool = False
+        self,
+        requests: List[Instance],
+        disable_tqdm: bool = False,
+        item_keys: Optional[List[Optional[ItemKey]]] = None,
     ) -> List[str]:
         res = []
+        if item_keys is None:
+            item_keys = [None] * len(requests)
 
         def _collate_gen(_requests):
             # sort by the length of the non-tokenized contexts
@@ -732,7 +788,10 @@ class TemplateAPI(TemplateLM):
         else:
             encodings_list = [None] * len(requests)
         requests = [
-            (a, b, c) for a, b, c in zip(requests, all_gen_kwargs, encodings_list)
+            (a, b, c, k)
+            for a, b, c, k in zip(
+                requests, all_gen_kwargs, encodings_list, item_keys
+            )
         ]
 
         re_ord = Collator(
@@ -750,7 +809,7 @@ class TemplateAPI(TemplateLM):
         if self._concurrent <= 1:
             pbar = tqdm(desc="Requesting API", total=len(requests))
             for chunk in chunked:
-                contexts, all_gen_kwargs, encodings_list = zip(*chunk)
+                contexts, all_gen_kwargs, encodings_list, chunk_item_keys = zip(*chunk)
                 if self.tokenized_requests:
                     max_gen_toks = all_gen_kwargs[0].get(
                         "max_gen_toks", self._max_gen_toks
@@ -776,12 +835,13 @@ class TemplateAPI(TemplateLM):
                     generate=True,
                     gen_kwargs=copy.deepcopy(all_gen_kwargs[0]),
                 )
-                for generated_text, context in zip(
+                for generated_text, context, item_key in zip(
                     self.parse_generations(
                         outputs=outputs,
                         contexts=contexts,
                     ),
                     contexts,
+                    chunk_item_keys,
                 ):
                     # Always append to res to maintain the correct number of items
                     # even if generation failed (generated_text is None)
@@ -801,10 +861,18 @@ class TemplateAPI(TemplateLM):
                             (context, all_gen_kwargs[0]),
                             generated_text,
                         )
+                    if (
+                        generated_text is not None
+                        and item_key is not None
+                        and self.checkpoint_store is not None
+                    ):
+                        self.checkpoint_store.mark_items_completed(
+                            [(item_key.item_id, serialize_response(generated_text))]
+                        )
                     pbar.update(1)
         else:
             for chunk in chunked:
-                contexts, all_gen_kwargs, encodings_list = zip(*chunk)
+                contexts, all_gen_kwargs, encodings_list, chunk_item_keys = zip(*chunk)
                 if self.tokenized_requests:
                     max_gen_toks = all_gen_kwargs[0].get(
                         "max_gen_toks", self._max_gen_toks
@@ -826,6 +894,7 @@ class TemplateAPI(TemplateLM):
                         self.get_batched_requests(
                             req,
                             cache_keys=[(ctx, all_gen_kwargs[0]) for ctx in contexts],
+                            item_keys=list(chunk_item_keys),
                             generate=True,
                             gen_kwargs=copy.deepcopy(all_gen_kwargs[0]),
                         )

@@ -362,6 +362,52 @@ wkv_mode = "fp32io16"
   `/v1/responses` 目前未被本仓库任何 backend 使用；`rwkv7-remote` 只走
   `/v1/completions`。
 
+### 10.4 并发与断点续跑（crash-safe resume）
+
+`num_concurrent` 控制并发请求数，调度层（`get_batched_requests` +
+`asyncio.Semaphore`）本身就是完成即调度、没有 batch barrier，因此把
+`num_concurrent` 调到评估端能承受的上限即可打满并发，不需要额外配置。
+
+针对长时间、多 benchmark 的 `rwkv7-remote` 跑批，仓库额外提供了 opt-in 的
+断点续跑机制，用于从网络抖动、远端 5xx 重试耗尽或进程被杀（`kill -9`）等
+崩溃中恢复，而不必从头重跑：
+
+```bash
+uv run --no-sync python -m lm_eval run \
+  --config configs/eval/rwkv7_remote_scoreboard_demo.toml \
+  --resume
+```
+
+或直接在 TOML 里持久开启：
+
+```toml
+[checkpoint]
+enabled = true
+# dir = "results/<name>/checkpoints"   # 默认 output_dir/checkpoints
+# fresh = true                          # 显式丢弃旧 checkpoint、重新开始
+```
+
+行为说明：
+
+- 每个请求项（含 `repeats`/自洽采样的每一次重复）成功返回后立即落盘到
+  `checkpoint.dir` 下的 `run.sqlite3`；重新以相同命令启动时，已完成的
+  benchmark 不会发起任何新请求，未跑完的 benchmark 只会重新调度尚未完成的
+  那部分请求项。
+- `run_id` 由本次运行的完整有效配置（模型、`model_args`、任务、
+  `num_fewshot`、`gen_kwargs` 等）算出。若指向同一个 `checkpoint.dir` 但配置
+  变了，续跑会直接报错拒绝执行，而不是静默复用旧结果——需要有意丢弃旧
+  checkpoint 时显式设置 `checkpoint.fresh = true`。
+- 若某个 benchmark 已经跑完但发布（scoreboard publication）当时失败或未及
+  完成，续跑只会重试发布这一步，不会重新推理、不会重新计分。
+- 崩溃语义是 at-least-once：若远端请求已经成功但进程在结果落盘前崩溃，该
+  请求项会被判定为未完成并在续跑时重新发送，可能造成极少量重复调用，但绝不
+  会静默丢失或损坏已完成的结果。
+- `checkpoint`/`--resume` 与 `--use_cache`（`CachingLM`）不能同时使用——两者
+  的缓存/去重语义不兼容，同时设置会在启动早期直接报错，需要二选一。
+- 自动重启进程本身不在 `lm_eval run` 的职责范围内：`lm_eval run --resume`
+  只负责"重新拉起后正确恢复评估状态"，进程崩溃后重新拉起进程是外部
+  supervisor（例如 systemd、supervisord 或自写的重试脚本）的职责。
+
 ## 11. 常见错误
 
 - `rwkv7-http requires tokenizer_backend=remote`：不要给评估端配置本地 tokenizer。
@@ -382,6 +428,12 @@ wkv_mode = "fp32io16"
   `tokenizer_name`/`trust_remote_code` 的字段依赖关系配置错误，见第 10.2 节。
 - loglikelihood 分数明显不合理但没有报错：优先怀疑 `tokenizer_name` 与远端
   权重词表不一致（代码不会校验这一点），见第 10.2 节。
+- `checkpoint (or --resume) and --use_cache cannot be combined`：
+  `[checkpoint]`/`--resume` 与 `--use_cache` 二选一，见第 10.4 节。
+- `checkpoint store at ... belongs to a different effective config`：
+  `checkpoint.dir` 指向的 `run.sqlite3` 记录的是另一次运行的配置指纹；确认
+  `checkpoint.dir` 没有被复用于不同 TOML，或有意丢弃时设置
+  `checkpoint.fresh = true`，见第 10.4 节。
 - GPU 空载但评估未结束：检查 SQLite/Hugging Face 缓存是否位于 Windows 挂载盘，
   以及数据集是否在离线模式下反复查询网络元数据。
 

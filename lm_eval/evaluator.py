@@ -13,6 +13,15 @@ import numpy as np
 
 import lm_eval.api.model
 import lm_eval.api.registry
+from lm_eval.api.checkpoint import (
+    ItemKey,
+    compute_idempotency_key,
+    compute_item_id,
+    compute_request_fingerprint,
+    compute_task_fingerprint,
+    deserialize_response,
+)
+from lm_eval.api.checkpoint import model_fingerprint as compute_model_fingerprint
 from lm_eval.caching.cache import delete_cache
 from lm_eval.defaults import DEFAULT_OTHER_SEED, DEFAULT_RANDOM_SEED, LMEVAL_HASHMM
 from lm_eval.evaluator_utils import (
@@ -42,6 +51,7 @@ from lm_eval.utils import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from lm_eval.api.checkpoint import CheckpointStore
     from lm_eval.api.group import Group
     from lm_eval.api.model import LM
     from lm_eval.api.task import Task
@@ -52,6 +62,70 @@ if TYPE_CHECKING:
     _NestedDict = dict[Group, dict[str, Task] | Group] | dict[str, Task]
 
 eval_logger = logging.getLogger(__name__)
+
+
+def _build_checkpointed_dispatch(
+    checkpoint_store: CheckpointStore,
+    task_name: str,
+    task_fingerprint: str,
+    model_fp: str,
+    reqs: list[Any],
+    reqtype: str,
+) -> tuple[list[Any], list[ItemKey | None]]:
+    """Build the checkpoint-aware dispatch list for one (task, reqtype) pair.
+
+    Every ``repeat_ord`` already ``completed`` in the checkpoint store is
+    restored directly into ``req.resps`` (by index) and excluded from
+    dispatch; only the remaining repeats are cloned into the returned
+    dispatch list, each paired with the ``ItemKey`` identity that
+    ``amodel_call``/``_loglikelihood_tokens`` use to mark it complete once the
+    response comes back.
+    """
+    existing_items = checkpoint_store.get_items(task_name)
+    dispatch_reqs: list[Any] = []
+    dispatch_keys: list[ItemKey | None] = []
+    to_register: list[ItemKey] = []
+    for req in reqs:
+        repeats = req.repeats
+        if len(req.resps) != repeats:
+            req.resps = [None] * repeats
+        for repeat_ord in range(repeats):
+            item_id = compute_item_id(
+                task_name, req.doc_id, req.idx, reqtype, repeat_ord
+            )
+            request_fp = compute_request_fingerprint(
+                item_id, req.args, task_fingerprint, model_fp
+            )
+            existing = existing_items.get(item_id)
+            if existing is not None and existing["status"] == "completed":
+                if existing["request_fingerprint"] == request_fp:
+                    req.resps[repeat_ord] = deserialize_response(
+                        existing["result_json"]
+                    )
+                    continue
+                eval_logger.warning(
+                    "Checkpoint item %s (task=%s) changed content since the "
+                    "last run; redispatching instead of trusting the stored "
+                    "result.",
+                    item_id,
+                    task_name,
+                )
+            key = ItemKey(
+                item_id=item_id,
+                request_fingerprint=request_fp,
+                idempotency_key=compute_idempotency_key(item_id, request_fp),
+                task_name=task_name,
+                doc_id=req.doc_id,
+                instance_idx=req.idx,
+                request_type=reqtype,
+                repeat_ord=repeat_ord,
+            )
+            dispatch_reqs.append(req)
+            dispatch_keys.append(key)
+            to_register.append(key)
+    if to_register:
+        checkpoint_store.register_pending_items(to_register)
+    return dispatch_reqs, dispatch_keys
 
 
 @positional_deprecated
@@ -88,6 +162,7 @@ def simple_evaluate(
     confirm_run_unsafe_code: bool = False,
     metadata: dict[str, Any] | None = None,
     task_callback: Callable[..., Any] | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -292,6 +367,14 @@ def simple_evaluate(
             + ".db",
         )
 
+    if checkpoint_store is not None:
+        if isinstance(lm, lm_eval.api.model.CachingLM):
+            raise ValueError(
+                "checkpoint_store and use_cache cannot be combined: CachingLM's "
+                "cache-check wrapper does not forward checkpoint item identity."
+            )
+        lm.set_checkpoint_store(checkpoint_store)
+
     if task_manager is None:
         metadata = (
             simple_parse_args_string(model_args)
@@ -395,6 +478,7 @@ def simple_evaluate(
         task_callback=task_callback,
         task_callback_context=callback_context,
         evaluation_tracker=evaluation_tracker,
+        checkpoint_store=checkpoint_store,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -464,6 +548,7 @@ def evaluate(
     task_callback: Callable[..., Any] | None = None,
     task_callback_context: dict[str, Any] | None = None,
     evaluation_tracker: EvaluationTracker | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -585,7 +670,7 @@ def evaluate(
         )
         if write_out:
             print_writeout(task)
-        if task_callback is None:
+        if task_callback is None and checkpoint_store is None:
             for instance in task.instances:
                 requests[instance.request_type].append(instance)
 
@@ -611,17 +696,52 @@ def evaluate(
     RANK = lm.rank
     WORLD_SIZE = lm.world_size
 
+    checkpoint_capable = checkpoint_store is not None and getattr(
+        lm, "_supports_checkpoint_items", False
+    )
+    model_fp = compute_model_fingerprint(lm) if checkpoint_capable else None
+
     def run_requests(
-        task_requests: dict[str, list[Any]], task_padding: dict[str, int]
+        task_requests: dict[str, list[Any]],
+        task_padding: dict[str, int],
+        task_name: str | None = None,
+        task_fingerprint: str | None = None,
     ) -> None:
+        checkpoint_active = (
+            checkpoint_capable and task_name is not None and task_fingerprint is not None
+        )
         for reqtype, reqs in task_requests.items():
             eval_logger.info(f"Running {reqtype} requests")
-            cloned_reqs = [req for req in reqs for _ in range(req.repeats)]
+            if checkpoint_active:
+                cloned_reqs, item_keys = _build_checkpointed_dispatch(
+                    checkpoint_store,
+                    task_name,
+                    task_fingerprint,
+                    model_fp,
+                    reqs,
+                    reqtype,
+                )
+            else:
+                cloned_reqs = [req for req in reqs for _ in range(req.repeats)]
+                item_keys = None
             for _ in range(task_padding.get(reqtype, 0)):
                 cloned_reqs.extend([reqs[-1]] * reqs[-1].repeats)
-            resps = getattr(lm, reqtype)(cloned_reqs)
-            for response, request in zip(resps, cloned_reqs, strict=True):
-                request.resps.append(response)
+                if item_keys is not None:
+                    item_keys.extend([None] * reqs[-1].repeats)
+            if cloned_reqs:
+                if item_keys is not None:
+                    resps = getattr(lm, reqtype)(cloned_reqs, item_keys=item_keys)
+                    for response, request, key in zip(
+                        resps, cloned_reqs, item_keys, strict=True
+                    ):
+                        if key is not None:
+                            request.resps[key.repeat_ord] = response
+                        else:
+                            request.resps.append(response)
+                else:
+                    resps = getattr(lm, reqtype)(cloned_reqs)
+                    for response, request in zip(resps, cloned_reqs, strict=True):
+                        request.resps.append(response)
             if WORLD_SIZE > 1:
                 lm.barrier()
 
@@ -651,7 +771,12 @@ def evaluate(
             )
         return evidence
 
-    def finish_benchmark(task_name: str, acc: ResultAcc, limit: int | None) -> None:
+    def finish_benchmark(
+        task_name: str,
+        acc: ResultAcc,
+        limit: int | None,
+        skip_publish: bool = False,
+    ) -> None:
         task = acc["task"]
         task.apply_filters()
         instances_by_doc_id = defaultdict(list)
@@ -733,7 +858,7 @@ def evaluate(
                         )
                     )
 
-        if RANK == 0 and task_callback is not None:
+        if RANK == 0 and (task_callback is not None or checkpoint_store is not None):
             aggregated_metrics, sample_len = _compute_task_aggregations(
                 task, acc["raw_metrics"], bootstrap_iters
             )
@@ -767,24 +892,37 @@ def evaluate(
                     eval_logger.warning(
                         "Could not persist task artifacts for %s: %s", task_name, error
                     )
-            try:
-                callback_status = task_callback(
-                    task_name=task_name,
-                    artifact_paths=artifact_paths,
+            if checkpoint_store is not None:
+                checkpoint_store.mark_benchmark_completed(
+                    task_name,
+                    (artifact_paths or {}).get("results"),
+                    (artifact_paths or {}).get("metadata"),
                 )
-                if isinstance(callback_status, dict):
-                    eval_logger.info(
-                        "Task %s publication=%s uploaded=%s",
-                        task_name,
-                        callback_status.get("publication", "unknown"),
-                        callback_status.get("uploaded", False),
+            if task_callback is not None and not skip_publish:
+                try:
+                    callback_status = task_callback(
+                        task_name=task_name,
+                        artifact_paths=artifact_paths,
                     )
-            except Exception as error:  # noqa: BLE001
-                eval_logger.warning("Task callback failed for %s: %s", task_name, error)
+                    if isinstance(callback_status, dict):
+                        eval_logger.info(
+                            "Task %s publication=%s uploaded=%s",
+                            task_name,
+                            callback_status.get("publication", "unknown"),
+                            callback_status.get("uploaded", False),
+                        )
+                    if checkpoint_store is not None:
+                        checkpoint_store.set_publish_status(task_name, "succeeded")
+                except Exception as error:  # noqa: BLE001
+                    eval_logger.warning(
+                        "Task callback failed for %s: %s", task_name, error
+                    )
+                    if checkpoint_store is not None:
+                        checkpoint_store.set_publish_status(task_name, "failed")
         if WORLD_SIZE > 1:
             lm.barrier()
 
-    if task_callback is None:
+    if task_callback is None and checkpoint_store is None:
         run_requests(requests, padding_requests)
         for (task_name, acc), task_limit in zip(
             eval_results_acc.items(), limits, strict=True
@@ -794,14 +932,28 @@ def evaluate(
         for (task_name, acc), task_limit in zip(
             eval_results_acc.items(), limits, strict=True
         ):
+            task_fingerprint = None
+            skip_publish = False
+            if checkpoint_store is not None:
+                task_fingerprint = compute_task_fingerprint(
+                    dict(acc["task"].dump_config())
+                )
+                existing_benchmark = checkpoint_store.get_benchmark(task_name)
+                skip_publish = (
+                    existing_benchmark is not None
+                    and existing_benchmark["publish_status"] == "succeeded"
+                )
+                checkpoint_store.start_benchmark(task_name, task_fingerprint)
             benchmark_requests = defaultdict(list)
             for instance in acc["task"].instances:
                 benchmark_requests[instance.request_type].append(instance)
             run_requests(
                 benchmark_requests,
                 task_padding_requests.get(task_name, {}),
+                task_name=task_name,
+                task_fingerprint=task_fingerprint,
             )
-            finish_benchmark(task_name, acc, task_limit)
+            finish_benchmark(task_name, acc, task_limit, skip_publish=skip_publish)
 
     if RANK == 0:
         res = _process_results(eval_results_acc, groups, bootstrap_iters)

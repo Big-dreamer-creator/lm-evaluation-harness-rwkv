@@ -46,3 +46,9 @@ examples/wandb/
 
 # PyInstaller
 *.spec
+
+# Local secrets (API keys, tokens) -- never commit these
+.secrets/
+*.secrets
+*_api_key
+*_api_key.*

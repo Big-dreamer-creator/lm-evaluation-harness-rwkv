@@ -148,6 +148,16 @@ class Run(SubCommand):
             metavar="<path>",
             help="Path to cache model responses (skips repeated inference)",
         )
+        model_group.add_argument(
+            "--resume",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help=(
+                "Resume a crash-safe checkpointed run (equivalent to "
+                "checkpoint.enabled=true in [checkpoint]). See [checkpoint] in "
+                "the TOML config for dir/fresh options."
+            ),
+        )
 
         # Evaluation Settings
         eval_group = self._parser.add_argument_group("evaluation settings")
@@ -417,6 +427,51 @@ class Run(SubCommand):
                 config=publication_config,
             )
 
+        checkpoint_store = None
+        checkpoint_cfg = dict(cfg.checkpoint or {})
+        if cfg.resume:
+            checkpoint_cfg["enabled"] = True
+        if checkpoint_cfg.get("enabled", False):
+            from dataclasses import asdict as _asdict
+
+            from lm_eval.api.checkpoint import CheckpointStore, compute_config_fingerprint
+
+            if cfg.use_cache:
+                raise ValueError(
+                    "checkpoint (or --resume) and --use_cache cannot be combined: "
+                    "CachingLM's cache-check wrapper does not forward checkpoint "
+                    "item identity."
+                )
+
+            checkpoint_dir = checkpoint_cfg.get("dir")
+            if not checkpoint_dir:
+                if not cfg.output_path:
+                    raise ValueError(
+                        "checkpoint.enabled (or --resume) requires output_path "
+                        "or checkpoint.dir to be set"
+                    )
+                checkpoint_dir = os.path.join(cfg.output_path, "checkpoints")
+            db_path = os.path.join(checkpoint_dir, "run.sqlite3")
+
+            fingerprint_payload = _asdict(cfg)
+            for key in (
+                "config",
+                "checkpoint",
+                "resume",
+                "show_config",
+                "verbosity",
+                "write_out",
+                "check_integrity",
+            ):
+                fingerprint_payload.pop(key, None)
+            config_fingerprint = compute_config_fingerprint(fingerprint_payload)
+
+            checkpoint_store = CheckpointStore(
+                db_path=db_path,
+                config_fingerprint=config_fingerprint,
+                fresh=bool(checkpoint_cfg.get("fresh", False)),
+            )
+
         # Create task manager (metadata already set up in config validation)
         task_manager = cfg.process_tasks(cfg.metadata)
 
@@ -468,7 +523,11 @@ class Run(SubCommand):
             confirm_run_unsafe_code=cfg.confirm_run_unsafe_code,
             metadata=cfg.metadata,
             task_callback=scoreboard_callback,
+            checkpoint_store=checkpoint_store,
         )
+
+        if checkpoint_store is not None:
+            checkpoint_store.close()
 
         # Process results
         if results is not None:

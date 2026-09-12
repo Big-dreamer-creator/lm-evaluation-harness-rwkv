@@ -39,6 +39,7 @@ VERSIONED_CONFIG_FIELDS = {
     "base_url",
     "batch_size",
     "benchmarks",
+    "checkpoint",
     "device",
     "fewshot_as_multiturn",
     "include_defaults",
@@ -158,6 +159,20 @@ class EvaluatorConfig:
     cache_requests: dict = field(
         default_factory=dict,
         metadata={"help": "Cache dataset requests: true/refresh/delete"},
+    )
+    checkpoint: dict = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Crash-safe resume settings: {enabled, dir, fresh}. See --resume."
+            )
+        },
+    )
+    resume: bool = field(
+        default=False,
+        metadata={
+            "help": "CLI sugar for checkpoint.enabled = true (see [checkpoint])."
+        },
     )
 
     # Output and logging flags
@@ -484,6 +499,26 @@ class EvaluatorConfig:
             publication_value = {}
         publication = publication_value
 
+        checkpoint_value = config.get("checkpoint")
+        if checkpoint_value is None:
+            checkpoint_value = {}
+        elif not isinstance(checkpoint_value, dict):
+            raise TypeError("checkpoint must be a table")
+        else:
+            unknown_checkpoint = sorted(
+                set(checkpoint_value) - {"enabled", "dir", "fresh"}
+            )
+            if unknown_checkpoint:
+                raise ValueError(
+                    "Unknown checkpoint fields: " + ", ".join(unknown_checkpoint)
+                )
+            if "enabled" in checkpoint_value:
+                cls._boolean(checkpoint_value["enabled"], "checkpoint.enabled")
+            if "fresh" in checkpoint_value:
+                cls._boolean(checkpoint_value["fresh"], "checkpoint.fresh")
+            if checkpoint_value.get("dir") is not None:
+                cls._non_empty_string(checkpoint_value["dir"], "checkpoint.dir")
+
         if backend == "rwkv7-http":
             model_args = {
                 "model": model_name,
@@ -522,6 +557,7 @@ class EvaluatorConfig:
                 "prompt_template": prompt_template,
             },
             "publication": publication,
+            "checkpoint": checkpoint_value,
         }
         if "limit" in config:
             limit = config["limit"]
