@@ -30,11 +30,11 @@ def test_rwkv7_remote_api_key_missing_raises(monkeypatch):
 
 
 def test_rwkv7_remote_api_key_used_in_header(monkeypatch):
-    monkeypatch.setenv("RWKV_API_KEY", "bba3a207dc4e1dc0")
+    monkeypatch.setenv("RWKV_API_KEY", "sk-test-fixture-key")
     model = _build()
 
-    assert model.api_key == "bba3a207dc4e1dc0"
-    assert model.header == {"Authorization": "Bearer bba3a207dc4e1dc0"}
+    assert model.api_key == "sk-test-fixture-key"
+    assert model.header == {"Authorization": "Bearer sk-test-fixture-key"}
 
 
 def test_rwkv7_remote_registered_in_model_mapping(monkeypatch):
