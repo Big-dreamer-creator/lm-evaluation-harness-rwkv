@@ -22,9 +22,62 @@ from lm_eval.utils import simple_parse_args_string
 if TYPE_CHECKING:
     from argparse import Namespace
 
+    from lm_eval.api.benchmark import BenchmarkSpec
     from lm_eval.tasks import TaskManager
 
 eval_logger = logging.getLogger(__name__)
+
+
+def _classify_benchmark(
+    task: str, matches: list[str], task_manager: TaskManager
+) -> BenchmarkSpec:
+    """Classify one requested ``benchmarks`` entry into a ``BenchmarkSpec``."""
+    from lm_eval.api.benchmark import BenchmarkSpec
+    from lm_eval.tasks._index import Kind
+
+    # `task_index` is only present on the real TaskManager; test doubles that
+    # only implement `match_tasks` fall back to treating every match as a
+    # standalone leaf task, same as an unindexed exact match below.
+    task_index = getattr(task_manager, "task_index", None)
+
+    if task_index is not None and len(matches) == 1 and matches[0] == task:
+        entry = task_index.get(task)
+        if entry is not None:
+            if entry.kind is Kind.GROUP:
+                has_formal_agg = bool((entry.cfg or {}).get("aggregate_metric_list"))
+                return BenchmarkSpec(
+                    name=task,
+                    strategy="group_aggregate" if has_formal_agg else "group_fallback",
+                )
+            if entry.kind is Kind.TAG:
+                return BenchmarkSpec(
+                    name=task,
+                    strategy="tag_fallback",
+                    leaf_task_names=tuple(sorted(entry.tags)),
+                )
+            # Kind.TASK / Kind.PY_TASK
+            return BenchmarkSpec(
+                name=task, strategy="standalone", leaf_task_names=(task,)
+            )
+
+    # Glob pattern (or unindexed exact match): only allow matching individual
+    # leaf tasks.
+    for matched_name in matches if task_index is not None else ():
+        matched_entry = task_index.get(matched_name)
+        if matched_entry is not None and matched_entry.kind in (
+            Kind.GROUP,
+            Kind.TAG,
+        ):
+            raise ValueError(
+                f"benchmarks entry {task!r} (glob) matched {matched_name!r}, "
+                "which is a group/tag, not a leaf task; glob patterns in "
+                "`benchmarks` may only match individual leaf tasks."
+            )
+    return BenchmarkSpec(
+        name=task, strategy="tag_fallback", leaf_task_names=tuple(matches)
+    )
+
+
 DICT_KEYS = [
     "wandb_args",
     "wandb_config_args",
@@ -81,7 +134,10 @@ RWKV_PROFILE_FIELDS = {
 RWKV_PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
 RWKV_GENERATION_PROMPTS = {"fake_think", "open_think"}
 RWKV_WKV_MODES = {"fp16", "fp32io16"}
-RWKV_BACKENDS = {"rwkv7-http", "rwkv7-remote"}
+RWKV_BACKENDS = {"rwkv7-http", "rwkv7-remote", "rwkv7-remote-chat"}
+# rwkv7-remote-chat renders no chat template locally (the server does, via
+# chat_template_kwargs) so it never needs a tokenizer, same as rwkv7-http.
+RWKV_BACKENDS_WITHOUT_TOKENIZER = {"rwkv7-http", "rwkv7-remote-chat"}
 
 
 @dataclass(slots=True)
@@ -413,13 +469,16 @@ class EvaluatorConfig:
         tokenizer_name = config.get("tokenizer_name")
         if tokenizer_name is not None:
             tokenizer_name = cls._non_empty_string(tokenizer_name, "tokenizer_name")
-            if backend == "rwkv7-http":
+            if backend in RWKV_BACKENDS_WITHOUT_TOKENIZER:
                 raise ValueError(
                     "tokenizer_name is only supported for backend = rwkv7-remote"
                 )
 
         model_name = cls._non_empty_string(config["model_name"], "model_name")
-        base_url = cls._completion_url(config["base_url"])
+        completion_path = (
+            "/v1/chat/completions" if backend == "rwkv7-remote-chat" else "/v1/completions"
+        )
+        base_url = cls._completion_url(config["base_url"], completion_path)
         benchmarks = cls._string_list(config["benchmarks"], "benchmarks")
         output_dir = cls._non_empty_string(config["output_dir"], "output_dir")
         max_length = cls._positive_int(config["max_length"], "max_length")
@@ -519,7 +578,7 @@ class EvaluatorConfig:
             if checkpoint_value.get("dir") is not None:
                 cls._non_empty_string(checkpoint_value["dir"], "checkpoint.dir")
 
-        if backend == "rwkv7-http":
+        if backend in ("rwkv7-http", "rwkv7-remote-chat"):
             model_args = {
                 "model": model_name,
                 "base_url": base_url,
@@ -534,6 +593,8 @@ class EvaluatorConfig:
                 "base_url": base_url,
                 "num_concurrent": num_concurrent,
                 "max_length": max_length,
+                "rwkv_prompt_template": prompt_template,
+                "rwkv_generation_prompt": generation_prompt,
             }
             if tokenizer_name is not None:
                 model_args["tokenizer"] = tokenizer_name
@@ -636,7 +697,7 @@ class EvaluatorConfig:
         return value
 
     @classmethod
-    def _completion_url(cls, value: Any) -> str:
+    def _completion_url(cls, value: Any, expected_path: str = "/v1/completions") -> str:
         url = cls._non_empty_string(value, "base_url")
         parsed = urlsplit(url)
         if (
@@ -646,9 +707,9 @@ class EvaluatorConfig:
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
-            or parsed.path.rstrip("/") != "/v1/completions"
+            or parsed.path.rstrip("/") != expected_path
         ):
-            raise ValueError("base_url must be an HTTP(S) /v1/completions endpoint")
+            raise ValueError(f"base_url must be an HTTP(S) {expected_path} endpoint")
         return url
 
     @staticmethod
@@ -768,7 +829,9 @@ class EvaluatorConfig:
 
         return self
 
-    def process_tasks(self, metadata: dict | None = None) -> TaskManager:
+    def process_tasks(
+        self, metadata: dict | None = None
+    ) -> tuple[TaskManager, dict[str, BenchmarkSpec]]:
         """Process and validate tasks, return resolved task names.
 
         Handles:
@@ -776,10 +839,16 @@ class EvaluatorConfig:
         - Custom YAML config files (e.g., "/path/to/task.yaml")
         - Glob patterns (e.g., "/path/to/*.yaml")
         - Directories of YAML files
+
+        Also builds a ``benchmark_name -> BenchmarkSpec`` map, classifying
+        each originally-requested ``benchmarks`` entry by how it should be
+        aggregated for scoreboard publication (real group aggregation, a
+        weighted-average fallback, or a tag/standalone passthrough).
         """
         import glob
         import itertools
 
+        from lm_eval.api.benchmark import BenchmarkSpec
         from lm_eval.tasks import TaskManager
         from lm_eval.tasks._yaml_loader import load_yaml
 
@@ -808,7 +877,7 @@ class EvaluatorConfig:
                 config = load_yaml(yaml_file, resolve_func=False)
                 task_names.append(config)
             self.tasks = task_names
-            return task_manager
+            return task_manager, {}
 
         # Normalize paths and deduplicate
         task_list = [
@@ -818,10 +887,15 @@ class EvaluatorConfig:
         match_dict = dict.fromkeys(task_list)  # deduplicate file paths
 
         # Match each task
+        benchmark_map: dict[str, BenchmarkSpec] = {}
         for task in match_dict:
             if not task.endswith(".yaml"):
                 # Standard task name - match via task manager
                 matches = task_manager.match_tasks([task])
+                if matches:
+                    benchmark_map[task] = _classify_benchmark(
+                        task, matches, task_manager
+                    )
             else:
                 # Custom config file(s) - support glob patterns
                 matches = []
@@ -844,7 +918,7 @@ class EvaluatorConfig:
 
         # Update tasks with resolved names
         self.tasks = task_names
-        return task_manager
+        return task_manager, benchmark_map
 
     def _set_trust_remote_code(self):
         """Apply the trust_remote_code setting if enabled."""

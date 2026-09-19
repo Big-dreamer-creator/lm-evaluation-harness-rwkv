@@ -43,6 +43,7 @@ MODEL_MAPPING = {
     "local-completions": "lm_eval.models.openai_completions:LocalCompletionsAPI",
     "rwkv7-http": "lm_eval.models.openai_completions:RWKV7HTTP",
     "rwkv7-remote": "lm_eval.models.rwkv_remote:RWKV7Remote",
+    "rwkv7-remote-chat": "lm_eval.models.rwkv_remote_chat:RWKV7RemoteChat",
     "mamba_ssm": "lm_eval.models.mamba_lm:MambaLMWrapper",
     "megatron_lm": "lm_eval.models.megatron_lm:MegatronLMEval",
     "nemo_lm": "lm_eval.models.nemo_lm:NeMoLM",

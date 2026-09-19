@@ -153,6 +153,12 @@ def test_rwkv7_http_construction_defaults(monkeypatch):
     assert model.tokenizer_name == f"rwkv7-g1h-test:{expected_sha}:assistant:fake_think"
 
 
+def test_rwkv7_http_get_model_info_reports_sampling_config(monkeypatch):
+    model, profile = _build_rwkv7_http(monkeypatch)
+
+    assert model.get_model_info() == {"sampling_config": profile}
+
+
 def test_rwkv7_http_rejects_tokenized_requests(monkeypatch):
     with pytest.raises(ValueError, match="tokenized_requests=False"):
         RWKV7HTTP(model="rwkv7-g1h-test", tokenized_requests=True)

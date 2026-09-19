@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
+from lm_eval.api.instance import Instance
 from lm_eval.api.registry import get_model
 from lm_eval.models.rwkv_remote import RWKV7Remote
 
@@ -63,6 +64,71 @@ def test_rwkv7_remote_without_tokenizer_keeps_defaults(monkeypatch):
     assert model.tokenized_requests is False
 
 
+def test_rwkv7_remote_without_tokenizer_reports_fixed_sampling_config(monkeypatch):
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build()
+
+    assert model.get_model_info() == {
+        "sampling_config": {
+            "temperature": 1.0,
+            "top_p": 0.28,
+            "top_k": 32,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "penalty_decay": 0.996,
+            "do_sample": True,
+            "stop": ["✿", "\nUser:", "\n### User"],
+        }
+    }
+
+
+def test_rwkv7_remote_get_model_info_reports_sampling_config_with_tokenizer(monkeypatch):
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token = "<eos>"
+        eos_token_id = 0
+        bos_token_id = 1
+        chat_template = "{{ messages }}"
+
+    with patch(
+        "transformers.AutoTokenizer.from_pretrained", return_value=FakeTokenizer()
+    ):
+        model = _build(tokenizer="some/repo")
+
+    assert model.get_model_info() == {
+        "sampling_config": {
+            "temperature": 1.0,
+            "top_p": 0.28,
+            "top_k": 32,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "penalty_decay": 0.996,
+            "do_sample": True,
+            "stop": ["✿", "\nUser:", "\n### User"],
+        }
+    }
+
+
+def test_rwkv7_remote_open_think_uses_its_own_fixed_sampling_config(monkeypatch):
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build(rwkv_generation_prompt="open_think")
+
+    assert model.get_model_info() == {
+        "sampling_config": {
+            "temperature": 0.96,
+            "top_p": 0.76,
+            "top_k": 32,
+            "presence_penalty": 1.0,
+            "frequency_penalty": 0.1,
+            "penalty_decay": 0.988,
+            "do_sample": True,
+            "stop": ["✿", "\nUser:", "\n### User"],
+        }
+    }
+
+
 def test_rwkv7_remote_parse_generations_reports_finish_reason():
     outputs = {
         "choices": [
@@ -75,3 +141,64 @@ def test_rwkv7_remote_parse_generations_reports_finish_reason():
     assert str(generation) == "hello"
     assert generation.finish_reason == "length"
     assert generation.truncated is True
+
+
+def _mc_requests(context, choices, doc_id=0, repeats=1):
+    return [
+        Instance(
+            request_type="loglikelihood",
+            doc={},
+            arguments=(context, choice),
+            idx=idx,
+            metadata=("some_task", doc_id, repeats),
+        )
+        for idx, choice in enumerate(choices)
+    ]
+
+
+def test_rwkv7_remote_avg_at_k_samples_k_generations_via_generate_until(monkeypatch):
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build()
+
+    generated_answers = iter(["A", "B", "A", "A"])
+    calls = []
+
+    def fake_generate_until(instances):
+        calls.append(instances[0])
+        return [next(generated_answers)]
+
+    monkeypatch.setattr(model, "generate_until", fake_generate_until)
+
+    requests = _mc_requests("What is 1+1?", ["one", "two"], doc_id=7, repeats=4)
+    results = model.loglikelihood(requests)
+
+    # avg@k exercises real generation (not echo/logprobs), so the sampling
+    # profile in _create_payload actually applies -- one generate_until call
+    # per k-sample, each carrying the choice-lettered prompt.
+    assert len(calls) == 4
+    assert "A. one" in calls[0].args[0]
+    assert "B. two" in calls[0].args[0]
+
+    # k=4 sample encodings recorded for the process_results avg@k patch,
+    # one full per-choice (ll, is_greedy) list per independent generation.
+    sample_encodings = model._avg_k_samples[7]
+    assert len(sample_encodings) == 4
+    assert [enc[0][1] for enc in sample_encodings] == [True, False, True, True]
+    assert [enc[1][1] for enc in sample_encodings] == [False, True, False, False]
+
+    # The single (ll, is_greedy) list returned still encodes a majority-vote
+    # winner (choice "A" won 3/4), so acc/acc_norm work without any patch.
+    assert results == [(0.0, True), (-1e6, False)]
+
+
+def test_rwkv7_remote_avg_at_k_defaults_to_one_sample(monkeypatch):
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build()
+
+    monkeypatch.setattr(model, "generate_until", lambda instances: ["B"])
+
+    requests = _mc_requests("ctx", ["one", "two"], doc_id=1, repeats=1)
+    results = model.loglikelihood(requests)
+
+    assert len(model._avg_k_samples[1]) == 1
+    assert results == [(-1e6, False), (0.0, True)]

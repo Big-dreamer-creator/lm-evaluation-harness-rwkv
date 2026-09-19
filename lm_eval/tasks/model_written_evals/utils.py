@@ -35,4 +35,13 @@ def load_json_dataset(data_files, **kwargs):
     resolved = (
         _resolve_data_files(data_files, Path(data_root)) if data_root else data_files
     )
-    return datasets.load_dataset("json", data_files=resolved)
+    if data_root:
+        return datasets.load_dataset("json", data_files=resolved)
+    # Remote http(s) URLs go through fsspec's aiohttp-backed HTTPFileSystem,
+    # which ignores HTTP_PROXY/HTTPS_PROXY/ALL_PROXY unless trust_env is set
+    # explicitly (aiohttp.ClientSession defaults trust_env=False).
+    return datasets.load_dataset(
+        "json",
+        data_files=resolved,
+        storage_options={"client_kwargs": {"trust_env": True}},
+    )

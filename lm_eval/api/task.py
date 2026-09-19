@@ -857,6 +857,17 @@ class ConfigurableTask(Task):
 
         if dataset_kwargs and vparse(datasets.__version__) >= vparse("4.0.0"):
             dataset_kwargs.pop("trust_remote_code", None)
+        if dataset_kwargs and isinstance(dataset_kwargs.get("features"), dict):
+            # datasets>=4.0 stores the raw `features=` kwarg on the builder's
+            # DatasetInfo without converting it (see DatasetBuilder.__init__),
+            # unlike DatasetInfo.__post_init__ which does call
+            # Features.from_dict for info deserialized from disk. A plain
+            # dict here breaks schema casting during dataset generation, so
+            # task YAMLs must be able to declare `dataset_kwargs.features` as
+            # a serialized Features dict and have it converted here.
+            dataset_kwargs["features"] = datasets.Features.from_dict(
+                dataset_kwargs["features"]
+            )
         if isinstance(self.config.custom_dataset, Callable):
             eval_logger.warning(
                 f"{self.config.task}: Custom kwargs can be passed to `--metadata` in console (as json string) or to the TaskManager."

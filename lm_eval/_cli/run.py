@@ -462,6 +462,12 @@ class Run(SubCommand):
                 "verbosity",
                 "write_out",
                 "check_integrity",
+                # Publication only affects what happens to already-computed
+                # results afterward, not what gets requested/computed, so it
+                # must not change the run identity -- otherwise adding a
+                # [publication] section to republish an already-completed
+                # run's results would be treated as a brand new run.
+                "publication",
             ):
                 fingerprint_payload.pop(key, None)
             config_fingerprint = compute_config_fingerprint(fingerprint_payload)
@@ -473,7 +479,7 @@ class Run(SubCommand):
             )
 
         # Create task manager (metadata already set up in config validation)
-        task_manager = cfg.process_tasks(cfg.metadata)
+        task_manager, benchmark_map = cfg.process_tasks(cfg.metadata)
 
         # Validation warnings (keep these in CLI as they're logging-specific)
         if "push_samples_to_hub" in cfg.hf_hub_log_args and not cfg.log_samples:
@@ -524,6 +530,7 @@ class Run(SubCommand):
             metadata=cfg.metadata,
             task_callback=scoreboard_callback,
             checkpoint_store=checkpoint_store,
+            benchmark_map=benchmark_map,
         )
 
         if checkpoint_store is not None:

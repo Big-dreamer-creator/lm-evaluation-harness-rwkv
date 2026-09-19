@@ -2,7 +2,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 from collections import defaultdict
 from functools import cached_property
 from operator import itemgetter
@@ -11,10 +10,37 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
 from lm_eval.models.api_models import TemplateAPI
+from lm_eval.models.rwkv_choice import build_choice_prompt, choice_letters, parse_choice_index
 from lm_eval.models.utils import handle_stop_sequences
 
 
 eval_logger = logging.getLogger(__name__)
+
+
+def _rwkv_sampling_config(profile: dict) -> dict:
+    """Map an RWKV `GenerationConfig` profile onto reportable sampling fields.
+
+    `_create_payload` strips several of these out of the outgoing HTTP request
+    (folding them into a server-side `generation_config` blob instead), so this
+    is the only place the *effective* sampling parameters survive for
+    `get_model_info()` to report into `results["config"]["sampling_config"]`.
+    """
+    sampling = {
+        key: profile[key]
+        for key in (
+            "temperature",
+            "top_p",
+            "top_k",
+            "presence_penalty",
+            "frequency_penalty",
+            "penalty_decay",
+            "do_sample",
+        )
+        if profile.get(key) is not None
+    }
+    if profile.get("stop_strings"):
+        sampling["stop"] = list(profile["stop_strings"])
+    return sampling
 
 
 @register_model("local-completions")
@@ -270,6 +296,9 @@ class RWKV7HTTP(LocalCompletionsAPI):
             f"{self.rwkv_prompt_template}:{self.rwkv_generation_prompt}"
         )
 
+    def get_model_info(self) -> dict:
+        return {"sampling_config": _rwkv_sampling_config(self._generation_profile)}
+
     @cached_property
     def eot_token_id(self) -> int:
         return 0
@@ -362,13 +391,6 @@ class RWKV7HTTP(LocalCompletionsAPI):
             payload["stop"] = [self.PROMPT_STOPS[self.rwkv_prompt_template]]
         return payload
 
-    _CHOICE_BOXED_RE = re.compile(r"\\boxed\{\s*\(?([A-Za-z])\)?\s*\}")
-    _CHOICE_EXPLICIT_RE = re.compile(
-        r"(?:answer|answer is|the answer is|answer:)\s*[:\-]?\s*\(?([A-Za-z])\)?",
-        re.IGNORECASE,
-    )
-    _CHOICE_BARE_RE = re.compile(r"\(?([A-Za-z])\)?[.\s]*$")
-
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         """Emulate multiple_choice loglikelihood scoring through generation.
 
@@ -382,7 +404,7 @@ class RWKV7HTTP(LocalCompletionsAPI):
         results: List[Optional[Tuple[float, bool]]] = [None] * len(requests)
         groups: Dict[Any, List[int]] = defaultdict(list)
         for position, request in enumerate(requests):
-            groups[request.doc_id].append(position)
+            groups[(request.task_name, request.doc_id)].append(position)
 
         for positions in groups.values():
             positions = sorted(positions, key=lambda p: requests[p].idx)
@@ -414,14 +436,8 @@ class RWKV7HTTP(LocalCompletionsAPI):
         return results
 
     def _resolve_choice(self, context: str, choices: List[str]) -> int:
-        letters = [chr(ord("A") + i) for i in range(len(choices))]
-        options = "\n".join(
-            f"{letter}. {choice}" for letter, choice in zip(letters, choices)
-        )
-        prompt = (
-            f"{context}\n\n{options}\n\n"
-            "Answer with only the letter of the correct option."
-        )
+        letters = choice_letters(choices)
+        prompt = build_choice_prompt(context, choices)
         gen_kwargs = {"until": [], "max_gen_toks": self._max_gen_toks}
         instance = Instance(
             request_type="generate_until",
@@ -435,30 +451,14 @@ class RWKV7HTTP(LocalCompletionsAPI):
     def _parse_choice_index(
         self, generated: str, letters: List[str], choices: List[str]
     ) -> int:
-        text = generated.strip()
-        for pattern in (
-            self._CHOICE_BOXED_RE,
-            self._CHOICE_EXPLICIT_RE,
-            self._CHOICE_BARE_RE,
-        ):
-            match = pattern.search(text)
-            if match:
-                letter = match.group(1).upper()
-                if letter in letters:
-                    return letters.index(letter)
-
-        lowered = text.lower()
-        best_index, best_len = 0, -1
-        for index, choice in enumerate(choices):
-            choice_lower = choice.lower()
-            if choice_lower and choice_lower in lowered and len(choice_lower) > best_len:
-                best_index, best_len = index, len(choice_lower)
-        if best_len < 0:
+        index = parse_choice_index(generated, letters, choices)
+        if index < 0:
             eval_logger.warning(
                 "RWKV7HTTP could not parse a choice letter from the generated "
-                f"answer {text!r}; defaulting to option {letters[0]!r}."
+                f"answer {generated.strip()!r}; defaulting to option {letters[0]!r}."
             )
-        return best_index
+            return 0
+        return index
 
 
 @register_model("local-chat-completions")

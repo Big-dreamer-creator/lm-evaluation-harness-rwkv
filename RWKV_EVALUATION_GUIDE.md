@@ -399,6 +399,17 @@ enabled = true
   checkpoint 时显式设置 `checkpoint.fresh = true`。
 - 若某个 benchmark 已经跑完但发布（scoreboard publication）当时失败或未及
   完成，续跑只会重试发布这一步，不会重新推理、不会重新计分。
+- 发布粒度是整个 benchmark，不是其内部叶子 task：`wmdp` 这类多叶子
+  benchmark（`wmdp_bio`/`wmdp_chem`/`wmdp_cyber`）只会在它自己的全部叶子都
+  跑完后合并聚合成一条看板记录再发布一次，叶子本身永远不会单独作为子条目
+  上传看板。没有正式 `aggregate_metric_list` 的 benchmark（如
+  `model_written_evals`、`xquad` 这类 tag/group）按叶子间共同拥有的 metric
+  名自动加权平均；叶子间 metric 名完全不重叠时（如 `infinitebench`）不产出
+  合成主指标，只保留各叶子自己的分项。相应地，`configs/eval/*.toml` 里的
+  `[publication.tasks.<name>]` 现在按 benchmark 名配置（例如
+  `[publication.tasks.wmdp]`，不再是 `[publication.tasks.wmdp_bio]` 之类的
+  叶子名）；单叶子 benchmark（如 `race`）benchmark 名与叶子名相同，配置写法
+  不变。
 - 崩溃语义是 at-least-once：若远端请求已经成功但进程在结果落盘前崩溃，该
   请求项会被判定为未完成并在续跑时重新发送，可能造成极少量重复调用，但绝不
   会静默丢失或损坏已完成的结果。

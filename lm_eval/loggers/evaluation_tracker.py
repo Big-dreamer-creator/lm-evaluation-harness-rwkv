@@ -331,6 +331,58 @@ class EvaluationTracker:
         samples_path = self.save_results_samples(task_name, samples)
         if samples_path is None:
             return None
+        return self._write_artifact_files(task_name, results, Path(samples_path))
+
+    def save_benchmark_artifacts(
+        self,
+        benchmark_name: str,
+        results_doc: dict[str, Any],
+    ) -> dict[str, str] | None:
+        """Persist one completed benchmark (possibly multi-leaf) for post-evaluation consumers.
+
+        Unlike ``save_task_artifacts``, there is no single raw ``samples`` list:
+        each leaf task already wrote its own samples file (see
+        ``leaf_artifact_paths`` in ``results_doc``), so this concatenates them
+        into one combined jsonl for the benchmark as a whole.
+        """
+        if not self.output_path:
+            return None
+        leaf_artifact_paths: dict[str, Any] = results_doc.get(
+            "leaf_artifact_paths", {}
+        )
+        leaf_samples_paths = [
+            Path(paths["samples"])
+            for paths in leaf_artifact_paths.values()
+            if paths and paths.get("samples")
+        ]
+        if not leaf_samples_paths:
+            return None
+        output_path = Path(self.output_path)
+        if output_path.suffix == ".json":
+            output_path = output_path.parent
+        else:
+            output_path /= str(self.general_config_tracker.model_name_sanitized)
+        root = output_path / "task_artifacts" / sanitize_task_name(benchmark_name)
+        root.mkdir(parents=True, exist_ok=True)
+        combined_samples_path = (
+            root / f"samples_{benchmark_name}_{self.date_id}.jsonl"
+        )
+        with combined_samples_path.open("w", encoding="utf-8") as combined:
+            for leaf_samples_path in leaf_samples_paths:
+                with leaf_samples_path.open(encoding="utf-8") as leaf_file:
+                    for line in leaf_file:
+                        if line.strip():
+                            combined.write(line)
+        return self._write_artifact_files(
+            benchmark_name, results_doc, combined_samples_path
+        )
+
+    def _write_artifact_files(
+        self,
+        task_name: str,
+        results: dict[str, Any],
+        samples_path: Path,
+    ) -> dict[str, str]:
         output_path = Path(self.output_path)
         if output_path.suffix == ".json":
             output_path = output_path.parent
@@ -340,12 +392,12 @@ class EvaluationTracker:
         root.mkdir(parents=True, exist_ok=True)
         paths = {
             "results": root / "results.json",
-            "samples": Path(samples_path),
+            "samples": samples_path,
             "metadata": root / "metadata.json",
         }
         run_config = results["config"]
         model_args = run_config["model_args"]
-        task_config = results["configs"][task_name]
+        task_config = results.get("configs", {}).get(task_name, {})
         task_metadata = task_config.get("metadata") or {}
         metadata = {
             "framework": "lm-eval-harness",

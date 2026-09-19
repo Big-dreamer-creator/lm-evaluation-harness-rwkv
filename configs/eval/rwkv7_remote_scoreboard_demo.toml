@@ -55,11 +55,5 @@ field = "reasoning"
 [publication.tasks.inverse_scaling_neqa]
 field = "reasoning"
 
-[publication.tasks.wmdp_bio]
-field = "knowledge"
-
-[publication.tasks.wmdp_chem]
-field = "knowledge"
-
-[publication.tasks.wmdp_cyber]
+[publication.tasks.wmdp]
 field = "knowledge"

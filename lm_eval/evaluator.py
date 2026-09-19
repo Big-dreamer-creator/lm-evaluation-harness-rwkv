@@ -13,6 +13,7 @@ import numpy as np
 
 import lm_eval.api.model
 import lm_eval.api.registry
+from lm_eval.api.benchmark import avg_at_k_plan
 from lm_eval.api.checkpoint import (
     ItemKey,
     compute_idempotency_key,
@@ -22,6 +23,7 @@ from lm_eval.api.checkpoint import (
     deserialize_response,
 )
 from lm_eval.api.checkpoint import model_fingerprint as compute_model_fingerprint
+from lm_eval.api.metrics import aggregate_benchmark_fallback, mean
 from lm_eval.caching.cache import delete_cache
 from lm_eval.defaults import DEFAULT_OTHER_SEED, DEFAULT_RANDOM_SEED, LMEVAL_HASHMM
 from lm_eval.evaluator_utils import (
@@ -34,6 +36,7 @@ from lm_eval.evaluator_utils import (
     print_writeout,
     run_task_tests,
 )
+from lm_eval.filters import build_filter_ensemble
 from lm_eval.loggers.utils import add_env_info, add_tokenizer_info, get_git_commit_hash
 from lm_eval.tasks import TaskManager
 from lm_eval.utils import (
@@ -51,6 +54,7 @@ from lm_eval.utils import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from lm_eval.api.benchmark import BenchmarkSpec
     from lm_eval.api.checkpoint import CheckpointStore
     from lm_eval.api.group import Group
     from lm_eval.api.model import LM
@@ -128,6 +132,77 @@ def _build_checkpointed_dispatch(
     return dispatch_reqs, dispatch_keys
 
 
+def _install_avg_at_k_patch(
+    task_obj: Task, lm: LM, k: int, metric_name: str
+) -> None:
+    """Wrap ``task_obj.process_results`` to average correctness over ``k``
+    independently-sampled generations per doc, surfacing the result under a
+    new ``<metric>_avg@k`` key alongside the task's normal (single-sample)
+    metrics -- so ``acc``/``exact_match`` etc. keep working unmodified for
+    any code that doesn't yet know about avg@k.
+
+    Only two ``OUTPUT_TYPE``s are handled:
+    - ``multiple_choice``: relies on ``lm._avg_k_samples[doc_id]`` (populated
+      by a ``SUPPORTS_AVG_AT_K`` model's own ``loglikelihood()`` override,
+      e.g. ``RWKV7Remote``) holding the ``k`` independently-generated
+      per-choice encodings for this doc; the task's own (unmodified)
+      ``process_results`` is invoked once per encoding and the results
+      averaged.
+    - ``generate_until``: relies on the task's filter having been switched
+      to ``take_first_k`` (below) so ``results[0]`` is the full list of
+      ``k`` generations rather than a single winner; the task's own
+      ``process_results`` is invoked once per generation and averaged.
+    Any other ``OUTPUT_TYPE`` (loglikelihood/loglikelihood_rolling) is left
+    untouched -- avg@k has no meaning for perplexity-style scoring.
+    """
+    if k <= 1:
+        return
+    original_process_results = task_obj.process_results
+    output_type = task_obj.OUTPUT_TYPE
+
+    def _average_metrics(per_sample: list[dict]) -> dict:
+        metrics = dict(per_sample[0])
+        for key in per_sample[0]:
+            values = [m[key] for m in per_sample if key in m]
+            if values and all(isinstance(v, (int, float)) for v in values):
+                avg_key = f"{key}_{metric_name}"
+                metrics[avg_key] = sum(values) / len(values)
+                task_obj._aggregation_list[avg_key] = task_obj._aggregation_list.get(
+                    key, mean
+                )
+                task_obj._higher_is_better[avg_key] = task_obj._higher_is_better.get(
+                    key, True
+                )
+        return metrics
+
+    if output_type == "multiple_choice":
+
+        def patched(doc, results):
+            metrics = original_process_results(doc, results)
+            doc_id = getattr(task_obj, "_avg_k_current_doc_id", None)
+            sample_encodings = lm._avg_k_samples.pop(doc_id, None)
+            if sample_encodings:
+                per_sample = [
+                    original_process_results(doc, enc) for enc in sample_encodings
+                ]
+                metrics.update(_average_metrics(per_sample))
+            return metrics
+    elif output_type == "generate_until":
+        task_obj._filters = [build_filter_ensemble("none", [["take_first_k", {"k": k}]])]
+
+        def patched(doc, results):
+            generations = results[0]
+            per_sample = [
+                original_process_results(doc, [generation])
+                for generation in generations
+            ]
+            return _average_metrics(per_sample)
+    else:
+        return
+
+    task_obj.process_results = patched
+
+
 @positional_deprecated
 def simple_evaluate(
     model: str | LM,
@@ -163,6 +238,7 @@ def simple_evaluate(
     metadata: dict[str, Any] | None = None,
     task_callback: Callable[..., Any] | None = None,
     checkpoint_store: CheckpointStore | None = None,
+    benchmark_map: dict[str, BenchmarkSpec] | None = None,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -428,6 +504,18 @@ def simple_evaluate(
         # fewshot_random_seed set for tasks, even with a default num_fewshot (e.g. in the YAML file)
         task_obj.set_fewshot_seed(seed=fewshot_random_seed)
 
+        # avg@k: only for backends that declare support (RWKV7Remote), and only
+        # for tasks that haven't already opted into their own repeated-sampling
+        # scoring (e.g. cruxeval's native repeats=10 pass@k) -- clobbering those
+        # would break their bespoke process_results.
+        if getattr(lm, "SUPPORTS_AVG_AT_K", False) and task_obj.get_config(
+            "repeats"
+        ) in (None, 1):
+            num_docs = len(task_obj.eval_docs)
+            k, metric_name = avg_at_k_plan(num_docs, limited=limit is not None)
+            task_obj.set_config(key="repeats", value=k, update=False)
+            _install_avg_at_k_patch(task_obj, lm, k, metric_name)
+
     if check_integrity:
         run_task_tests(task_list=tasks)
 
@@ -479,6 +567,7 @@ def simple_evaluate(
         task_callback_context=callback_context,
         evaluation_tracker=evaluation_tracker,
         checkpoint_store=checkpoint_store,
+        benchmark_map=benchmark_map,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -549,6 +638,7 @@ def evaluate(
     task_callback_context: dict[str, Any] | None = None,
     evaluation_tracker: EvaluationTracker | None = None,
     checkpoint_store: CheckpointStore | None = None,
+    benchmark_map: dict[str, BenchmarkSpec] | None = None,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -608,6 +698,35 @@ def evaluate(
     else:
         task_dict = cast("TaskDict", task_dict)
         groups, eval_tasks = task_dict.get("groups", {}), task_dict.get("tasks", {})
+
+    # Group leaf tasks by the benchmark they were requested under, so that
+    # scoreboard publication happens once per benchmark (as soon as its own
+    # leaves are all done), never once per leaf task.
+    benchmark_trackers: dict[str, dict[str, Any]] = {}
+    leaf_to_benchmark: dict[str, str] = {}
+    if benchmark_map and (task_callback is not None or checkpoint_store is not None):
+        for bname, spec in benchmark_map.items():
+            if spec.leaf_task_names is not None:
+                leaves = list(spec.leaf_task_names)
+            else:
+                group_obj = groups.get(bname)
+                leaves = (
+                    [t.task_name for t in group_obj.get_all_tasks(recursive=True)]
+                    if group_obj is not None
+                    else []
+                )
+            leaves = [leaf for leaf in leaves if leaf in eval_tasks]
+            if not leaves:
+                continue
+            benchmark_trackers[bname] = {
+                "spec": spec,
+                "leaf_names": leaves,
+                "remaining": len(leaves),
+                "collected_metrics": {},
+                "collected_artifacts": {},
+            }
+            for leaf in leaves:
+                leaf_to_benchmark[leaf] = bname
 
     # Initialize accumulators for per-sample metrics and logged samples
     eval_results_acc: dict[str, ResultAcc] = {
@@ -775,7 +894,6 @@ def evaluate(
         task_name: str,
         acc: ResultAcc,
         limit: int | None,
-        skip_publish: bool = False,
     ) -> None:
         task = acc["task"]
         task.apply_filters()
@@ -795,6 +913,11 @@ def evaluate(
             for doc_id, doc in doc_iterator:
                 doc_id_true = indices[doc_id] if indices else doc_id
                 document_requests = instances_by_doc_id[doc_id]
+                # Read by the avg@k process_results patch (see
+                # _install_avg_at_k_patch) to look up this doc's
+                # independently-sampled per-choice encodings; a harmless
+                # no-op for any task that isn't patched.
+                task._avg_k_current_doc_id = doc_id
                 metrics = task.process_results(
                     doc,
                     [req.filtered_resps[filter_key] for req in document_requests],
@@ -898,29 +1021,125 @@ def evaluate(
                     (artifact_paths or {}).get("results"),
                     (artifact_paths or {}).get("metadata"),
                 )
-            if task_callback is not None and not skip_publish:
-                try:
-                    callback_status = task_callback(
-                        task_name=task_name,
-                        artifact_paths=artifact_paths,
-                    )
-                    if isinstance(callback_status, dict):
-                        eval_logger.info(
-                            "Task %s publication=%s uploaded=%s",
-                            task_name,
-                            callback_status.get("publication", "unknown"),
-                            callback_status.get("uploaded", False),
-                        )
-                    if checkpoint_store is not None:
-                        checkpoint_store.set_publish_status(task_name, "succeeded")
-                except Exception as error:  # noqa: BLE001
-                    eval_logger.warning(
-                        "Task callback failed for %s: %s", task_name, error
-                    )
-                    if checkpoint_store is not None:
-                        checkpoint_store.set_publish_status(task_name, "failed")
+            # Leaf tasks are never published to the scoreboard on their own:
+            # only once every leaf of the benchmark it belongs to is done do
+            # we publish one aggregated entry for that benchmark.
+            bname = leaf_to_benchmark.get(task_name)
+            if bname is not None:
+                tracker = benchmark_trackers[bname]
+                tracker["collected_metrics"][task_name] = callback_results["results"][
+                    task_name
+                ]
+                tracker["collected_artifacts"][task_name] = artifact_paths
+                tracker["remaining"] -= 1
+                if tracker["remaining"] == 0:
+                    _finish_and_publish_benchmark(bname)
         if WORLD_SIZE > 1:
             lm.barrier()
+
+    def _finish_and_publish_benchmark(bname: str) -> None:
+        tracker = benchmark_trackers[bname]
+        spec = tracker["spec"]
+        leaves = tracker["leaf_names"]
+        metrics = tracker["collected_metrics"]
+
+        if spec.strategy == "standalone":
+            leaf = leaves[0]
+            aggregated = {**metrics[leaf], "name": bname, "alias": bname}
+            primary_metric_hint = None
+        elif spec.strategy == "group_aggregate":
+            group_obj = groups[bname]
+            aggregated = group_obj.aggregate(metrics)
+            primary_metric_hint = group_obj.aggregate_metric_list[0].metric
+        else:  # group_fallback / tag_fallback
+            aggregated, primary_metric_hint = aggregate_benchmark_fallback(
+                bname, leaves, metrics
+            )
+
+        n_original = sum(
+            len(eval_tasks[leaf].eval_docs) for leaf in leaves if leaf in eval_tasks
+        )
+        n_effective = sum(
+            metrics[leaf].get("sample_len", 0) for leaf in leaves if leaf in metrics
+        )
+
+        fingerprint = compute_task_fingerprint(
+            {"leaves": sorted(leaves), "strategy": spec.strategy}
+        )
+        skip_publish = False
+        if checkpoint_store is not None:
+            existing = checkpoint_store.get_benchmark(bname)
+            skip_publish = (
+                existing is not None and existing["publish_status"] == "succeeded"
+            )
+            checkpoint_store.start_benchmark(bname, fingerprint)
+
+        results_doc = {
+            **(task_callback_context or {}),
+            "results": {bname: aggregated},
+            "configs": (
+                {bname: eval_tasks[leaves[0]].dump_config()}
+                if spec.strategy == "standalone"
+                else {}
+            ),
+            "versions": (
+                {bname: eval_tasks[leaves[0]].VERSION}
+                if spec.strategy == "standalone"
+                else {}
+            ),
+            "n-samples": {
+                bname: {"original": n_original, "effective": n_effective}
+            },
+            "strategy": spec.strategy,
+            "primary_metric_hint": primary_metric_hint,
+            "leaf_artifact_paths": dict(tracker["collected_artifacts"]),
+        }
+        artifact_paths = None
+        if evaluation_tracker is not None:
+            try:
+                artifact_paths = evaluation_tracker.save_benchmark_artifacts(
+                    bname, results_doc
+                )
+            except (OSError, TypeError, ValueError) as error:
+                eval_logger.warning(
+                    "Could not persist benchmark artifacts for %s: %s", bname, error
+                )
+
+        if checkpoint_store is not None:
+            checkpoint_store.mark_benchmark_completed(
+                bname,
+                (artifact_paths or {}).get("results"),
+                (artifact_paths or {}).get("metadata"),
+            )
+        if task_callback is not None and not skip_publish:
+            try:
+                callback_status = task_callback(
+                    task_name=bname, artifact_paths=artifact_paths
+                )
+                publish_ok = True
+                if isinstance(callback_status, dict):
+                    publish_ok = callback_status.get("publication") not in (
+                        "failed",
+                        None,
+                    )
+                    eval_logger.log(
+                        logging.INFO if publish_ok else logging.WARNING,
+                        "Benchmark %s publication=%s uploaded=%s%s",
+                        bname,
+                        callback_status.get("publication", "unknown"),
+                        callback_status.get("uploaded", False),
+                        f" error={callback_status['error']}"
+                        if callback_status.get("error")
+                        else "",
+                    )
+                if checkpoint_store is not None:
+                    checkpoint_store.set_publish_status(
+                        bname, "succeeded" if publish_ok else "failed"
+                    )
+            except Exception as error:  # noqa: BLE001
+                eval_logger.warning("Task callback failed for %s: %s", bname, error)
+                if checkpoint_store is not None:
+                    checkpoint_store.set_publish_status(bname, "failed")
 
     if task_callback is None and checkpoint_store is None:
         run_requests(requests, padding_requests)
@@ -933,15 +1152,9 @@ def evaluate(
             eval_results_acc.items(), limits, strict=True
         ):
             task_fingerprint = None
-            skip_publish = False
             if checkpoint_store is not None:
                 task_fingerprint = compute_task_fingerprint(
                     dict(acc["task"].dump_config())
-                )
-                existing_benchmark = checkpoint_store.get_benchmark(task_name)
-                skip_publish = (
-                    existing_benchmark is not None
-                    and existing_benchmark["publish_status"] == "succeeded"
                 )
                 checkpoint_store.start_benchmark(task_name, task_fingerprint)
             benchmark_requests = defaultdict(list)
@@ -953,7 +1166,7 @@ def evaluate(
                 task_name=task_name,
                 task_fingerprint=task_fingerprint,
             )
-            finish_benchmark(task_name, acc, task_limit, skip_publish=skip_publish)
+            finish_benchmark(task_name, acc, task_limit)
 
     if RANK == 0:
         res = _process_results(eval_results_acc, groups, bootstrap_iters)

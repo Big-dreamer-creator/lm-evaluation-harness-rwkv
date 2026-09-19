@@ -194,10 +194,25 @@ def _primary_metric(
 ) -> str:
     name = policy.get("primary_metric")
     if name is None:
-        name = task_config["metric_list"][0]["metric"]
-    for metric in metrics:
-        if metric == name or metric.split(",", 1)[0] == name:
-            return metric
+        configured = task_config["metric_list"][0]["metric"]
+        # `!function`-defined metrics (e.g. cruxeval/humaneval_infilling's
+        # pass_at_k) serialize to their full source instead of a bare name,
+        # so a non-identifier value can never match an actual metric key --
+        # there is no configured name to check against, so fall straight
+        # through to the alphabetical fallback below.
+        name = configured if re.fullmatch(r"[A-Za-z0-9_]+", configured) else None
+    if name is not None:
+        for metric in metrics:
+            if metric == name or metric.split(",", 1)[0] == name:
+                return metric
+        raise ScoreboardError(f"primary metric {name!r} is not present in results")
+    non_stderr = sorted(
+        metric for metric in metrics if not metric.split(",", 1)[0].endswith("_stderr")
+    )
+    if non_stderr:
+        return non_stderr[0]
+    if metrics:
+        return sorted(metrics)[0]
     raise ScoreboardError(f"primary metric {name!r} is not present in results")
 
 
@@ -227,10 +242,11 @@ def _sample(
         mc_choice_text if mc_choice_text is not None else _text(row["filtered_resps"])
     )
     score = row.get(metric_name)
+    scalar_score = score if isinstance(score, (int, float)) and not isinstance(score, bool) else None
     outcome = (
         "unanswered"
         if not raw_completion.strip()
-        else {1: "correct", 0: "incorrect"}.get(score, "undetermined")
+        else {1: "correct", 0: "incorrect"}.get(scalar_score, "undetermined")
     )
     stop_reason = str(first_evidence.get("finish_reason") or "unknown")
     truncated = first_evidence.get("truncated") is True or stop_reason in {
@@ -356,7 +372,7 @@ def _sampling_config(
     return sampling
 
 
-def build_task_publication(
+def _build_leaf_publication(
     results: dict[str, Any],
     metadata: dict[str, Any],
     samples_path: Path,
@@ -456,6 +472,267 @@ def build_task_publication(
         "contract_sha256": _sha256(CONTRACT),
         "configured_benchmarks": [benchmark],
         "resolved_benchmarks": [benchmark],
+        "skipped_benchmarks": [],
+        "expected_tasks": [task],
+        "rerun_reason": config.rerun_reason,
+    }
+    run_key_payload = dict(campaign)
+    run_key_payload.pop("run_key")
+    campaign["run_key"] = _sha256(run_key_payload)
+    return campaign, publication
+
+
+def _common(values: list[Any]) -> Any:
+    """The shared value across `values`, or `None` if any two disagree."""
+    if not values:
+        return None
+    first = values[0]
+    return first if all(value == first for value in values[1:]) else None
+
+
+def _match_metric_key(metrics: dict[str, float], name: str | None) -> str | None:
+    if name is None:
+        return None
+    for metric in metrics:
+        if metric == name or metric.split(",", 1)[0] == name:
+            return metric
+    return None
+
+
+def _merge_task_metadata(leaf_configs: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Merge per-leaf task metadata for a multi-leaf benchmark publication.
+
+    Keeps only metadata keys with an identical value across every leaf
+    (fields that genuinely differ per leaf, e.g. `field`, are left for the
+    publication policy to disambiguate). `dataset` is recomputed as the
+    value shared by every leaf (`None` if leaves disagree); `languages`/
+    `tags`/`evaluation_splits` are recomputed as a deduplicated, sorted
+    union instead of arbitrarily picking one leaf's value.
+    """
+    task_metadatas = [(cfg.get("metadata") or {}) for cfg in leaf_configs.values()]
+    common_keys = (
+        set.intersection(*(set(m) for m in task_metadatas)) if task_metadatas else set()
+    )
+    merged = {
+        key: value
+        for key in common_keys
+        if (value := _common([m[key] for m in task_metadatas])) is not None
+    }
+
+    def _union(getter: Any) -> list[str]:
+        values: set[str] = set()
+        for cfg in leaf_configs.values():
+            meta = cfg.get("metadata") or {}
+            values.update(str(v) for v in (getter(cfg, meta) or []))
+        return sorted(values)
+
+    # `dataset` is a single string field on Task, unlike languages/tags/
+    # evaluation_splits which are lists -- so it must use `_common` (None
+    # when leaves disagree) rather than a deduplicated union.
+    merged["dataset"] = _common(
+        [
+            (cfg.get("dataset_path") or (cfg.get("metadata") or {}).get("dataset"))
+            or None
+            for cfg in leaf_configs.values()
+        ]
+    )
+    merged["languages"] = _union(lambda cfg, meta: meta.get("languages") or [])
+    merged["tags"] = _union(
+        lambda cfg, meta: meta.get("tags") or meta.get("upstream_tags") or []
+    )
+    merged["evaluation_splits"] = _union(
+        lambda cfg, meta: meta.get("evaluation_splits")
+        or (
+            [cfg.get("test_split") or cfg.get("validation_split")]
+            if (cfg.get("test_split") or cfg.get("validation_split"))
+            else []
+        )
+    )
+    return merged
+
+
+def build_benchmark_publication(
+    results: dict[str, Any],
+    metadata: dict[str, Any],
+    config: PublicationConfig,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build one compact Scoreboard publication for an aggregated benchmark.
+
+    `results` is the benchmark-level results.json written by
+    `save_benchmark_artifacts` -- it never carries leaf sub-entries, only the
+    aggregated score(s), plus pointers (`leaf_artifact_paths`) to each leaf's
+    own artifacts so sample evidence can still be sourced without
+    duplicating it on disk.
+    """
+    benchmark_name = next(iter(results["results"]))
+    leaf_artifact_paths: dict[str, dict[str, str]] = (
+        results.get("leaf_artifact_paths") or {}
+    )
+
+    if results.get("strategy") == "standalone":
+        leaf_name = next(iter(leaf_artifact_paths))
+        samples_path = Path(leaf_artifact_paths[leaf_name]["samples"])
+        return _build_leaf_publication(
+            results, metadata, samples_path, benchmark_name, config
+        )
+
+    leaf_docs = {
+        leaf_name: json.loads(Path(paths["results"]).read_text("utf-8"))
+        for leaf_name, paths in leaf_artifact_paths.items()
+    }
+    leaf_configs = {
+        leaf_name: doc["configs"][leaf_name] for leaf_name, doc in leaf_docs.items()
+    }
+    task_metadata = _merge_task_metadata(leaf_configs)
+    policy = _task_policy(config, benchmark_name, benchmark_name)
+
+    run_config = results["config"]
+    model_args = run_config["model_args"]
+    model_name = str(
+        metadata.get("model")
+        or model_args.get("model")
+        or model_args.get("pretrained")
+        or run_config["model"]
+    )
+    precision = str(
+        metadata.get("precision")
+        or task_metadata.get("wkv_mode")
+        or model_args.get("wkv_mode")
+        or "fp32io16"
+    )
+    task_version = str(
+        task_metadata.get("task_version")
+        or _common(
+            [doc["versions"][leaf_name] for leaf_name, doc in leaf_docs.items()]
+        )
+        or task_metadata.get("version")
+        or "aggregate"
+    )
+    task = {
+        "identity": f"{config.model_sha256}:{precision}:{benchmark_name}",
+        "weight_sha256": config.model_sha256,
+        "weight_display_name": model_name,
+        "wkv_mode": precision,
+        "field": _field(task_metadata, {}, policy),
+        "benchmark": benchmark_name,
+        "task_name": benchmark_name,
+        "task_version": task_version,
+        "dataset": task_metadata["dataset"],
+        "subset": _common(
+            [cfg.get("dataset_name") or None for cfg in leaf_configs.values()]
+        ),
+        "evaluation_splits": task_metadata["evaluation_splits"],
+        "languages": task_metadata["languages"],
+        "tags": task_metadata["tags"],
+    }
+
+    metrics = _metrics(results, benchmark_name)
+    policy_metric_name = policy.get("primary_metric")
+    primary_metric = _match_metric_key(metrics, policy_metric_name)
+    if primary_metric is None and policy_metric_name is not None:
+        raise ScoreboardError(
+            f"primary metric {policy_metric_name!r} is not present in results"
+        )
+    if primary_metric is None:
+        primary_metric = _match_metric_key(metrics, results.get("primary_metric_hint"))
+    no_shared_metric = not metrics
+
+    all_details: list[dict[str, Any]] = []
+    outcome_counts = dict.fromkeys(
+        ("correct", "incorrect", "unanswered", "undetermined"), 0
+    )
+    samples_total = uploaded_total = 0
+    weighted_truncated = 0.0
+    for leaf_name, paths in leaf_artifact_paths.items():
+        leaf_doc = leaf_docs[leaf_name]
+        leaf_metrics = _metrics(leaf_doc, leaf_name)
+        leaf_policy = _task_policy(config, leaf_name, benchmark_name)
+        leaf_primary = _primary_metric(
+            leaf_metrics, leaf_configs[leaf_name], leaf_policy
+        )
+        if no_shared_metric:
+            # Benchmarks like cruxeval/infinitebench mix leaves with no
+            # metric name shared across all of them, so aggregate_benchmark_
+            # fallback intentionally leaves the benchmark-level metrics
+            # empty (see its docstring) rather than synthesize a misleading
+            # headline score. The Scoreboard schema still requires at least
+            # one non-null metric, so surface each leaf's own primary metric
+            # namespaced by leaf name instead of a blended score.
+            metrics[f"{leaf_name}/{leaf_primary}"] = leaf_metrics[leaf_primary]
+        sample_metric = str(
+            leaf_policy.get("outcome_metric") or leaf_primary.split(",", 1)[0]
+        )
+        details, diagnostics = _samples(
+            Path(paths["samples"]), leaf_name, sample_metric, True
+        )
+        all_details.extend(details)
+        for key in outcome_counts:
+            outcome_counts[key] += diagnostics["outcome_counts"][key]
+        samples_total += diagnostics["samples_total"]
+        weighted_truncated += (
+            diagnostics["truncation_rate"] * diagnostics["samples_total"]
+        )
+        uploaded_total += diagnostics["samples_uploaded"]
+    if primary_metric is None and metrics:
+        primary_metric = sorted(metrics)[0]
+    for index, detail in enumerate(all_details):
+        detail["sample_index"] = index
+    diagnostics = {
+        "samples_total": samples_total,
+        "samples_uploaded": uploaded_total,
+        "outcome_counts": outcome_counts,
+        "truncation_rate": (
+            weighted_truncated / samples_total if samples_total else 0.0
+        ),
+    }
+
+    counts = results["n-samples"][benchmark_name]
+    task_summary = {
+        "task": benchmark_name,
+        "dataset_path": task["dataset"],
+        "dataset_name": task["subset"],
+        "output_type": _common(
+            [cfg.get("output_type") for cfg in leaf_configs.values()]
+        ),
+        "num_fewshot": _common(
+            [cfg.get("num_fewshot") for cfg in leaf_configs.values()]
+        ),
+        "original_num_docs": counts["original"],
+        "effective_num_docs": counts["effective"],
+    }
+    publication = {
+        "schema_version": SCHEMA_VERSION,
+        "task": task,
+        "result_files": [],
+        "task_config": task_summary,
+        "environment": {
+            "framework": SOURCE,
+            "version": metadata.get("version") or results["lm_eval_version"],
+            "model": model_name,
+            "precision": precision,
+            "backend": metadata.get("backend") or run_config["model"],
+        },
+        "sampling_config": _sampling_config(results, {}, model_args, task_metadata),
+        "primary_metric": primary_metric,
+        "metrics": metrics,
+        "diagnostics": diagnostics,
+        "samples": all_details,
+    }
+    campaign = {
+        "schema_version": SCHEMA_VERSION,
+        "run_key": "",
+        "source": SOURCE,
+        "config_sha256": _sha256(
+            {
+                "task": task_summary,
+                "sampling": publication["sampling_config"],
+                "policy": policy,
+            }
+        ),
+        "registry_sha256": _sha256([task]),
+        "contract_sha256": _sha256(CONTRACT),
+        "configured_benchmarks": [benchmark_name],
+        "resolved_benchmarks": [benchmark_name],
         "skipped_benchmarks": [],
         "expected_tasks": [task],
         "rerun_reason": config.rerun_reason,
@@ -620,12 +897,8 @@ class ScoreboardTaskCallback:
         try:
             results = json.loads(Path(artifact_paths["results"]).read_text("utf-8"))
             metadata = json.loads(Path(artifact_paths["metadata"]).read_text("utf-8"))
-            campaign, publication = build_task_publication(
-                results,
-                metadata,
-                Path(artifact_paths["samples"]),
-                task_name,
-                self.config,
+            campaign, publication = build_benchmark_publication(
+                results, metadata, self.config
             )
             status["diagnostics"] = publication["diagnostics"]
             if self.config.dry_run:
