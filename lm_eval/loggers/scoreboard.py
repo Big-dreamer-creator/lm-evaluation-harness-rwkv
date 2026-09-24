@@ -298,13 +298,28 @@ def _sample(
 
 
 def _samples(
-    path: Path, task_name: str, metric_name: str, include_answer: bool
+    path: Path,
+    task_name: str,
+    metric_name: str,
+    include_answer: bool,
+    uploaded_counts: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Read one leaf's per-sample details, capped at `MAX_SAMPLES_PER_OUTCOME`.
+
+    `uploaded_counts` tracks how many samples of each outcome have already
+    been uploaded for the *benchmark* this leaf belongs to. Callers building
+    a multi-leaf benchmark publication must share one `uploaded_counts` dict
+    across all `_samples` calls for that benchmark so the cap applies to the
+    benchmark as a whole rather than being re-applied per leaf (which would
+    let an N-leaf benchmark upload up to `N * MAX_SAMPLES_PER_OUTCOME`
+    samples per outcome).
+    """
     details: list[dict[str, Any]] = []
     outcome_counts = dict.fromkeys(
         ("correct", "incorrect", "unanswered", "undetermined"), 0
     )
-    uploaded_counts = dict.fromkeys(outcome_counts, 0)
+    if uploaded_counts is None:
+        uploaded_counts = dict.fromkeys(outcome_counts, 0)
     total = truncated = 0
     with path.open(encoding="utf-8") as sample_file:
         for line in sample_file:
@@ -643,6 +658,7 @@ def build_benchmark_publication(
     )
     samples_total = uploaded_total = 0
     weighted_truncated = 0.0
+    shared_uploaded_counts = dict.fromkeys(outcome_counts, 0)
     for leaf_name, paths in leaf_artifact_paths.items():
         leaf_doc = leaf_docs[leaf_name]
         leaf_metrics = _metrics(leaf_doc, leaf_name)
@@ -663,7 +679,11 @@ def build_benchmark_publication(
             leaf_policy.get("outcome_metric") or leaf_primary.split(",", 1)[0]
         )
         details, diagnostics = _samples(
-            Path(paths["samples"]), leaf_name, sample_metric, True
+            Path(paths["samples"]),
+            leaf_name,
+            sample_metric,
+            True,
+            uploaded_counts=shared_uploaded_counts,
         )
         all_details.extend(details)
         for key in outcome_counts:

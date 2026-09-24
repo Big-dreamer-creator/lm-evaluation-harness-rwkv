@@ -8,8 +8,10 @@ import lm_eval.evaluator as evaluator
 from lm_eval.api.benchmark import BenchmarkSpec
 from lm_eval.loggers.evaluation_tracker import EvaluationTracker
 from lm_eval.loggers.scoreboard import (
+    MAX_SAMPLES_PER_OUTCOME,
     PublicationConfig,
     _build_leaf_publication,
+    _samples,
     build_benchmark_publication,
 )
 from lm_eval.models.dummy import DummyLM
@@ -250,3 +252,53 @@ def test_standalone_matches_leaf_publication_directly(tmp_path):
     )
 
     assert via_benchmark == via_leaf_direct
+
+
+def _write_correct_samples_jsonl(path: Path, task_name: str, count: int) -> None:
+    rows = []
+    for doc_id in range(count):
+        rows.append(
+            {
+                "doc_id": doc_id,
+                "repeat_id": 0,
+                "filtered_resps": ["4"],
+                "resps": [["4"]],
+                "target": "4",
+                "arguments": [["What is 2+2?", {}]],
+                "response_evidence": [{"text": "4", "finish_reason": "stop"}],
+                "metrics": ["acc"],
+                "acc": 1,
+            }
+        )
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+
+def test_samples_cap_is_shared_across_leaves_of_one_benchmark(tmp_path):
+    """A benchmark's per-outcome cap must apply across ALL of its leaves
+    combined, not be re-applied independently per leaf. Otherwise a
+    benchmark with N sub-tasks uploads up to N * MAX_SAMPLES_PER_OUTCOME
+    "correct" samples instead of MAX_SAMPLES_PER_OUTCOME total.
+    """
+    num_leaves = 7
+    docs_per_leaf = MAX_SAMPLES_PER_OUTCOME
+    shared_uploaded_counts: dict[str, int] = dict.fromkeys(
+        ("correct", "incorrect", "unanswered", "undetermined"), 0
+    )
+    total_uploaded = 0
+    for leaf_index in range(num_leaves):
+        leaf_name = f"leaf_{leaf_index}"
+        samples_path = tmp_path / f"{leaf_name}.jsonl"
+        _write_correct_samples_jsonl(samples_path, leaf_name, docs_per_leaf)
+        details, _diagnostics = _samples(
+            samples_path,
+            leaf_name,
+            "acc",
+            True,
+            uploaded_counts=shared_uploaded_counts,
+        )
+        total_uploaded += len(details)
+
+    assert total_uploaded == MAX_SAMPLES_PER_OUTCOME
+    assert shared_uploaded_counts["correct"] == MAX_SAMPLES_PER_OUTCOME
