@@ -129,6 +129,10 @@ def test_rwkv7_remote_chat_parse_generations_reads_message_content():
 
 
 def _mc_requests(context, choices, doc_id=0, repeats=1):
+    # Mirrors evaluator.py's `cloned_reqs = [req for req in reqs for _ in
+    # range(req.repeats)]`: avg@k's k is read off the actual number of
+    # cloned instances per choice, not off the `repeats` metadata value
+    # alone, so tests must clone here too.
     return [
         Instance(
             request_type="loglikelihood",
@@ -138,28 +142,29 @@ def _mc_requests(context, choices, doc_id=0, repeats=1):
             metadata=("some_task", doc_id, repeats),
         )
         for idx, choice in enumerate(choices)
+        for _ in range(repeats)
     ]
 
 
-def test_rwkv7_remote_chat_resolve_choice_wraps_prompt_as_chat_message(monkeypatch):
+def test_rwkv7_remote_chat_resolve_choices_wraps_prompt_as_chat_message(monkeypatch):
     monkeypatch.setenv("RWKV_API_KEY", "test-key")
     model = _build()
 
     calls = []
 
     def fake_generate_until(instances):
-        calls.append(instances[0])
+        calls.append(instances)
         return ["A"]
 
     monkeypatch.setattr(model, "generate_until", fake_generate_until)
 
     prompt = build_choice_prompt("What is 1+1?", ["one", "two"])
-    index = model._resolve_choice(prompt, ["A", "B"], ["one", "two"])
+    indices = model._resolve_choices(prompt, ["A", "B"], ["one", "two"], 1)
 
-    assert index == 0
-    sent = calls[0].args[0]
+    assert indices == [0]
+    sent = calls[0][0].args[0]
     # A bare string would blow up LocalChatCompletion's `_create_payload`
-    # assertion, so `_resolve_choice` must hand generate_until a JsonChatStr
+    # assertion, so `_resolve_choices` must hand generate_until a JsonChatStr
     # that unwraps into a proper [{"role", "content"}, ...] message list.
     assert isinstance(sent, JsonChatStr)
     messages = json.loads(sent.prompt)
@@ -172,20 +177,78 @@ def test_rwkv7_remote_chat_avg_at_k_samples_k_generations_via_generate_until(mon
     monkeypatch.setenv("RWKV_API_KEY", "test-key")
     model = _build()
 
-    generated_answers = iter(["A", "B", "A", "A"])
     calls = []
 
     def fake_generate_until(instances):
-        calls.append(instances[0])
-        return [next(generated_answers)]
+        calls.append(instances)
+        return ["A", "B", "A", "A"]
 
     monkeypatch.setattr(model, "generate_until", fake_generate_until)
 
     requests = _mc_requests("What is 1+1?", ["one", "two"], doc_id=7, repeats=4)
     results = model.loglikelihood(requests)
 
-    assert len(calls) == 4
+    # All k rollouts are dispatched through a single generate_until call so
+    # the harness's existing concurrency (num_concurrent semaphore, batching,
+    # multi-replica pool dispatch) parallelizes them instead of blocking on
+    # one rollout at a time.
+    assert len(calls) == 1
+    assert len(calls[0]) == 4
     sample_encodings = model._avg_k_samples[7]
     assert len(sample_encodings) == 4
     assert [enc[0][1] for enc in sample_encodings] == [True, False, True, True]
-    assert results == [(0.0, True), (-1e6, False)]
+    assert model._avg_k_parsed[7] == [True, True, True, True]
+    # `requests` has 4 cloned instances per choice, so `results` mirrors that
+    # shape: 4 outcomes for choice "one" (the winner) then 4 for "two".
+    assert results == [(0.0, True)] * 4 + [(-1e6, False)] * 4
+
+
+def test_rwkv7_remote_chat_avg_at_k_ignores_unparsed_rollouts_in_majority_vote(monkeypatch):
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build()
+
+    def fake_generate_until(instances):
+        # Only one of four rollouts names a valid letter; the other three
+        # generations don't contain anything parse_choice_index recognizes.
+        return ["gibberish", "B", "gibberish", "gibberish"]
+
+    monkeypatch.setattr(model, "generate_until", fake_generate_until)
+
+    requests = _mc_requests("What is 1+1?", ["one", "two"], doc_id=9, repeats=4)
+    results = model.loglikelihood(requests)
+
+    # The majority vote is decided purely by the single valid rollout ("B"),
+    # not diluted/overruled by unparseable ones defaulting to option A.
+    assert results == [(-1e6, False)] * 4 + [(0.0, True)] * 4
+    assert model._avg_k_parsed[9] == [False, True, False, False]
+
+
+def test_rwkv7_remote_chat_loglikelihood_attaches_real_generation_as_evidence(monkeypatch):
+    """See test_rwkv7_remote_loglikelihood_attaches_real_generation_as_evidence
+    in test_rwkv_remote.py -- identical contract for the chat backend."""
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build()
+
+    real_generation = RWKV7RemoteChat.parse_generations(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "The answer is B."},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+    )[0]
+    monkeypatch.setattr(model, "generate_until", lambda instances: [real_generation])
+
+    requests = _mc_requests("ctx", ["one", "two"], doc_id=1, repeats=1)
+    results = model.loglikelihood(requests)
+
+    assert results == [(-1e6, False), (0.0, True)]
+    for outcome in results:
+        assert outcome.raw_response is real_generation.raw_response
+        assert outcome.finish_reason == "stop"
+        assert "Answer with only the letter" in outcome.prompt
+        assert "A. one" in outcome.prompt
+        assert "B. two" in outcome.prompt

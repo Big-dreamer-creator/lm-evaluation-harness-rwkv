@@ -14,7 +14,12 @@ from lm_eval.models.openai_completions import (
     _RWKVCompletion,
     _rwkv_sampling_config,
 )
-from lm_eval.models.rwkv_choice import build_choice_prompt, choice_letters, parse_choice_index
+from lm_eval.models.rwkv_choice import (
+    RWKVLoglikelihoodResponse,
+    build_choice_prompt,
+    choice_letters,
+    parse_choice_index,
+)
 
 
 eval_logger = logging.getLogger(__name__)
@@ -144,6 +149,11 @@ class RWKV7Remote(LocalCompletionsAPI):
         # process_results patch installed in lm_eval/evaluator.py. Cleared as
         # each doc is consumed so it never leaks across evaluation runs.
         self._avg_k_samples: Dict[Any, List[List[Tuple[float, bool]]]] = {}
+        # Parallel to `_avg_k_samples[doc_id]`: whether each of the k samples
+        # actually had a choice letter parsed out of it, so the avg@k patch
+        # can score unparseable generations at chance level instead of
+        # whatever placeholder index they were encoded with.
+        self._avg_k_parsed: Dict[Any, List[bool]] = {}
         if tokenizer is not None:
             self._chat_template_source = self.tokenizer.chat_template
             if not isinstance(self._chat_template_source, str) or not self._chat_template_source:
@@ -206,6 +216,16 @@ class RWKV7Remote(LocalCompletionsAPI):
         for position, request in enumerate(requests):
             groups[(request.task_name, request.doc_id)].append(position)
 
+        # Build every doc's rollout prompts up front and dispatch them as a
+        # single generate_until() call instead of one call per doc: all these
+        # instances share the same gen_kwargs, so the Collator's
+        # group_by="gen_kwargs" batches them together and get_batched_requests's
+        # asyncio.Semaphore(num_concurrent) actually parallelizes across docs
+        # (previously each doc's k-sample call ran in its own asyncio.run(),
+        # serializing the whole benchmark whenever k was small, e.g. k=1
+        # without avg@k).
+        doc_plans: List[dict] = []
+        pending_instances: List[Instance] = []
         for positions in groups.values():
             positions = sorted(positions, key=lambda p: requests[p].idx)
             group = [requests[p] for p in positions]
@@ -247,24 +267,94 @@ class RWKV7Remote(LocalCompletionsAPI):
             k = min(len(cg) for cg in choice_positions)
             letters = choice_letters(choices)
             prompt = build_choice_prompt(context, choices)
+            # The bare menu text has no User:/Assistant: framing, so an
+            # instruct-tuned RWKV model has no cue that it's its turn to
+            # speak -- it frequently either free-continues the passage or
+            # emits an immediate stop token (observed as ~50-100% empty
+            # generations for some model sizes). Wrap it through the same
+            # chat template used for real chat requests so the model gets
+            # the "Assistant: <think></think>" turn cue it was tuned on.
+            # (No tokenizer configured -- e.g. in unit tests -- means no
+            # chat template is available; fall back to the bare prompt.)
+            if self._chat_template_source is not None:
+                prompt = self.apply_chat_template([{"role": "user", "content": prompt}])
 
-            sample_encodings: List[List[Tuple[float, bool]]] = []
-            chosen_indices: List[int] = []
-            for _ in range(k):
-                index = self._resolve_choice(prompt, letters, choices)
-                chosen_indices.append(index)
-                sample_encodings.append(
-                    [
-                        (0.0, True) if choice_idx == index else (-1e6, False)
-                        for choice_idx in range(len(choices))
-                    ]
-                )
-            doc_id = group[0].doc_id
+            start = len(pending_instances)
+            pending_instances.extend(self._rollout_instances(prompt, k))
+            doc_plans.append(
+                {
+                    "doc_id": group[0].doc_id,
+                    "letters": letters,
+                    "choices": choices,
+                    "choice_positions": choice_positions,
+                    "k": k,
+                    "start": start,
+                }
+            )
+
+        generations = self.generate_until(pending_instances) if pending_instances else []
+
+        for plan in doc_plans:
+            doc_id = plan["doc_id"]
+            letters = plan["letters"]
+            choices = plan["choices"]
+            k = plan["k"]
+            doc_generations = generations[plan["start"] : plan["start"] + k]
+            raw_indices = [
+                parse_choice_index(str(generated), letters, choices)
+                for generated in doc_generations
+            ]
+            parsed_flags = [index >= 0 for index in raw_indices]
+            sample_encodings: List[List[Tuple[float, bool]]] = [
+                [
+                    (0.0, True) if choice_idx == (index if index >= 0 else 0) else (-1e6, False)
+                    for choice_idx in range(len(choices))
+                ]
+                for index in raw_indices
+            ]
             self._avg_k_samples[doc_id] = sample_encodings
+            self._avg_k_parsed[doc_id] = parsed_flags
 
-            majority_index = Counter(chosen_indices).most_common(1)[0][0]
-            for choice_idx, cg in enumerate(choice_positions):
-                outcome = (0.0, True) if choice_idx == majority_index else (-1e6, False)
+            valid_indices = [index for index in raw_indices if index >= 0]
+            if valid_indices:
+                majority_index = Counter(valid_indices).most_common(1)[0][0]
+            else:
+                majority_index = 0
+                eval_logger.warning(
+                    f"RWKV7Remote could not parse a choice letter from any of the "
+                    f"{k} sampled answers for doc {doc_id!r}; defaulting to option "
+                    f"{letters[0]!r}."
+                )
+            # Attach the real generation the majority vote actually came from
+            # (never a synthesized/averaged one) as evidence, so Scoreboard
+            # publication reflects the genuine prompt/completion instead of
+            # reconstructing a fake one from the score -- see
+            # RWKVLoglikelihoodResponse.
+            evidence_generation = next(
+                (
+                    generation
+                    for generation, index in zip(doc_generations, raw_indices)
+                    if index == majority_index
+                ),
+                doc_generations[0] if doc_generations else None,
+            )
+            for choice_idx, cg in enumerate(plan["choice_positions"]):
+                is_greedy = choice_idx == majority_index
+                loglikelihood = 0.0 if is_greedy else -1e6
+                if evidence_generation is not None:
+                    outcome = RWKVLoglikelihoodResponse(
+                        loglikelihood,
+                        is_greedy,
+                        prompt=prompt,
+                        raw_response=getattr(evidence_generation, "raw_response", None),
+                        finish_reason=getattr(evidence_generation, "finish_reason", None),
+                        output_token_ids=getattr(
+                            evidence_generation, "output_token_ids", None
+                        ),
+                        truncated=bool(getattr(evidence_generation, "truncated", False)),
+                    )
+                else:
+                    outcome = (loglikelihood, is_greedy)
                 for position in cg:
                     results[position] = outcome
 
@@ -279,23 +369,45 @@ class RWKV7Remote(LocalCompletionsAPI):
 
         return results
 
-    def _resolve_choice(self, prompt: str, letters: List[str], choices: List[str]) -> int:
+    @staticmethod
+    def _rollout_instances(prompt: str, k: int) -> List[Instance]:
+        """Build ``k`` independent generate_until instances for one doc's prompt.
+
+        Every doc's rollouts share this same ``gen_kwargs`` literal, so
+        ``loglikelihood()`` can hand every doc's instances to a single
+        ``generate_until`` call: the Collator's ``group_by="gen_kwargs"``
+        batches them all together and the ``num_concurrent`` asyncio
+        semaphore parallelizes across docs, not just within one doc's k
+        samples.
+        """
         gen_kwargs = {"until": [], "max_gen_toks": MAX_NEW_TOKENS}
-        instance = Instance(
-            request_type="generate_until",
-            doc={},
-            arguments=(prompt, gen_kwargs),
-            idx=0,
-        )
-        generated = str(self.generate_until([instance])[0])
-        index = parse_choice_index(generated, letters, choices)
-        if index < 0:
-            eval_logger.warning(
-                "RWKV7Remote could not parse a choice letter from the generated "
-                f"answer {generated.strip()!r}; defaulting to option {letters[0]!r}."
+        return [
+            Instance(
+                request_type="generate_until",
+                doc={},
+                arguments=(prompt, gen_kwargs),
+                idx=i,
             )
-            return 0
-        return index
+            for i in range(k)
+        ]
+
+    def _resolve_choices(
+        self, prompt: str, letters: List[str], choices: List[str], k: int
+    ) -> List[int]:
+        """Resolve ``k`` independent choice generations for one doc, standalone.
+
+        Returns the raw parsed index per rollout, which may be ``-1`` if no
+        choice letter could be extracted -- callers decide how to treat an
+        unparseable rollout (e.g. excluding it from a majority vote) rather
+        than this method silently guessing. ``loglikelihood()`` no longer
+        calls this itself (it batches every doc's rollouts into one
+        ``generate_until`` call instead); kept for any caller that needs a
+        single doc resolved on its own.
+        """
+        generations = self.generate_until(self._rollout_instances(prompt, k))
+        return [
+            parse_choice_index(str(generated), letters, choices) for generated in generations
+        ]
 
     def apply_chat_template(
         self,

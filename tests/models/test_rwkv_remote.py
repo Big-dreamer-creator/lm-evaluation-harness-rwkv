@@ -144,6 +144,10 @@ def test_rwkv7_remote_parse_generations_reports_finish_reason():
 
 
 def _mc_requests(context, choices, doc_id=0, repeats=1):
+    # Mirrors evaluator.py's `cloned_reqs = [req for req in reqs for _ in
+    # range(req.repeats)]`: avg@k's k is read off the actual number of
+    # cloned instances per choice, not off the `repeats` metadata value
+    # alone, so tests must clone here too.
     return [
         Instance(
             request_type="loglikelihood",
@@ -153,6 +157,7 @@ def _mc_requests(context, choices, doc_id=0, repeats=1):
             metadata=("some_task", doc_id, repeats),
         )
         for idx, choice in enumerate(choices)
+        for _ in range(repeats)
     ]
 
 
@@ -160,12 +165,11 @@ def test_rwkv7_remote_avg_at_k_samples_k_generations_via_generate_until(monkeypa
     monkeypatch.setenv("RWKV_API_KEY", "test-key")
     model = _build()
 
-    generated_answers = iter(["A", "B", "A", "A"])
     calls = []
 
     def fake_generate_until(instances):
-        calls.append(instances[0])
-        return [next(generated_answers)]
+        calls.append(instances)
+        return ["A", "B", "A", "A"]
 
     monkeypatch.setattr(model, "generate_until", fake_generate_until)
 
@@ -173,11 +177,13 @@ def test_rwkv7_remote_avg_at_k_samples_k_generations_via_generate_until(monkeypa
     results = model.loglikelihood(requests)
 
     # avg@k exercises real generation (not echo/logprobs), so the sampling
-    # profile in _create_payload actually applies -- one generate_until call
-    # per k-sample, each carrying the choice-lettered prompt.
-    assert len(calls) == 4
-    assert "A. one" in calls[0].args[0]
-    assert "B. two" in calls[0].args[0]
+    # profile in _create_payload actually applies -- all k samples for a doc
+    # are dispatched as one generate_until call (not k blocking calls) so
+    # the harness's existing concurrency parallelizes the rollouts.
+    assert len(calls) == 1
+    assert len(calls[0]) == 4
+    assert "A. one" in calls[0][0].args[0]
+    assert "B. two" in calls[0][0].args[0]
 
     # k=4 sample encodings recorded for the process_results avg@k patch,
     # one full per-choice (ll, is_greedy) list per independent generation.
@@ -185,10 +191,33 @@ def test_rwkv7_remote_avg_at_k_samples_k_generations_via_generate_until(monkeypa
     assert len(sample_encodings) == 4
     assert [enc[0][1] for enc in sample_encodings] == [True, False, True, True]
     assert [enc[1][1] for enc in sample_encodings] == [False, True, False, False]
+    assert model._avg_k_parsed[7] == [True, True, True, True]
 
     # The single (ll, is_greedy) list returned still encodes a majority-vote
     # winner (choice "A" won 3/4), so acc/acc_norm work without any patch.
-    assert results == [(0.0, True), (-1e6, False)]
+    # `requests` has 4 cloned instances per choice, so `results` mirrors that
+    # shape: 4 outcomes for choice "one" (the winner) then 4 for "two".
+    assert results == [(0.0, True)] * 4 + [(-1e6, False)] * 4
+
+
+def test_rwkv7_remote_avg_at_k_ignores_unparsed_rollouts_in_majority_vote(monkeypatch):
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build()
+
+    def fake_generate_until(instances):
+        # Only one of four rollouts names a valid letter; the rest can't be
+        # parsed into a choice at all.
+        return ["gibberish", "B", "gibberish", "gibberish"]
+
+    monkeypatch.setattr(model, "generate_until", fake_generate_until)
+
+    requests = _mc_requests("What is 1+1?", ["one", "two"], doc_id=9, repeats=4)
+    results = model.loglikelihood(requests)
+
+    # The majority vote is decided purely by the single valid rollout ("B"),
+    # not diluted/overruled by unparseable ones silently defaulting to A.
+    assert results == [(-1e6, False)] * 4 + [(0.0, True)] * 4
+    assert model._avg_k_parsed[9] == [False, True, False, False]
 
 
 def test_rwkv7_remote_avg_at_k_defaults_to_one_sample(monkeypatch):
@@ -202,3 +231,33 @@ def test_rwkv7_remote_avg_at_k_defaults_to_one_sample(monkeypatch):
 
     assert len(model._avg_k_samples[1]) == 1
     assert results == [(-1e6, False), (0.0, True)]
+
+
+def test_rwkv7_remote_loglikelihood_attaches_real_generation_as_evidence(monkeypatch):
+    """The Scoreboard-published assembled_prompt/raw_completion must come
+    from the real generative rollout, not be reconstructed from the score
+    (see RWKVLoglikelihoodResponse) -- k=1, the only mode currently used in
+    production, has exactly one real generation per doc, so this checks it
+    is threaded through unmodified."""
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build()
+
+    real_generation = RWKV7Remote.parse_generations(
+        {
+            "choices": [
+                {"index": 0, "text": "The answer is B.", "finish_reason": "stop"}
+            ]
+        }
+    )[0]
+    monkeypatch.setattr(model, "generate_until", lambda instances: [real_generation])
+
+    requests = _mc_requests("ctx", ["one", "two"], doc_id=1, repeats=1)
+    results = model.loglikelihood(requests)
+
+    assert results == [(-1e6, False), (0.0, True)]
+    for outcome in results:
+        assert outcome.raw_response is real_generation.raw_response
+        assert outcome.finish_reason == "stop"
+        assert "Answer with only the letter" in outcome.prompt
+        assert "A. one" in outcome.prompt
+        assert "B. two" in outcome.prompt

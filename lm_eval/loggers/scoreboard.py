@@ -277,7 +277,10 @@ def _sample(
                 mc_target_text if mc_target_text is not None else _text(row["target"])
             ),
             "extracted_answer": extracted_answer,
-            "assembled_prompt": _prompt_from_arguments(row.get("arguments")),
+            "assembled_prompt": (
+                first_evidence.get("prompt")
+                or _prompt_from_arguments(row.get("arguments"))
+            ),
             "raw_completion": raw_completion,
             "fail_reason": (
                 None

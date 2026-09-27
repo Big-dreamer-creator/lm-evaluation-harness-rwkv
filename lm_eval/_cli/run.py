@@ -468,6 +468,9 @@ class Run(SubCommand):
                 # [publication] section to republish an already-completed
                 # run's results would be treated as a brand new run.
                 "publication",
+                # Concurrency knob only, not part of what gets requested/
+                # computed -- must not change the run identity either.
+                "scheduler",
             ):
                 fingerprint_payload.pop(key, None)
             config_fingerprint = compute_config_fingerprint(fingerprint_payload)
@@ -477,6 +480,10 @@ class Run(SubCommand):
                 config_fingerprint=config_fingerprint,
                 fresh=bool(checkpoint_cfg.get("fresh", False)),
             )
+
+        scheduler_cfg = dict(cfg.scheduler or {})
+        max_concurrent_benchmarks_explicit = "max_concurrent_benchmarks" in scheduler_cfg
+        max_concurrent_benchmarks = scheduler_cfg.get("max_concurrent_benchmarks", 3)
 
         # Create task manager (metadata already set up in config validation)
         task_manager, benchmark_map = cfg.process_tasks(cfg.metadata)
@@ -531,6 +538,8 @@ class Run(SubCommand):
             task_callback=scoreboard_callback,
             checkpoint_store=checkpoint_store,
             benchmark_map=benchmark_map,
+            max_concurrent_benchmarks=max_concurrent_benchmarks,
+            max_concurrent_benchmarks_explicit=max_concurrent_benchmarks_explicit,
         )
 
         if checkpoint_store is not None:

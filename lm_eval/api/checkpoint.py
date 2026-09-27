@@ -20,6 +20,7 @@ Three distinct identities are used throughout this module and its callers:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -27,6 +28,7 @@ import os
 import sqlite3
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -100,6 +102,29 @@ def model_fingerprint(lm: Any) -> str:
 
 
 def serialize_response(response: Any) -> str:
+    # Checked ahead of the generic `isinstance(response, tuple)` branch below:
+    # `RWKVLoglikelihoodResponse` *is* a tuple (so every other consumer keeps
+    # unpacking/zipping it like a bare 2-tuple), but a plain `list(response)`
+    # would silently drop its raw_response/finish_reason evidence -- the same
+    # loss this type exists to prevent -- so it needs its own `kind` to round
+    # -trip that evidence across a checkpoint resume.
+    if isinstance(response, tuple) and (
+        getattr(response, "raw_response", None) is not None
+        or getattr(response, "finish_reason", None) is not None
+    ):
+        return json.dumps(
+            {
+                "kind": "rwkv_loglikelihood",
+                "value": list(response),
+                "prompt": getattr(response, "prompt", None),
+                "raw_response": response.raw_response,
+                "finish_reason": response.finish_reason,
+                "output_token_ids": getattr(response, "output_token_ids", None),
+                "truncated": bool(getattr(response, "truncated", False)),
+            },
+            default=str,
+            ensure_ascii=False,
+        )
     if isinstance(response, tuple):
         return json.dumps({"kind": "tuple", "value": list(response)}, default=str)
     if isinstance(response, str):
@@ -125,6 +150,19 @@ def deserialize_response(data: str) -> Any:
     kind = payload.get("kind")
     if kind == "tuple":
         return tuple(payload["value"])
+    if kind == "rwkv_loglikelihood":
+        from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
+
+        loglikelihood, is_greedy = payload["value"]
+        return RWKVLoglikelihoodResponse(
+            loglikelihood,
+            is_greedy,
+            prompt=payload.get("prompt"),
+            raw_response=payload.get("raw_response"),
+            finish_reason=payload.get("finish_reason"),
+            output_token_ids=payload.get("output_token_ids"),
+            truncated=bool(payload.get("truncated", False)),
+        )
     if kind == "rwkv_completion":
         from lm_eval.models.openai_completions import _RWKVCompletion
 
@@ -207,8 +245,10 @@ class CheckpointStore:
     beside. ``mark_items_completed_async`` is the one method meant to be
     awaited from inside a running asyncio event loop (the concurrent HTTP
     dispatch path in ``lm_eval/models/api_models.py``); it offloads the same
-    synchronous sqlite3 call via ``asyncio.to_thread`` so it can never block
-    the event loop driving concurrent requests.
+    synchronous sqlite3 call to a dedicated executor (not asyncio's shared
+    default one -- see ``self._executor``) so it can never block the event
+    loop driving concurrent requests, nor queue behind unrelated
+    ``asyncio.to_thread`` callers under heavy concurrent-benchmark load.
     """
 
     def __init__(self, db_path: str, config_fingerprint: str, fresh: bool = False) -> None:
@@ -217,6 +257,18 @@ class CheckpointStore:
         if parent:
             os.makedirs(parent, exist_ok=True)
         self._lock = threading.Lock()
+        # All writes are serialized by `self._lock` anyway, so this doesn't
+        # need to be large -- just large enough that concurrent-benchmark
+        # runs (several `evaluate()` worker threads, each with its own
+        # `num_concurrent` HTTP requests, all potentially calling
+        # `mark_items_completed_async` at once) don't queue behind asyncio's
+        # small shared default executor (`min(32, cpu_count+4)`), which is
+        # also used by unrelated `asyncio.to_thread` callers elsewhere in the
+        # process.
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="checkpoint-store"
+        )
+        weakref.finalize(self, self._executor.shutdown, wait=False)
         self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
@@ -324,6 +376,15 @@ class CheckpointStore:
             for r in rows
         }
 
+    def count_completed(self, task_name: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM items "
+                "WHERE run_id=? AND task_name=? AND status='completed'",
+                (self.run_id, task_name),
+            ).fetchone()
+        return row[0] if row is not None else 0
+
     def register_pending_items(self, items: list[ItemKey]) -> None:
         if not items:
             return
@@ -377,11 +438,14 @@ class CheckpointStore:
     async def mark_items_completed_async(self, results: list[tuple[str, str]]) -> None:
         """Awaitable wrapper for use inside a running asyncio event loop.
 
-        Offloads the same synchronous sqlite3 write via ``asyncio.to_thread``
-        so the event loop driving concurrent HTTP dispatch is never blocked
-        by disk I/O.
+        Offloads the same synchronous sqlite3 write to ``self._executor``
+        (not ``asyncio.to_thread``'s shared default pool) so the event loop
+        driving concurrent HTTP dispatch is never blocked by disk I/O, and
+        this write never queues behind unrelated ``to_thread`` callers.
         """
-        await asyncio.to_thread(self.mark_items_completed, results)
+        await asyncio.wrap_future(
+            self._executor.submit(self.mark_items_completed, results)
+        )
 
     def mark_benchmark_completed(
         self,

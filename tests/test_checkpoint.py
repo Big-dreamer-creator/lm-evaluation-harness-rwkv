@@ -106,6 +106,28 @@ def test_register_pending_items_is_idempotent(tmp_path):
     store.close()
 
 
+def test_count_completed_matches_get_items(tmp_path):
+    store = _make_store(tmp_path)
+    keys = [_item_key(item_id=f"item-{i}", repeat_ord=i) for i in range(3)]
+    store.register_pending_items(keys)
+    assert store.count_completed("task") == 0
+
+    store.mark_items_completed(
+        [(keys[0].item_id, serialize_response("a")), (keys[1].item_id, serialize_response("b"))]
+    )
+
+    items = store.get_items("task")
+    expected = sum(1 for item in items.values() if item["status"] == "completed")
+    assert store.count_completed("task") == expected == 2
+    store.close()
+
+
+def test_count_completed_unknown_task_is_zero(tmp_path):
+    store = _make_store(tmp_path)
+    assert store.count_completed("nonexistent-task") == 0
+    store.close()
+
+
 def test_mark_benchmark_completed_and_publish_status(tmp_path):
     store = _make_store(tmp_path)
     store.start_benchmark("task", "task-fp")
@@ -158,6 +180,33 @@ def test_serialize_deserialize_rwkv_completion_roundtrip():
     assert restored == "generated text"
     assert restored.finish_reason == "stop"
     assert restored.raw_response == {"choices": [{"text": "generated text"}]}
+
+
+def test_serialize_deserialize_rwkv_loglikelihood_roundtrip():
+    from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
+
+    response = RWKVLoglikelihoodResponse(
+        0.0,
+        True,
+        prompt="ctx\n\nA. one\nB. two\n\nAnswer with only the letter of the correct option.",
+        raw_response={"choices": [{"text": "The answer is B."}]},
+        finish_reason="stop",
+        output_token_ids=[1, 2, 3],
+        truncated=False,
+    )
+    data = serialize_response(response)
+    restored = deserialize_response(data)
+
+    # Resuming from a checkpoint must not silently fall back to the fake,
+    # reconstructed-from-score prompt/completion: the real evidence has to
+    # survive the round trip exactly like a fresh run would produce it.
+    assert restored == (0.0, True)
+    assert isinstance(restored, tuple)
+    assert restored.prompt == response.prompt
+    assert restored.raw_response == {"choices": [{"text": "The answer is B."}]}
+    assert restored.finish_reason == "stop"
+    assert restored.output_token_ids == [1, 2, 3]
+    assert restored.truncated is False
 
 
 def test_compute_item_id_stable_and_distinguishes_repeat_ord():

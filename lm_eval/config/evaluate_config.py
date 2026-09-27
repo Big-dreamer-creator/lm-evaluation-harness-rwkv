@@ -104,10 +104,12 @@ VERSIONED_CONFIG_FIELDS = {
     "model_name",
     "num_concurrent",
     "output_dir",
+    "pool_manifest",
     "publication",
     "publish",
     "scoreboard",
     "rwkv_profile",
+    "scheduler",
     "samples",
     "schema_version",
     "seed",
@@ -116,9 +118,11 @@ VERSIONED_CONFIG_FIELDS = {
     "trust_remote_code",
     "use_cache",
 }
+# base_url and pool_manifest are mutually exclusive alternatives; exactly one
+# is required, so neither is in VERSIONED_REQUIRED_FIELDS -- see the dedicated
+# check in _normalize_versioned_config.
 VERSIONED_REQUIRED_FIELDS = {
     "backend",
-    "base_url",
     "benchmarks",
     "max_length",
     "model_name",
@@ -228,6 +232,15 @@ class EvaluatorConfig:
         default=False,
         metadata={
             "help": "CLI sugar for checkpoint.enabled = true (see [checkpoint])."
+        },
+    )
+    scheduler: dict = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Cross-benchmark concurrent scheduling settings: "
+                "{max_concurrent_benchmarks}. See [scheduler]."
+            )
         },
     )
 
@@ -478,7 +491,20 @@ class EvaluatorConfig:
         completion_path = (
             "/v1/chat/completions" if backend == "rwkv7-remote-chat" else "/v1/completions"
         )
-        base_url = cls._completion_url(config["base_url"], completion_path)
+        has_base_url = "base_url" in config
+        has_pool_manifest = "pool_manifest" in config
+        if has_base_url == has_pool_manifest:
+            raise ValueError(
+                "Exactly one of base_url or pool_manifest must be set"
+            )
+        base_url = None
+        pool_manifest = None
+        if has_base_url:
+            base_url = cls._completion_url(config["base_url"], completion_path)
+        else:
+            pool_manifest = cls._non_empty_string(
+                config["pool_manifest"], "pool_manifest"
+            )
         benchmarks = cls._string_list(config["benchmarks"], "benchmarks")
         output_dir = cls._non_empty_string(config["output_dir"], "output_dir")
         max_length = cls._positive_int(config["max_length"], "max_length")
@@ -578,10 +604,28 @@ class EvaluatorConfig:
             if checkpoint_value.get("dir") is not None:
                 cls._non_empty_string(checkpoint_value["dir"], "checkpoint.dir")
 
+        scheduler_value = config.get("scheduler")
+        if scheduler_value is None:
+            scheduler_value = {}
+        elif not isinstance(scheduler_value, dict):
+            raise TypeError("scheduler must be a table")
+        else:
+            unknown_scheduler = sorted(
+                set(scheduler_value) - {"max_concurrent_benchmarks"}
+            )
+            if unknown_scheduler:
+                raise ValueError(
+                    "Unknown scheduler fields: " + ", ".join(unknown_scheduler)
+                )
+            if "max_concurrent_benchmarks" in scheduler_value:
+                cls._positive_int(
+                    scheduler_value["max_concurrent_benchmarks"],
+                    "scheduler.max_concurrent_benchmarks",
+                )
+
         if backend in ("rwkv7-http", "rwkv7-remote-chat"):
             model_args = {
                 "model": model_name,
-                "base_url": base_url,
                 "rwkv_prompt_template": prompt_template,
                 "rwkv_generation_prompt": generation_prompt,
                 "num_concurrent": num_concurrent,
@@ -590,7 +634,6 @@ class EvaluatorConfig:
         else:
             model_args = {
                 "model": model_name,
-                "base_url": base_url,
                 "num_concurrent": num_concurrent,
                 "max_length": max_length,
                 "rwkv_prompt_template": prompt_template,
@@ -598,6 +641,10 @@ class EvaluatorConfig:
             }
             if tokenizer_name is not None:
                 model_args["tokenizer"] = tokenizer_name
+        if base_url is not None:
+            model_args["base_url"] = base_url
+        else:
+            model_args["pool_manifest"] = pool_manifest
 
         normalized: dict[str, Any] = {
             "model": backend,
@@ -619,6 +666,7 @@ class EvaluatorConfig:
             },
             "publication": publication,
             "checkpoint": checkpoint_value,
+            "scheduler": scheduler_value,
         }
         if "limit" in config:
             limit = config["limit"]

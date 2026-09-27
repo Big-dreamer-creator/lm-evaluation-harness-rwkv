@@ -14,7 +14,12 @@ from lm_eval.models.openai_completions import (
     _RWKVCompletion,
     _rwkv_sampling_config,
 )
-from lm_eval.models.rwkv_choice import build_choice_prompt, choice_letters, parse_choice_index
+from lm_eval.models.rwkv_choice import (
+    RWKVLoglikelihoodResponse,
+    build_choice_prompt,
+    choice_letters,
+    parse_choice_index,
+)
 from lm_eval.models.rwkv_remote import MAX_NEW_TOKENS, RWKV7Remote
 
 
@@ -74,6 +79,11 @@ class RWKV7RemoteChat(LocalChatCompletion):
         # process_results patch installed in lm_eval/evaluator.py. Cleared as
         # each doc is consumed so it never leaks across evaluation runs.
         self._avg_k_samples: Dict[Any, List[List[Tuple[float, bool]]]] = {}
+        # Parallel to `_avg_k_samples[doc_id]`: whether each of the k samples
+        # actually had a choice letter parsed out of it, so the avg@k patch
+        # can score unparseable generations at chance level instead of
+        # whatever placeholder index they were encoded with.
+        self._avg_k_parsed: Dict[Any, List[bool]] = {}
 
     @cached_property
     def api_key(self) -> str:
@@ -109,6 +119,16 @@ class RWKV7RemoteChat(LocalChatCompletion):
         for position, request in enumerate(requests):
             groups[(request.task_name, request.doc_id)].append(position)
 
+        # Build every doc's rollout prompts up front and dispatch them as a
+        # single generate_until() call instead of one call per doc: all these
+        # instances share the same gen_kwargs, so the Collator's
+        # group_by="gen_kwargs" batches them together and get_batched_requests's
+        # asyncio.Semaphore(num_concurrent) actually parallelizes across docs
+        # (previously each doc's k-sample call ran in its own asyncio.run(),
+        # serializing the whole benchmark whenever k was small, e.g. k=1
+        # without avg@k).
+        doc_plans: List[dict] = []
+        pending_instances: List[Instance] = []
         for positions in groups.values():
             positions = sorted(positions, key=lambda p: requests[p].idx)
             group = [requests[p] for p in positions]
@@ -151,23 +171,82 @@ class RWKV7RemoteChat(LocalChatCompletion):
             letters = choice_letters(choices)
             prompt = build_choice_prompt(context, choices)
 
-            sample_encodings: List[List[Tuple[float, bool]]] = []
-            chosen_indices: List[int] = []
-            for _ in range(k):
-                index = self._resolve_choice(prompt, letters, choices)
-                chosen_indices.append(index)
-                sample_encodings.append(
-                    [
-                        (0.0, True) if choice_idx == index else (-1e6, False)
-                        for choice_idx in range(len(choices))
-                    ]
-                )
-            doc_id = group[0].doc_id
-            self._avg_k_samples[doc_id] = sample_encodings
+            start = len(pending_instances)
+            pending_instances.extend(self._rollout_instances(prompt, k))
+            doc_plans.append(
+                {
+                    "doc_id": group[0].doc_id,
+                    "letters": letters,
+                    "choices": choices,
+                    "choice_positions": choice_positions,
+                    "k": k,
+                    "start": start,
+                }
+            )
 
-            majority_index = Counter(chosen_indices).most_common(1)[0][0]
-            for choice_idx, cg in enumerate(choice_positions):
-                outcome = (0.0, True) if choice_idx == majority_index else (-1e6, False)
+        generations = self.generate_until(pending_instances) if pending_instances else []
+
+        for plan in doc_plans:
+            doc_id = plan["doc_id"]
+            letters = plan["letters"]
+            choices = plan["choices"]
+            k = plan["k"]
+            doc_generations = generations[plan["start"] : plan["start"] + k]
+            raw_indices = [
+                parse_choice_index(str(generated), letters, choices)
+                for generated in doc_generations
+            ]
+            parsed_flags = [index >= 0 for index in raw_indices]
+            sample_encodings: List[List[Tuple[float, bool]]] = [
+                [
+                    (0.0, True) if choice_idx == (index if index >= 0 else 0) else (-1e6, False)
+                    for choice_idx in range(len(choices))
+                ]
+                for index in raw_indices
+            ]
+            self._avg_k_samples[doc_id] = sample_encodings
+            self._avg_k_parsed[doc_id] = parsed_flags
+
+            valid_indices = [index for index in raw_indices if index >= 0]
+            if valid_indices:
+                majority_index = Counter(valid_indices).most_common(1)[0][0]
+            else:
+                majority_index = 0
+                eval_logger.warning(
+                    f"RWKV7RemoteChat could not parse a choice letter from any of "
+                    f"the {k} sampled answers for doc {doc_id!r}; defaulting to "
+                    f"option {letters[0]!r}."
+                )
+            # Attach the real generation the majority vote actually came from
+            # (never a synthesized/averaged one) as evidence, so Scoreboard
+            # publication reflects the genuine prompt/completion instead of
+            # reconstructing a fake one from the score -- see
+            # RWKVLoglikelihoodResponse.
+            evidence_generation = next(
+                (
+                    generation
+                    for generation, index in zip(doc_generations, raw_indices)
+                    if index == majority_index
+                ),
+                doc_generations[0] if doc_generations else None,
+            )
+            for choice_idx, cg in enumerate(plan["choice_positions"]):
+                is_greedy = choice_idx == majority_index
+                loglikelihood = 0.0 if is_greedy else -1e6
+                if evidence_generation is not None:
+                    outcome = RWKVLoglikelihoodResponse(
+                        loglikelihood,
+                        is_greedy,
+                        prompt=prompt,
+                        raw_response=getattr(evidence_generation, "raw_response", None),
+                        finish_reason=getattr(evidence_generation, "finish_reason", None),
+                        output_token_ids=getattr(
+                            evidence_generation, "output_token_ids", None
+                        ),
+                        truncated=bool(getattr(evidence_generation, "truncated", False)),
+                    )
+                else:
+                    outcome = (loglikelihood, is_greedy)
                 for position in cg:
                     results[position] = outcome
 
@@ -182,7 +261,17 @@ class RWKV7RemoteChat(LocalChatCompletion):
 
         return results
 
-    def _resolve_choice(self, prompt: str, letters: List[str], choices: List[str]) -> int:
+    @staticmethod
+    def _rollout_instances(prompt: str, k: int) -> List[Instance]:
+        """Build ``k`` independent generate_until instances for one doc's prompt.
+
+        Every doc's rollouts share this same ``gen_kwargs`` literal, so
+        ``loglikelihood()`` can hand every doc's instances to a single
+        ``generate_until`` call: the Collator's ``group_by="gen_kwargs"``
+        batches them all together and the ``num_concurrent`` asyncio
+        semaphore parallelizes across docs, not just within one doc's k
+        samples.
+        """
         gen_kwargs = {"until": [], "max_gen_toks": MAX_NEW_TOKENS}
         # `generate_until` unwraps a `JsonChatStr` into the [{"role","content"}, ...]
         # list this class's `_create_payload` requires; a bare string (fine for the
@@ -190,29 +279,49 @@ class RWKV7RemoteChat(LocalChatCompletion):
         chat_prompt = JsonChatStr(
             json.dumps([{"role": "user", "content": prompt}], ensure_ascii=False)
         )
-        instance = Instance(
-            request_type="generate_until",
-            doc={},
-            arguments=(chat_prompt, gen_kwargs),
-            idx=0,
-        )
-        generated = str(self.generate_until([instance])[0])
-        index = parse_choice_index(generated, letters, choices)
-        if index < 0:
-            eval_logger.warning(
-                "RWKV7RemoteChat could not parse a choice letter from the generated "
-                f"answer {generated.strip()!r}; defaulting to option {letters[0]!r}."
+        return [
+            Instance(
+                request_type="generate_until",
+                doc={},
+                arguments=(chat_prompt, gen_kwargs),
+                idx=i,
             )
-            return 0
-        return index
+            for i in range(k)
+        ]
+
+    def _resolve_choices(
+        self, prompt: str, letters: List[str], choices: List[str], k: int
+    ) -> List[int]:
+        """Resolve ``k`` independent choice generations for one doc, standalone.
+
+        Returns the raw parsed index per rollout, which may be ``-1`` if no
+        choice letter could be extracted -- callers decide how to treat an
+        unparseable rollout rather than this method silently guessing.
+        ``loglikelihood()`` no longer calls this itself (it batches every
+        doc's rollouts into one ``generate_until`` call instead); kept for
+        any caller that needs a single doc resolved on its own.
+        """
+        generations = self.generate_until(self._rollout_instances(prompt, k))
+        return [
+            parse_choice_index(str(generated), letters, choices) for generated in generations
+        ]
 
     def _create_payload(
         self,
-        messages: List[Dict],
+        messages: Union[str, List[Dict]],
         generate=False,
         gen_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> dict:
+        # generate_until only produces a JsonChatStr (-> list[dict]) when the
+        # caller renders one via apply_chat_template/_resolve_choice; plain
+        # generate_until tasks with apply_chat_template=false hand create_message
+        # a bare string instead (see TemplateAPI.create_message). The server-side
+        # template needs a message list regardless, so wrap it as a single user
+        # turn ourselves rather than requiring every caller to opt into chat
+        # templating just to use this transport.
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
         payload = super()._create_payload(
             messages, generate=generate, gen_kwargs=gen_kwargs, **kwargs
         )

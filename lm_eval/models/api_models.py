@@ -5,6 +5,7 @@ import itertools
 import json
 import logging
 import os
+from contextlib import AsyncExitStack
 from functools import cached_property
 from typing import (
     TYPE_CHECKING,
@@ -24,7 +25,13 @@ from typing import (
 try:
     import requests
     from aiohttp import ClientSession, ClientTimeout, TCPConnector
-    from tenacity import RetryError, retry, stop_after_attempt, wait_exponential
+    from tenacity import (
+        RetryError,
+        retry,
+        retry_if_not_exception_type,
+        stop_after_attempt,
+        wait_exponential,
+    )
     from tqdm import tqdm
     from tqdm.asyncio import tqdm_asyncio
 except ModuleNotFoundError:
@@ -39,6 +46,16 @@ from lm_eval import utils
 from lm_eval.api.checkpoint import ItemKey, serialize_response
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
+from lm_eval.models.api_pool import (
+    ContextLengthExhausted,
+    PoolError,
+    PoolManifest,
+    ReplicaPool,
+    RETRYABLE_STATUS_CODES,
+    _normalize_replicas,
+    context_error_prompt_tokens,
+    shrink_max_tokens,
+)
 from lm_eval.models.utils import Collator, chunks, configure_pad_token
 
 
@@ -109,6 +126,29 @@ def create_image_prompt(
     return chat
 
 
+class _ContextExhaustedCompletion(str):
+    """Placeholder generation result for a request whose prompt tokens alone
+    leave no positive completion budget, even after shrinking max_tokens to
+    fit (see ``ContextLengthExhausted`` in ``lm_eval.models.api_pool``).
+
+    Duck-type compatible with ``openai_completions._RWKVCompletion`` (same
+    ``finish_reason``/``raw_response``/``truncated`` attributes), since
+    ``evaluator.py::response_evidence()`` only accesses them via ``getattr``
+    with defaults -- this lets that existing truncation-reporting path pick
+    it up without a circular import back into ``openai_completions``.
+    """
+
+    def __new__(cls):
+        value = super().__new__(cls, "")
+        value.finish_reason = "length"
+        value.raw_response = None
+        value.prompt_token_ids = None
+        value.output_token_ids = None
+        value.reasoning = None
+        value.truncated = True
+        return value
+
+
 class TemplateAPI(TemplateLM):
     MULTIMODAL = True
     _supports_checkpoint_items = True
@@ -118,6 +158,7 @@ class TemplateAPI(TemplateLM):
         model: str = None,
         pretrained: str = None,  # `model` takes precedence over `pretrained` when passed.
         base_url: str = None,
+        pool_manifest: Optional[str] = None,
         tokenizer: Optional[str] = None,
         # Loglikelihood tasks require a tokenizer to calculate context lengths,
         # however the requests can be sent as a string if the API doesn't support token inputs.
@@ -187,6 +228,22 @@ class TemplateAPI(TemplateLM):
                 "Concurrent requests are disabled. To enable concurrent requests, set `num_concurrent` > 1."
             )
         self._concurrent = int(num_concurrent)
+        self._pool: Optional[ReplicaPool] = None
+        if pool_manifest is not None:
+            if base_url is not None:
+                raise PoolError(
+                    "model_args: specify either `base_url` or `pool_manifest`, not both."
+                )
+            replicas = PoolManifest.read(pool_manifest)
+            self._pool = ReplicaPool(
+                _normalize_replicas(None, replicas, self._concurrent)
+            )
+            self.base_url = self._pool.first_base_url
+        elif base_url is not None:
+            self._pool = ReplicaPool(
+                _normalize_replicas(base_url, None, self._concurrent)
+            )
+            self.base_url = self._pool.first_base_url
         self.tokenizer_backend = (
             None if tokenizer_backend in ("None", "none") else tokenizer_backend
         )
@@ -457,6 +514,25 @@ class TemplateAPI(TemplateLM):
         elif self.tokenizer_backend == "remote":
             return self.tokenizer.batch_decode(tokens)
 
+    def _get_pool(self) -> ReplicaPool:
+        """Lazily build a single-replica pool off the current ``self.base_url``.
+
+        Some subclasses (e.g. ``AzureOpenaiChatCompletionsLM``) call
+        ``super().__init__()`` with no arguments and set ``self.base_url``
+        directly afterwards, bypassing the pool construction in
+        ``TemplateAPI.__init__``. This keeps ``model_call``/``amodel_call``
+        working for those subclasses without special-casing them.
+        """
+        if self._pool is None:
+            if not self.base_url:
+                raise PoolError(
+                    "No base_url or pool_manifest configured; cannot dispatch API requests."
+                )
+            self._pool = ReplicaPool(
+                _normalize_replicas(self.base_url, None, self._concurrent)
+            )
+        return self._pool
+
     def model_call(
         self,
         messages: Union[List[List[int]], List[str], List[JsonChatStr]],
@@ -469,26 +545,55 @@ class TemplateAPI(TemplateLM):
         # !!! Copy: shared dict for each request, need new object !!!
         gen_kwargs = copy.deepcopy(gen_kwargs)
         headers = {**self.header, **extra_headers} if extra_headers else self.header
+        payload = self._create_payload(
+            self.create_message(messages),
+            generate=generate,
+            gen_kwargs=gen_kwargs,
+            seed=self._seed,
+            eos=self.eos_string,
+            **kwargs,
+        )
+        pool = self._get_pool()
         try:
-            response = requests.post(
-                self.base_url,
-                json=self._create_payload(
-                    self.create_message(messages),
-                    generate=generate,
-                    gen_kwargs=gen_kwargs,
-                    seed=self._seed,
-                    eos=self.eos_string,
-                    **kwargs,
-                ),
-                headers=headers,
-                verify=self.verify_certificate,
-            )
-            if not response.ok:
-                eval_logger.warning(
-                    f"API request failed with error message: {response.text}. Retrying..."
-                )
-            response.raise_for_status()
-            return response.json()
+            excluded: set = set()
+            while len(excluded) < len(pool.replicas):
+                index = pool.pick_sync(excluded=frozenset(excluded))
+                try:
+                    while True:
+                        response = requests.post(
+                            pool.base_url_for(index),
+                            json=payload,
+                            headers=headers,
+                            verify=self.verify_certificate,
+                        )
+                        if response.ok:
+                            return response.json()
+                        eval_logger.warning(
+                            f"API request failed with error message: {response.text}. Retrying..."
+                        )
+                        prompt_tokens = context_error_prompt_tokens(
+                            response.status_code, response.text
+                        )
+                        if prompt_tokens is not None:
+                            adjusted = shrink_max_tokens(
+                                payload, self.max_length - prompt_tokens
+                            )
+                            if adjusted is not None:
+                                payload = adjusted
+                                continue
+                            raise ContextLengthExhausted(
+                                f"Prompt requires at least {prompt_tokens} input tokens, "
+                                f"leaving no positive completion budget within max_length={self.max_length}."
+                            )
+                        if response.status_code in RETRYABLE_STATUS_CODES:
+                            excluded.add(index)
+                            break
+                        raise PoolError(
+                            f"HTTP {response.status_code}: {response.text}"
+                        )
+                finally:
+                    pool.release(index)
+            raise PoolError("All replicas failed for this request.")
         except RetryError:
             eval_logger.error(
                 "API request failed after multiple retries. Please check the API status."
@@ -506,6 +611,7 @@ class TemplateAPI(TemplateLM):
         item_keys: Optional[List[Optional[ItemKey]]] = None,
         ctxlens: Optional[List[int]] = None,
         gen_kwargs: Optional[Dict] = None,
+        sessions: Optional[Dict[int, ClientSession]] = None,
         **kwargs,
     ) -> Union[List[str], List[Tuple[float, bool]], None]:
         # !!! Copy: shared dict for each request, need new object !!!
@@ -526,24 +632,59 @@ class TemplateAPI(TemplateLM):
             and item_keys[0] is not None
         ):
             extra_headers = {"Idempotency-Key": item_keys[0].idempotency_key}
+        request_headers = (
+            {**self.header, **extra_headers} if extra_headers else self.header
+        )
+        pool = self._get_pool()
+
+        def _session_for(index: int) -> ClientSession:
+            return sessions[index] if sessions is not None else session
+
         acquired = await sem.acquire()
         try:
-            async with session.post(
-                self.base_url,
-                json=payload,
-                headers=(
-                    {**self.header, **extra_headers} if extra_headers else self.header
-                ),
-            ) as response:
-                if not response.ok:
-                    error_text = await response.text()
-                    eval_logger.warning(
-                        f"API request failed! Status code: {response.status}, "
-                        f"Response text: {error_text}. Retrying..."
-                    )
-                # raising exception will retry the request
-                response.raise_for_status()
-                outputs = await response.json()
+            outputs = None
+            excluded: set = set()
+            while outputs is None:
+                if len(excluded) >= len(pool.replicas):
+                    raise PoolError("All replicas failed for this request.")
+                index = await pool.pick_async(excluded=frozenset(excluded))
+                try:
+                    while True:
+                        async with _session_for(index).post(
+                            pool.base_url_for(index),
+                            json=payload,
+                            headers=request_headers,
+                        ) as response:
+                            if response.ok:
+                                outputs = await response.json()
+                                break
+                            error_text = await response.text()
+                            eval_logger.warning(
+                                f"API request failed! Status code: {response.status}, "
+                                f"Response text: {error_text}. Retrying..."
+                            )
+                            prompt_tokens = context_error_prompt_tokens(
+                                response.status, error_text
+                            )
+                            if prompt_tokens is not None:
+                                adjusted = shrink_max_tokens(
+                                    payload, self.max_length - prompt_tokens
+                                )
+                                if adjusted is not None:
+                                    payload = adjusted
+                                    continue
+                                raise ContextLengthExhausted(
+                                    f"Prompt requires at least {prompt_tokens} input tokens, "
+                                    f"leaving no positive completion budget within max_length={self.max_length}."
+                                )
+                            if response.status in RETRYABLE_STATUS_CODES:
+                                excluded.add(index)
+                                break
+                            raise PoolError(
+                                f"HTTP {response.status}: {error_text}"
+                            )
+                finally:
+                    pool.release(index)
             tmp_answers = (
                 self.parse_generations(
                     outputs=outputs,
@@ -626,24 +767,36 @@ class TemplateAPI(TemplateLM):
     ) -> Union[List[List[str]], List[List[Tuple[float, bool]]]]:
         ctxlens = ctxlens if ctxlens else [None] * len(requests)
         item_keys = item_keys if item_keys else [None] * len(requests)
-        conn = TCPConnector(limit=self._concurrent, ssl=self.verify_certificate)
+        pool = self._get_pool()
         sem = asyncio.Semaphore(self._concurrent)
-        async with ClientSession(
-            connector=conn, timeout=ClientTimeout(total=self.timeout)
-        ) as session:
+        async with AsyncExitStack() as stack:
+            sessions: Dict[int, ClientSession] = {}
+            for index, replica in enumerate(pool.replicas):
+                conn = TCPConnector(
+                    limit=replica.max_concurrency, ssl=self.verify_certificate
+                )
+                sessions[index] = await stack.enter_async_context(
+                    ClientSession(
+                        connector=conn, timeout=ClientTimeout(total=self.timeout)
+                    )
+                )
             retry_: Callable[..., Awaitable[Any]] = retry(
                 stop=stop_after_attempt(self.max_retries),
                 wait=wait_exponential(multiplier=0.5, min=1, max=10),
                 reraise=True,
+                retry=retry_if_not_exception_type(ContextLengthExhausted),
                 before_sleep=lambda retry_state: eval_logger.info(
                     f"Retry attempt {retry_state.attempt_number}"
                 ),
             )(self.amodel_call)
-            # Create tasks for each batch of request
-            tasks = [
-                asyncio.create_task(
-                    retry_(
-                        session=session,
+
+            async def _guarded(
+                message: list, cache_key: list, ctxlen: list, item_key: list
+            ) -> list:
+                try:
+                    return await retry_(
+                        session=sessions[0],
+                        sessions=sessions,
                         sem=sem,
                         messages=message,
                         cache_keys=cache_key,
@@ -652,7 +805,33 @@ class TemplateAPI(TemplateLM):
                         ctxlens=ctxlen,
                         **kwargs,
                     )
-                )
+                except ContextLengthExhausted as e:
+                    eval_logger.warning(
+                        f"Context length exhausted for one batch; recording "
+                        f"placeholder result(s) instead of failing the run: {e}"
+                    )
+                    placeholder = (
+                        _ContextExhaustedCompletion() if generate else (0.0, False)
+                    )
+                    answers = [placeholder] * len(message)
+                    completed = [
+                        (key.item_id, serialize_response(res))
+                        for key, res in zip(item_key, answers)
+                        if key is not None
+                    ]
+                    if completed and self.checkpoint_store is not None:
+                        await self.checkpoint_store.mark_items_completed_async(
+                            completed
+                        )
+                    return answers
+
+            # Create tasks for each batch of request. `session` is kept for
+            # subclasses that override `amodel_call` with the old single-session
+            # signature (e.g. LiteLLMChatCompletion, which never dispatches
+            # HTTP itself and ignores it); `sessions` is the per-replica map
+            # the pool-aware base implementation actually uses.
+            tasks = [
+                asyncio.create_task(_guarded(message, cache_key, ctxlen, item_key))
                 for message, cache_key, ctxlen, item_key in zip(
                     chunks(requests, n=self._batch_size),
                     chunks(cache_keys, n=self._batch_size),
@@ -661,7 +840,22 @@ class TemplateAPI(TemplateLM):
                 )
             ]
 
-            return await tqdm_asyncio.gather(*tasks, desc="Requesting API")
+            try:
+                return await tqdm_asyncio.gather(*tasks, desc="Requesting API")
+            except BaseException:
+                # `gather()` raises on the first failing task but does not
+                # cancel the rest, which would otherwise keep running against
+                # the `ClientSession`s this `async with` block is about to
+                # close on unwind (-> ServerDisconnectedError/RuntimeError
+                # storms) and, worse, can leave them cancelled while blocked
+                # in `pool.pick_async()`, leaking pool capacity. Cancel and
+                # drain them here, while the sessions are still open, instead
+                # of leaving that to asyncio.run()'s teardown-time mass-cancel.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
 
     def _loglikelihood_tokens(self, requests, **kwargs) -> List[Tuple[float, bool]]:
         assert self.tokenizer is not None, (
@@ -700,11 +894,31 @@ class TemplateAPI(TemplateLM):
                     self.batch_loglikelihood_requests([chunk])
                 )
 
-                outputs = retry(
-                    stop=stop_after_attempt(self.max_retries),
-                    wait=wait_exponential(multiplier=0.5, min=1, max=10),
-                    reraise=True,
-                )(self.model_call)(messages=inputs, generate=False)
+                try:
+                    outputs = retry(
+                        stop=stop_after_attempt(self.max_retries),
+                        wait=wait_exponential(multiplier=0.5, min=1, max=10),
+                        reraise=True,
+                        retry=retry_if_not_exception_type(ContextLengthExhausted),
+                    )(self.model_call)(messages=inputs, generate=False)
+                except ContextLengthExhausted as e:
+                    eval_logger.warning(
+                        f"Context length exhausted for loglikelihood request; "
+                        f"recording as (0.0, False) instead of failing the run: {e}"
+                    )
+                    for cache_key, item_key in zip(cache_keys, item_keys):
+                        answer_ = (0.0, False)
+                        res.append(answer_)
+                        if cache_key is not None:
+                            self.cache_hook.add_partial(
+                                "loglikelihood", cache_key, answer_
+                            )
+                        if item_key is not None and self.checkpoint_store is not None:
+                            self.checkpoint_store.mark_items_completed(
+                                [(item_key.item_id, serialize_response(answer_))]
+                            )
+                        pbar.update(1)
+                    continue
                 if isinstance(outputs, dict):
                     outputs = [outputs]
                 for answer_, cache_key, item_key in zip(
@@ -826,20 +1040,29 @@ class TemplateAPI(TemplateLM):
                         )
 
                 req = encodings_list if self.tokenized_requests else contexts
-                outputs = retry(
-                    stop=stop_after_attempt(self.max_retries),
-                    wait=wait_exponential(multiplier=0.5, min=1, max=10),
-                    reraise=True,
-                )(self.model_call)(
-                    messages=req,
-                    generate=True,
-                    gen_kwargs=copy.deepcopy(all_gen_kwargs[0]),
-                )
-                for generated_text, context, item_key in zip(
-                    self.parse_generations(
+                try:
+                    outputs = retry(
+                        stop=stop_after_attempt(self.max_retries),
+                        wait=wait_exponential(multiplier=0.5, min=1, max=10),
+                        reraise=True,
+                        retry=retry_if_not_exception_type(ContextLengthExhausted),
+                    )(self.model_call)(
+                        messages=req,
+                        generate=True,
+                        gen_kwargs=copy.deepcopy(all_gen_kwargs[0]),
+                    )
+                    generations = self.parse_generations(
                         outputs=outputs,
                         contexts=contexts,
-                    ),
+                    )
+                except ContextLengthExhausted as e:
+                    eval_logger.warning(
+                        f"Context length exhausted for generate_until request; "
+                        f"recording empty completion(s) instead of failing the run: {e}"
+                    )
+                    generations = [_ContextExhaustedCompletion()] * len(contexts)
+                for generated_text, context, item_key in zip(
+                    generations,
                     contexts,
                     chunk_item_keys,
                 ):
