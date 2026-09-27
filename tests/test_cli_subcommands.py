@@ -1459,14 +1459,12 @@ token_env = "MY_PUBLICATION_TOKEN"
 control_timeout = 15.0
 retries = 4
 retry_delay = 0.5
-finalize = true
-model_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+cot_mode = "NoCoT"
 rerun_reason = "protocol correction"
-configured_benchmarks = ["race", "drop"]
-skipped_benchmarks = []
 
 [publication.tasks.race]
-history_only = true
+field = "knowledge"
+avg_k = 1
 """,
             encoding="utf-8",
         )
@@ -1477,18 +1475,13 @@ history_only = true
             "enabled": True,
             "base_url": "https://eval.rwkv.rs/test",
             "token_env": "MY_PUBLICATION_TOKEN",
-            "timeout": 3600.0,
             "control_timeout": 15.0,
             "retries": 4,
             "retry_delay": 0.5,
-            "finalize": True,
-            "model_sha256": "a" * 64,
+            "cot_mode": "NoCoT",
             "rerun_reason": "protocol correction",
-            "configured_benchmarks": ["race", "drop"],
-            "skipped_benchmarks": [],
-            "tasks": {"race": {"history_only": True}},
+            "tasks": {"race": {"field": "knowledge", "avg_k": 1}},
         }
-        assert loaded.model_args["record_evidence"] is True
 
     def test_versioned_config_requires_samples_for_publication(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
