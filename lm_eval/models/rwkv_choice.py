@@ -85,6 +85,7 @@ class RWKVLoglikelihoodResponse(tuple):
         finish_reason: Optional[str] = None,
         output_token_ids: Optional[List[int]] = None,
         truncated: bool = False,
+        unparsed: bool = False,
     ) -> "RWKVLoglikelihoodResponse":
         self = super().__new__(cls, (loglikelihood, is_greedy))
         self.prompt = prompt
@@ -92,6 +93,13 @@ class RWKVLoglikelihoodResponse(tuple):
         self.finish_reason = finish_reason
         self.output_token_ids = output_token_ids
         self.truncated = truncated
+        # True when none of the k sampled generations for this doc could be
+        # parsed into a choice letter, so `is_greedy` here is an arbitrary
+        # placeholder rather than a genuine reflection of what the model
+        # answered -- task-specific `process_results` should treat this doc
+        # as "no answer given" (excluded from scoring) rather than reading
+        # the placeholder choice as if the model had actually named it.
+        self.unparsed = unparsed
         return self
 
 
@@ -176,6 +184,14 @@ def parse_choice_index(generated: str, letters: List[str], choices: List[str]) -
     silently guessing.
     """
     text = generated.strip()
+    # RWKV chat completions occasionally lead with a bare ">" before the
+    # actual answer (e.g. ">A" instead of "A") -- lighteval-rwkv's own
+    # generative-answer extractor strips this same artifact
+    # (rwkv_eval/answer_extract/free_response.py) before parsing, so mirror
+    # that here rather than letting every regex tier below miss a
+    # single-token answer like ">A".
+    if text.startswith(">"):
+        text = text[1:].lstrip()
 
     # Chain-of-thought models may wrap their reasoning in <think>...</think>
     # before stating a final answer; parse the concluding segment first so an

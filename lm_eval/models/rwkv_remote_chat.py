@@ -208,14 +208,27 @@ class RWKV7RemoteChat(LocalChatCompletion):
             self._avg_k_parsed[doc_id] = parsed_flags
 
             valid_indices = [index for index in raw_indices if index >= 0]
+            doc_unparsed = not valid_indices
             if valid_indices:
                 majority_index = Counter(valid_indices).most_common(1)[0][0]
             else:
+                # None of the k samples could be parsed into a choice letter
+                # -- this is "no answer given", not "the model chose option
+                # A". Encoding it as a confident pick of the first choice
+                # would silently corrupt downstream metrics (e.g.
+                # discrim_eval's bias-diff aggregations) with a fake,
+                # systematically-biased answer. `majority_index` below is
+                # kept only as an arbitrary placeholder index to satisfy the
+                # (loglikelihood, is_greedy)-per-choice shape the
+                # `multiple_choice` pipeline expects; every outcome for this
+                # doc is tagged `unparsed=True` so task-specific
+                # `process_results` can recognize and exclude it instead of
+                # reading the placeholder as a genuine answer.
                 majority_index = 0
                 eval_logger.warning(
                     f"RWKV7RemoteChat could not parse a choice letter from any of "
-                    f"the {k} sampled answers for doc {doc_id!r}; defaulting to "
-                    f"option {letters[0]!r}."
+                    f"the {k} sampled answers for doc {doc_id!r}; marking this doc "
+                    f"unparsed rather than defaulting to a choice."
                 )
             # Attach the real generation the majority vote actually came from
             # (never a synthesized/averaged one) as evidence, so Scoreboard
@@ -244,9 +257,12 @@ class RWKV7RemoteChat(LocalChatCompletion):
                             evidence_generation, "output_token_ids", None
                         ),
                         truncated=bool(getattr(evidence_generation, "truncated", False)),
+                        unparsed=doc_unparsed,
                     )
                 else:
-                    outcome = (loglikelihood, is_greedy)
+                    outcome = RWKVLoglikelihoodResponse(
+                        loglikelihood, is_greedy, unparsed=doc_unparsed
+                    )
                 for position in cg:
                     results[position] = outcome
 

@@ -85,3 +85,8 @@ def test_falls_back_to_choice_text_substring_match():
 def test_returns_negative_one_when_nothing_can_be_parsed():
     text = "This is a completely unrelated response with no letters at all here."
     assert parse_choice_index(text, LETTERS, CHOICES) == -1
+
+
+def test_strips_leading_gt_artifact_before_parsing():
+    assert parse_choice_index(">A", LETTERS, CHOICES) == 0
+    assert parse_choice_index(">B", LETTERS, CHOICES) == 1

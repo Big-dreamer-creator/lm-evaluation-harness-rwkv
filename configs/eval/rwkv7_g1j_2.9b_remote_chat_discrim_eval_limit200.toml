@@ -1,0 +1,37 @@
+# RWKV7-g1j-2.9B remote-chat discrim_eval run against the hosted api.rwkv.rs
+# service, generative scoring via /v1/chat/completions (avg@k), publishing
+# to the local Scoreboard instance (scoreboard-rwkv).
+schema_version = 1
+backend = "rwkv7-remote-chat"
+
+model_name = "rwkv7-g1j-2.9b"
+base_url = "https://api.rwkv.rs/v1/chat/completions"
+benchmarks = ["discrim_eval"]
+output_dir = "results/rwkv7-g1j-2.9b-remote-chat-discrim-eval-limit200"
+
+max_length = 16384
+num_concurrent = 64
+limit = 200
+
+apply_chat_template = false
+fewshot_as_multiturn = false
+log_samples = true
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+
+[checkpoint]
+enabled = true
+
+[publication]
+enabled = true
+base_url = "http://127.0.0.1:7862"
+cot_mode = "FakeCoT"
+token_env = "SCOREBOARD_PUBLICATION_TOKEN"
+model_sha256 = "966f3420f833532aae3fb1fd6326533b08d43d23b7b03eaa2f0694a30b64a239"
+
+[publication.tasks.discrim_eval]
+field = "reasoning"
+avg_k = 1

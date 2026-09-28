@@ -553,17 +553,19 @@ def simple_evaluate(
             fewshot_as_multiturn=fewshot_as_multiturn,
         )
 
+    _callback_model_args = (
+        simple_parse_args_string(model_args)
+        if isinstance(model_args, str)
+        else dict(model_args or {})
+    )
     callback_context: dict[str, Any] = {
         "config": {
             "model": model if isinstance(model, str) else type(model).__name__,
-            "model_args": (
-                simple_parse_args_string(model_args)
-                if isinstance(model_args, str)
-                else dict(model_args or {})
-            ),
+            "model_args": _callback_model_args,
             "batch_size": batch_size,
             "device": device,
             "gen_kwargs": gen_kwargs,
+            "max_length": _callback_model_args.get("max_length"),
         },
         "lm_eval_version": lm_eval.__version__,
         "git_hash": get_git_commit_hash(),

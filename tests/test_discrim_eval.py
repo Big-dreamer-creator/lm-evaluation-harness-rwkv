@@ -1,5 +1,6 @@
 import datasets
 
+from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
 from lm_eval.tasks.discrim_eval.utils import (
     agg_age_bias_slope,
     agg_demographic_bias_diff,
@@ -26,6 +27,23 @@ def test_process_results_extracts_hard_choice_from_is_greedy():
 
     out = process_results(doc, _make_results(chose_yes=False))
     assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", 0)
+
+
+def test_process_results_returns_none_for_unparsed_generation():
+    # RWKV7Remote/RWKV7RemoteChat tag every choice's response
+    # `unparsed=True` when none of the k sampled generations could be
+    # parsed into a choice letter -- `is_greedy` here is an arbitrary
+    # placeholder (option A), not a real answer, so `process_results` must
+    # not read it as "chose yes".
+    doc = _make_doc("white", "male", 30.0, 0)
+    results = [
+        RWKVLoglikelihoodResponse(0.0, True, unparsed=True),
+        RWKVLoglikelihoodResponse(-1e6, False, unparsed=True),
+        RWKVLoglikelihoodResponse(-1e6, False, unparsed=True),
+        RWKVLoglikelihoodResponse(-1e6, False, unparsed=True),
+    ]
+    out = process_results(doc, results)
+    assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", None)
 
 
 def test_agg_demographic_bias_diff_recovers_injected_bias():
@@ -67,6 +85,18 @@ def test_agg_demographic_bias_diff_empty_input_is_zero():
     assert agg_demographic_bias_diff([]) == 0.0
 
 
+def test_agg_demographic_bias_diff_skips_unparsed_none_entries():
+    # An unparsed doc (chose_yes=None) must not be silently counted as
+    # "chose no" -- that would fabricate a fake bias signal from a
+    # generation the model's answer couldn't even be extracted from.
+    items = [
+        (("black", "male", 30.0, 0), "black_bias", 1),
+        (("black", "male", 30.0, 0), "black_bias", None),
+        (("white", "male", 30.0, 0), "black_bias", 0),
+    ]
+    assert agg_demographic_bias_diff(items) == 1.0
+
+
 def test_agg_age_bias_slope_recovers_positive_trend():
     items = [
         (("white", "male", 20.0, 0), "age_bias", 0),
@@ -79,6 +109,17 @@ def test_agg_age_bias_slope_recovers_positive_trend():
 
 def test_agg_age_bias_slope_empty_input_is_zero():
     assert agg_age_bias_slope([]) == 0.0
+
+
+def test_agg_age_bias_slope_skips_unparsed_none_entries():
+    items = [
+        (("white", "male", 20.0, 0), "age_bias", 0),
+        (("white", "male", 30.0, 0), "age_bias", None),
+        (("white", "male", 40.0, 0), "age_bias", 0),
+        (("white", "male", 60.0, 0), "age_bias", 1),
+        (("white", "male", 80.0, 0), "age_bias", 1),
+    ]
+    assert agg_age_bias_slope(items) > 0.0
 
 
 def test_agg_age_bias_slope_skips_degenerate_scenarios():

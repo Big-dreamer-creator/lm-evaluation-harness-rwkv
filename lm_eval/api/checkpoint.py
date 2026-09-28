@@ -111,6 +111,7 @@ def serialize_response(response: Any) -> str:
     if isinstance(response, tuple) and (
         getattr(response, "raw_response", None) is not None
         or getattr(response, "finish_reason", None) is not None
+        or getattr(response, "unparsed", False)
     ):
         return json.dumps(
             {
@@ -121,6 +122,7 @@ def serialize_response(response: Any) -> str:
                 "finish_reason": response.finish_reason,
                 "output_token_ids": getattr(response, "output_token_ids", None),
                 "truncated": bool(getattr(response, "truncated", False)),
+                "unparsed": bool(getattr(response, "unparsed", False)),
             },
             default=str,
             ensure_ascii=False,
@@ -162,6 +164,7 @@ def deserialize_response(data: str) -> Any:
             finish_reason=payload.get("finish_reason"),
             output_token_ids=payload.get("output_token_ids"),
             truncated=bool(payload.get("truncated", False)),
+            unparsed=bool(payload.get("unparsed", False)),
         )
     if kind == "rwkv_completion":
         from lm_eval.models.openai_completions import _RWKVCompletion

@@ -316,14 +316,21 @@ class RWKV7Remote(LocalCompletionsAPI):
             self._avg_k_parsed[doc_id] = parsed_flags
 
             valid_indices = [index for index in raw_indices if index >= 0]
+            doc_unparsed = not valid_indices
             if valid_indices:
                 majority_index = Counter(valid_indices).most_common(1)[0][0]
             else:
+                # See RWKV7RemoteChat.loglikelihood: no sample parsed means
+                # "no answer given", not "the model chose option A" --
+                # `majority_index` stays 0 only as a placeholder index, and
+                # every outcome below is tagged `unparsed=True` so
+                # task-specific `process_results` can exclude it instead of
+                # reading the placeholder as a genuine answer.
                 majority_index = 0
                 eval_logger.warning(
                     f"RWKV7Remote could not parse a choice letter from any of the "
-                    f"{k} sampled answers for doc {doc_id!r}; defaulting to option "
-                    f"{letters[0]!r}."
+                    f"{k} sampled answers for doc {doc_id!r}; marking this doc "
+                    f"unparsed rather than defaulting to a choice."
                 )
             # Attach the real generation the majority vote actually came from
             # (never a synthesized/averaged one) as evidence, so Scoreboard
@@ -352,9 +359,12 @@ class RWKV7Remote(LocalCompletionsAPI):
                             evidence_generation, "output_token_ids", None
                         ),
                         truncated=bool(getattr(evidence_generation, "truncated", False)),
+                        unparsed=doc_unparsed,
                     )
                 else:
-                    outcome = (loglikelihood, is_greedy)
+                    outcome = RWKVLoglikelihoodResponse(
+                        loglikelihood, is_greedy, unparsed=doc_unparsed
+                    )
                 for position in cg:
                     results[position] = outcome
 
