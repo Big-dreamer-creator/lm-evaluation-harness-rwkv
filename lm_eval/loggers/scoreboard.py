@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -16,6 +17,9 @@ from urllib.request import Request, urlopen
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+
+eval_logger = logging.getLogger(__name__)
 
 
 SOURCE = "lm-eval-harness"
@@ -37,6 +41,9 @@ PARAM_SIZES = {"1.5b", "2.9b", "7.2b", "13.3b"}
 # "<arch_version>-<data_version>-<param_size>[-...]", e.g.
 # "rwkv7-g1j-1.5b" or "rwkv7-g1i-1.5b-20260805-ctx16384".
 MODEL_NAME_PATTERN = re.compile(r"^([a-z0-9]+)-([a-z][0-9][a-z0-9]*)-([0-9.]+[a-z]+)(?:-.*)?$")
+# Weight releases name their context window, e.g.
+# "rwkv7-g1k-13.3b-20260930-ctx25600"; the run directory keeps that revision.
+WEIGHT_CTX_PATTERN = re.compile(r"ctx(\d+)")
 DEFAULT_MAX_GENERATED_TOKENS = 8192
 DEFAULT_SEED = 1234
 NEW_SAMPLING_FIELDS = {
@@ -89,8 +96,24 @@ def _task_policy(
     return policy if isinstance(policy, dict) else {}
 
 
-def _messages(arguments: Any, index: int = 0) -> list[dict[str, str]]:
+def _messages(
+    arguments: Any, index: int = 0, evidence_prompt: Any = None
+) -> list[dict[str, str]]:
     r"""The OpenAI-style chat messages actually sent for one request.
+
+    ``evidence_prompt`` -- when it's a non-empty string -- is
+    ``RWKVLoglikelihoodResponse.prompt`` surfaced via
+    ``response_evidence[0]["prompt"]``: the genuine prompt captured at the
+    moment the request was actually issued. It takes priority over anything
+    reconstructed from ``arguments`` because RWKV's avg@k generative
+    ``multiple_choice`` path (``rwkv_remote.py``/``rwkv_remote_chat.py``)
+    fills in the lettered `A./B./C.` options -- and, for the completions
+    backend, chat-template markup -- *after* the original loglikelihood
+    request's ``arguments`` was already captured, so ``arguments`` alone is
+    missing content the model genuinely saw (it's just the bare echo-style
+    context). Only a plain generate_until doc (no avg@k choice resolution)
+    leaves ``evidence_prompt`` unset, in which case this falls back to the
+    old reconstruction below.
 
     A chat request's `arg_0` is a `JsonChatStr` NamedTuple (see
     `lm_eval.models.api_models.JsonChatStr`), which round-trips through
@@ -100,6 +123,21 @@ def _messages(arguments: Any, index: int = 0) -> list[dict[str, str]]:
     that doesn't match that shape (a bare prompt string) falls back to a
     single synthesized user message.
     """
+    if isinstance(evidence_prompt, str) and evidence_prompt.strip():
+        try:
+            parsed = json.loads(evidence_prompt)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, list) and parsed and all(
+            isinstance(item, dict) and "role" in item and "content" in item
+            for item in parsed
+        ):
+            return [
+                {"role": str(item["role"]), "content": _text(item["content"])}
+                for item in parsed
+            ]
+        return [{"role": "user", "content": evidence_prompt}]
+
     entry = arguments.get(f"gen_args_{index}") if isinstance(arguments, dict) else None
     arg0 = entry.get("arg_0") if isinstance(entry, dict) else None
     if isinstance(arg0, list) and len(arg0) == 1 and isinstance(arg0[0], str):
@@ -118,6 +156,53 @@ def _messages(arguments: Any, index: int = 0) -> list[dict[str, str]]:
     return [{"role": "user", "content": _text(arg0)}]
 
 
+def _ground_truth(row: dict[str, Any], lettered: bool) -> str:
+    """The gold answer, in the same representation as ``answer``.
+
+    ``multiple_choice`` tasks store ``target`` as a raw numeric choice
+    index (lm-eval-harness's native gold format) -- but when the doc went
+    through RWKV's avg@k lettered-generation path, ``answer`` is a letter
+    (``A``/``B``/...), not an index (see ``_detail``'s ``parsed_answer``
+    handling). Showing "2" as ground truth next to "A" as the answer is
+    two different representations of the same thing, so here that index
+    is mapped into the identical letter space `choice_letters()` used to
+    build the answer: choice count comes from ``arguments``'s
+    ``gen_args_N`` entries, which are populated one per choice in the
+    same index order the RWKV backends iterate to assign letters.
+    """
+    target = row.get("target")
+    if not lettered:
+        return _text(target)
+    arguments = row.get("arguments") or {}
+    n_choices = sum(
+        1 for key in arguments if isinstance(key, str) and key.startswith("gen_args_")
+    )
+    try:
+        index = int(target)
+    except (TypeError, ValueError):
+        return _text(target)
+    if not (0 <= index < n_choices):
+        return _text(target)
+    return chr(ord("A") + index)
+
+
+def _extracted_answer(row: dict[str, Any]) -> str | None:
+    """The `filter_list` pipeline's extracted answer for this doc (e.g.
+    the "yes"/"no"/letter a `yes_no`/`albatross_mcq` filter resolves a
+    chain-of-thought completion down to), or ``None`` if the row carries
+    no `filtered_resps` at all. Mirrors the `results[0][0]` shape task
+    `process_results` functions read (one filtered string per repeat;
+    `[0]` is the first/only repeat for `repeats: 1` tasks).
+    """
+    filtered = row.get("filtered_resps")
+    if not isinstance(filtered, list) or not filtered:
+        return None
+    first = filtered[0]
+    if not isinstance(first, list) or not first:
+        return None
+    return _text(first[0])
+
+
 def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str, bool]:
     evidence = row.get("response_evidence") or []
     first_evidence = evidence[0] if evidence else {}
@@ -126,25 +211,74 @@ def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str,
     scalar_score = (
         score if isinstance(score, (int, float)) and not isinstance(score, bool) else None
     )
-    outcome = (
-        "failed"
-        if not raw_completion.strip()
-        else "passed"
-        if scalar_score == 1
-        else "wrong"
-        if scalar_score == 0
-        else "failed"
+    extracted = _extracted_answer(row)
+    # `extracted is None` means the task has no `filter_list` at all (not
+    # that filtering failed) -- the raw completion itself is already "the
+    # answer" there (see the `answer` field logic below), so judge
+    # usability from it directly rather than treating a legitimately
+    # unfiltered task as if nothing could be extracted.
+    has_usable_answer = (
+        bool(raw_completion.strip()) if extracted is None else extracted != "[invalid]"
     )
+    if not raw_completion.strip():
+        outcome = "failed"
+    elif scalar_score == 1:
+        outcome = "passed"
+    elif scalar_score == 0:
+        outcome = "wrong"
+    elif scalar_score is None:
+        # Some tasks (e.g. discrim_eval's bias metrics) score each doc with
+        # an aggregation input -- a tuple like `(demographics, bias_name,
+        # chose_yes)` -- rather than a binary correct/incorrect value: there
+        # is no "wrong answer" concept to apply (any yes/no is a legitimate
+        # answer; the benchmark measures the *distribution* across
+        # demographics, not per-doc correctness). Defaulting this case to
+        # "failed" (the prior behavior) mislabeled every successfully
+        # answered doc as a failure; the only real failure here is not
+        # getting a usable answer out of the completion at all.
+        outcome = "passed" if has_usable_answer else "failed"
+    else:
+        outcome = "failed"
     stop_reason = str(first_evidence.get("finish_reason") or "unknown")
     truncated = first_evidence.get("truncated") is True or stop_reason in {
         "length",
         "max_tokens",
         "model_length",
     }
+    messages = _messages(
+        row.get("arguments") or {}, evidence_prompt=first_evidence.get("prompt")
+    )
+    messages.append({"role": "assistant", "content": raw_completion})
+    # For RWKV's avg@k generative multiple_choice path, `filtered_resps`/
+    # `resps` hold a fabricated `(loglikelihood, is_greedy)` tuple rather
+    # than real model text -- `parsed_answer` (the choice letter
+    # `parse_choice_index()` actually extracted from the real generation,
+    # see RWKVLoglikelihoodResponse) is the genuine answer to surface here.
+    # A missing `parsed_answer` key means this doc wasn't scored through
+    # that path at all.
+    lettered = "parsed_answer" in first_evidence
+    if lettered:
+        answer = first_evidence.get("parsed_answer") or "-"
+    else:
+        # Plain `generate_until` tasks with a `filter_list` (e.g. the
+        # `yes_no`/`albatross_mcq` filters) reduce a long chain-of-thought
+        # completion down to the clean value actually used for scoring --
+        # that distilled value belongs here, not the raw, unfiltered
+        # completion the filter exists to cut through. Only fall back to
+        # the raw completion when no filter extracted anything (e.g. a
+        # task with no filter_list at all, where the full completion *is*
+        # the answer).
+        extracted = _extracted_answer(row)
+        if extracted is None:
+            answer = raw_completion
+        elif extracted == "[invalid]":
+            answer = "-"
+        else:
+            answer = extracted
     detail = {
-        "messages": _messages(row.get("arguments") or {}),
-        "answer": _text(row["filtered_resps"]),
-        "ground_truth": _text(row["target"]),
+        "messages": messages,
+        "answer": answer,
+        "ground_truth": _ground_truth(row, lettered),
         "is_passed": outcome == "passed",
     }
     return detail, outcome, truncated
@@ -181,7 +315,55 @@ def _details(
     return buckets, total, (truncated / total if total else 0.0)
 
 
+def _weight_ctx_len(
+    model_name: str, *artifact_paths: str | Path | None
+) -> int:
+    """Return the context window baked into the served weight release.
+
+    Scoreboard treats ``ctx_len`` as part of the model identity -- the window
+    the weight was trained/released with, e.g.
+    ``rwkv7-g1k-13.3b-20260930-ctx25600``. It is deliberately *not* the
+    evaluation's ``max_length``: that is only the harness-side truncation
+    budget, so evaluating one weight at a shorter ``max_length`` must not fork
+    it into a second model on the board.
+
+    The revision is read from ``model_name`` when it carries one, otherwise
+    from the run's artifact paths, which live under a run directory named
+    after the weight that was served.
+    """
+    sources: list[tuple[str, str]] = [(str(model_name), "model name")]
+    sources.extend(
+        (str(path), "artifact path")
+        for path in artifact_paths
+        if path is not None
+    )
+    found = [
+        (kind, int(match.group(1)))
+        for text, kind in sources
+        if (match := WEIGHT_CTX_PATTERN.search(text)) is not None
+    ]
+    if not found:
+        searched = ", ".join(f"{kind} {text!r}" for text, kind in sources)
+        raise ScoreboardError(
+            "cannot determine the served weight's context window (ctx_len): no "
+            f"'ctx<number>' token in {searched}. Name the weight revision in "
+            "model_name (e.g. 'rwkv7-g1k-13.3b-20260930-ctx25600'); the "
+            "evaluation's max_length is intentionally not used because ctx_len "
+            "identifies the weight."
+        )
+    ctx_len = found[0][1]
+    if any(value != ctx_len for _, value in found[1:]):
+        eval_logger.warning(
+            "weight context window disagrees across sources %s; using %d from the %s",
+            found,
+            ctx_len,
+            found[0][0],
+        )
+    return ctx_len
+
+
 def _rwkv_model(model_name: str, ctx_len: int) -> dict[str, Any]:
+    """Build the board's model identity from the served weight."""
     match = MODEL_NAME_PATTERN.match(model_name)
     if match is None:
         raise ScoreboardError(
@@ -389,7 +571,9 @@ def _build_leaf_score(
     benchmark_info = _benchmark_info(benchmark, counts["effective"], policy)
     score = {
         "benchmark_id": None,
-        "model": _rwkv_model(model_name, run_config["max_length"]),
+        "model": _rwkv_model(
+            model_name, _weight_ctx_len(model_name, samples_path)
+        ),
         "cot_mode": config.cot_mode,
         "sampling_config": _sampling_config(
             results, task_config, model_args, task_metadata
@@ -421,6 +605,14 @@ def build_score(
     leaf_artifact_paths: dict[str, dict[str, str]] = (
         results.get("leaf_artifact_paths") or {}
     )
+    # The run directory that holds these artifacts is named after the served
+    # weight, so it is the fallback source for the weight's context window.
+    artifact_hint_paths = [
+        value
+        for paths in leaf_artifact_paths.values()
+        for key in ("results", "samples")
+        if (value := paths.get(key))
+    ]
 
     if results.get("strategy") == "standalone":
         leaf_name = next(iter(leaf_artifact_paths))
@@ -494,7 +686,9 @@ def build_score(
     benchmark_info = _benchmark_info(benchmark_name, counts["effective"], policy)
     score = {
         "benchmark_id": None,
-        "model": _rwkv_model(model_name, run_config["max_length"]),
+        "model": _rwkv_model(
+            model_name, _weight_ctx_len(model_name, *artifact_hint_paths)
+        ),
         "cot_mode": config.cot_mode,
         "sampling_config": _sampling_config(results, {}, model_args, {}),
         "score": metrics[primary_metric],
@@ -577,16 +771,9 @@ class ScoreboardPublisher:
         except HTTPError as error:
             body = json.loads(error.read().decode("utf-8") or "{}")
             detail = body.get("detail")
-            if isinstance(detail, dict) and detail.get("code") == "duplicate_score":
-                return {
-                    "success": True,
-                    "message": "Score already uploaded (idempotent replay)",
-                    "score_id": detail.get("score_id"),
-                    "benchmark_id": score["benchmark_id"],
-                }
+            code = detail.get("code") if isinstance(detail, dict) else None
             if (
-                isinstance(detail, dict)
-                and detail.get("code") == "active_score_exists"
+                code in ("duplicate_score", "active_score_exists")
                 and self.config.rerun_reason is not None
                 and detail.get("score_id") is not None
             ):
@@ -596,6 +783,14 @@ class ScoreboardPublisher:
                     timeout=self.config.control_timeout,
                 )
                 return self._upload(score)
+            if code == "duplicate_score":
+                return {
+                    "success": True,
+                    "message": "Score already uploaded (idempotent replay)",
+                    "replayed": True,
+                    "score_id": detail.get("score_id"),
+                    "benchmark_id": score["benchmark_id"],
+                }
             raise ScoreboardError(
                 f"scoreboard POST /api/upload returned HTTP {error.code}: {detail}"
             ) from error

@@ -174,8 +174,13 @@ class Publish(SubCommand):
                     )
                     continue
                 receipt = publisher.publish(benchmark_info, score)
+                status = (
+                    "[replayed] idempotent replay, no new data uploaded"
+                    if receipt["score"].get("replayed")
+                    else "[published]"
+                )
                 print(
-                    f"[published] {benchmark_info['name']}: "
+                    f"{status} {benchmark_info['name']}: "
                     f"benchmark_id={receipt['benchmark_id']} score={score['score']}"
                 )
             except (

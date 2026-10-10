@@ -1,6 +1,7 @@
 import json
 import random
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
@@ -11,9 +12,11 @@ from lm_eval.loggers.scoreboard import (
     MAX_SAMPLES_PER_OUTCOME,
     PublicationConfig,
     ScoreboardError,
+    ScoreboardPublisher,
     _detail,
     _messages,
     _rwkv_model,
+    _weight_ctx_len,
     build_score,
 )
 from lm_eval.models.dummy import DummyLM
@@ -51,6 +54,10 @@ metadata:
 """
 
 _MODEL_NAME = "rwkv7-g1j-1.5b"
+# Scoreboard records the *weight's* context window as part of the model
+# identity, so run output lives under a directory named after the weight
+# release (see `_weight_ctx_len`). Keep this fixture dir conventions-complete.
+_RUN_DIR_NAME = "rwkv7-g1j-1.5b-20260101-ctx4096-remote-unit"
 _MODEL_ARGS = {
     "temperature": 0.7,
     "top_p": 1.0,
@@ -120,7 +127,7 @@ def _run_benchmark(
 
     random.seed(seed)
     lm = DummyLM()
-    evaluation_tracker = EvaluationTracker(output_path=str(tmp_path / "output"))
+    evaluation_tracker = EvaluationTracker(output_path=str(tmp_path / _RUN_DIR_NAME))
 
     captured: dict = {}
 
@@ -176,7 +183,8 @@ def test_standalone_benchmark_produces_score_with_real_metric(tmp_path):
     assert len(score["wrong_details"]) == 3
     assert score["passed_details"][0]["is_passed"] is True
     assert score["passed_details"][0]["messages"] == [
-        {"role": "user", "content": "What is 2+2?"}
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "lol"},
     ]
 
 
@@ -231,7 +239,7 @@ def test_publication_config_validates_cot_mode():
         )
 
 
-def test_rwkv_model_parses_name_and_uses_config_ctx_len():
+def test_rwkv_model_parses_name_with_explicit_ctx_len():
     assert _rwkv_model("rwkv7-g1j-1.5b", 4096) == {
         "arch_version": "rwkv7",
         "data_version": "G1j",
@@ -244,6 +252,43 @@ def test_rwkv_model_parses_name_and_uses_config_ctx_len():
         "param_size": "1.5b",
         "ctx_len": 16384,
     }
+
+
+def test_weight_ctx_len_reads_the_weight_revision_not_the_eval_budget():
+    """ctx_len identifies the weight, so it never comes from max_length.
+
+    Evaluating one weight at a shorter harness `max_length` must not fork it
+    into a second model on the board, so the revision is read from
+    ``model_name`` when present and otherwise from the run directory, which is
+    named after the served weight.
+    """
+    assert (
+        _weight_ctx_len(
+            "rwkv7-g1k-13.3b-20260930-ctx25600",
+            "results/rwkv7-g1k-13.3b-20260930-ctx25600-remote-x/task_artifacts/a/results.json",
+        )
+        == 25600
+    )
+    # model_name without a revision: fall back to the artifact path.
+    assert (
+        _weight_ctx_len(
+            "rwkv7-g1k-13.3b",
+            "results/rwkv7-g1k-13.3b-20260930-ctx25600-remote-x/task_artifacts/a/results.json",
+        )
+        == 25600
+    )
+    # A revision in the name wins over a directory that disagrees.
+    assert (
+        _weight_ctx_len(
+            "rwkv7-g1k-13.3b-20260930-ctx25600", "results/stale-ctx8192-remote/x/a.json"
+        )
+        == 25600
+    )
+
+
+def test_weight_ctx_len_refuses_unidentifiable_weight():
+    with pytest.raises(ScoreboardError, match="ctx<number>"):
+        _weight_ctx_len("rwkv7-g1j-1.5b", "output/a/results.json")
 
 
 def test_rwkv_model_rejects_unknown_shape():
@@ -266,10 +311,21 @@ def test_messages_falls_back_to_plain_string_prompt():
     assert _messages(arguments) == [{"role": "user", "content": "plain prompt text"}]
 
 
-def _generative_row(*, answer: str, target: str, evidence_text: str | None) -> dict:
+def _generative_row(
+    *,
+    answer: str,
+    target: str,
+    evidence_text: str | None,
+    filtered_answer: str | None = None,
+) -> dict:
+    # `filtered_resps` is one list of filtered strings (one per repeat) per
+    # document request -- [[answer]] mirrors the real on-disk shape for a
+    # single-repeat generate_until task (see samples_<task>_*.jsonl), not a
+    # flat [answer]. `filtered_answer` defaults to `answer` so existing
+    # callers that don't care about filtering behave as before.
     return {
         "arguments": {"gen_args_0": {"arg_0": "the prompt", "arg_1": {}}},
-        "filtered_resps": [answer],
+        "filtered_resps": [[filtered_answer if filtered_answer is not None else answer]],
         "resps": [[answer]],
         "target": target,
         "response_evidence": (
@@ -287,18 +343,107 @@ def test_detail_buckets_passed_wrong_and_failed():
     )
     assert passed_outcome == "passed"
     assert passed_detail["is_passed"] is True
+    assert passed_detail["messages"] == [
+        {"role": "user", "content": "the prompt"},
+        {"role": "assistant", "content": "4"},
+    ]
 
     wrong_detail, wrong_outcome, _ = _detail(
         _generative_row(answer="5", target="4", evidence_text="5"), "exact_match"
     )
     assert wrong_outcome == "wrong"
     assert wrong_detail["is_passed"] is False
+    assert wrong_detail["messages"][-1] == {"role": "assistant", "content": "5"}
 
     failed_detail, failed_outcome, _ = _detail(
         _generative_row(answer="", target="4", evidence_text=""), "exact_match"
     )
     assert failed_outcome == "failed"
     assert failed_detail["is_passed"] is False
+    assert failed_detail["messages"][-1] == {"role": "assistant", "content": ""}
+
+
+def test_detail_answer_uses_filtered_resps_not_raw_completion():
+    """A `filter_list` (e.g. `yes_no`/`albatross_mcq`) exists to reduce a
+    long chain-of-thought completion down to the clean value actually used
+    for scoring -- `answer` must show that distilled value, not the raw
+    completion the filter exists to cut through (the bug: Scoreboard was
+    showing the entire multi-KB reasoning dump as "the answer" for every
+    `generate_until` task that uses a filter).
+    """
+    row = _generative_row(
+        answer="C",
+        target="C",
+        evidence_text="<think>lots of reasoning...</think>C. the full option text",
+        filtered_answer="C",
+    )
+    detail, _outcome, _truncated = _detail(row, "exact_match")
+    assert detail["answer"] == "C"
+    assert detail["messages"][-1]["content"].startswith("<think>")
+
+
+def test_detail_answer_falls_back_to_dash_when_filter_could_not_extract():
+    """The `yes_no`/`albatross_mcq` filters' fallback sentinel
+    ("[invalid]") means no answer could be extracted at all -- that must
+    show as "-", not the literal sentinel string nor the raw completion.
+    """
+    row = _generative_row(
+        answer="whatever",
+        target="C",
+        evidence_text="rambling with no clear final answer",
+        filtered_answer="[invalid]",
+    )
+    detail, _outcome, _truncated = _detail(row, "exact_match")
+    assert detail["answer"] == "-"
+
+
+def test_detail_tuple_valued_metric_with_usable_answer_passes():
+    """Tasks like discrim_eval score each doc with an aggregation-input
+    tuple (`(demographics, bias_name, chose_yes)`), not a binary 0/1 --
+    there's no "wrong answer" concept there (any yes/no is legitimate), so
+    a doc with a real extracted answer must be "passed", not blanket
+    "failed" just because the metric value isn't a plain scalar.
+    """
+    row = _generative_row(
+        answer="yes",
+        target="yes",
+        evidence_text="<think>reasoning</think>yes",
+        filtered_answer="yes",
+    )
+    row["exact_match"] = [["black", "female", 30.0, 1], "black_bias", 1]
+    detail, outcome, _truncated = _detail(row, "exact_match")
+    assert outcome == "passed"
+    assert detail["is_passed"] is True
+    assert detail["answer"] == "yes"
+
+
+def test_detail_tuple_valued_metric_with_unparseable_answer_fails():
+    """Same tuple-valued metric shape, but the `yes_no` filter's fallback
+    sentinel means no answer could be extracted at all -- that is a real
+    failure, unlike every other doc that did get a usable answer.
+    """
+    row = _generative_row(
+        answer="rambling with no verdict",
+        target="yes",
+        evidence_text="rambling with no verdict",
+        filtered_answer="[invalid]",
+    )
+    row["exact_match"] = [["black", "female", 30.0, 1], "black_bias", None]
+    detail, outcome, _truncated = _detail(row, "exact_match")
+    assert outcome == "failed"
+    assert detail["is_passed"] is False
+    assert detail["answer"] == "-"
+
+
+def test_detail_answer_falls_back_to_raw_completion_without_filtered_resps():
+    """A task with no `filter_list` at all (just the implicit `take_first`
+    pass-through) has no meaningfully different filtered value -- the raw
+    completion is already the genuine answer there.
+    """
+    row = _generative_row(answer="4", target="4", evidence_text="4")
+    del row["filtered_resps"]
+    detail, _outcome, _truncated = _detail(row, "exact_match")
+    assert detail["answer"] == "4"
 
 
 def test_samples_cap_is_shared_across_leaves_of_one_benchmark(tmp_path):
@@ -331,3 +476,88 @@ def test_samples_cap_is_shared_across_leaves_of_one_benchmark(tmp_path):
 
     assert total_uploaded == MAX_SAMPLES_PER_OUTCOME
     assert shared_uploaded_counts["passed"] == MAX_SAMPLES_PER_OUTCOME
+
+
+def _http_error(code: str, score_id: int = 4) -> HTTPError:
+    import io
+
+    body = json.dumps({"detail": {"code": code, "score_id": score_id}}).encode()
+    error = HTTPError(
+        url="https://scoreboard.example/api/upload",
+        code=409,
+        msg="Conflict",
+        hdrs=None,
+        fp=io.BytesIO(body),
+    )
+    return error
+
+
+def _publisher(monkeypatch, rerun_reason: str | None) -> ScoreboardPublisher:
+    import dataclasses
+
+    monkeypatch.setenv("SCOREBOARD_PUBLICATION_TOKEN", "test-token")
+    config = dataclasses.replace(
+        _publish_config(), rerun_reason=rerun_reason, dry_run=False
+    )
+    return ScoreboardPublisher(config)
+
+
+def test_upload_duplicate_score_without_rerun_reason_is_idempotent_replay(
+    monkeypatch,
+):
+    """Without --rerun-reason, a duplicate_score conflict is a harmless
+    no-op replay of the existing score -- no expire, no retry.
+    """
+    publisher = _publisher(monkeypatch, rerun_reason=None)
+    monkeypatch.setattr(
+        "lm_eval.loggers.scoreboard.urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error("duplicate_score")),
+    )
+
+    receipt = publisher._upload({"benchmark_id": 1})
+
+    assert receipt["replayed"] is True
+    assert receipt["score_id"] == 4
+
+
+def test_upload_duplicate_score_with_rerun_reason_expires_and_reuploads(
+    monkeypatch,
+):
+    """With --rerun-reason set, a duplicate_score conflict must NOT be
+    silently replayed: the stale score is expired and the new payload
+    (e.g. containing a bugfix that doesn't change the numeric score) is
+    genuinely re-uploaded, not swallowed.
+    """
+    publisher = _publisher(monkeypatch, rerun_reason="fixed messages bug")
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request.full_url)
+        if request.full_url.endswith("/api/upload") and len(calls) == 1:
+            raise _http_error("duplicate_score")
+        if request.full_url.endswith("/api/expire"):
+            return _fake_response({"success": True})
+        return _fake_response({"success": True, "score_id": 99, "message": "ok"})
+
+    monkeypatch.setattr("lm_eval.loggers.scoreboard.urlopen", fake_urlopen)
+
+    receipt = publisher._upload({"benchmark_id": 1})
+
+    assert calls == [
+        "https://scoreboard.example/api/upload",
+        "https://scoreboard.example/api/expire",
+        "https://scoreboard.example/api/upload",
+    ]
+    assert receipt.get("replayed") is not True
+    assert receipt["score_id"] == 99
+
+
+def _fake_response(payload: dict):
+    import io
+    from contextlib import contextmanager
+
+    @contextmanager
+    def cm():
+        yield io.BytesIO(json.dumps(payload).encode())
+
+    return cm()
