@@ -388,7 +388,7 @@ wkv_mode = "fp32io16"
 
 ```bash
 uv run --no-sync python -m lm_eval run \
-  --config configs/eval/rwkv7_remote_scoreboard_demo.toml \
+  --config configs/eval/rwkv7_g1j_1.5b_remote_race_scoreboard_example.toml \
   --resume
 ```
 
