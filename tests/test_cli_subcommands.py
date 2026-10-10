@@ -949,6 +949,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["race", "drop"]
 output_dir = "results/formal"
 max_length = 16384
+max_num_seqs = 5
 
 [rwkv_profile]
 prompt_template = "assistant"
@@ -1001,6 +1002,7 @@ base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/rwkv7-g1i-1.5b-remote"
 max_length = 16384
+max_num_seqs = 5
 apply_chat_template = false
 fewshot_as_multiturn = false
 
@@ -1037,6 +1039,7 @@ base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/rwkv7-g1i-1.5b-remote"
 max_length = 16384
+max_num_seqs = 5
 apply_chat_template = false
 fewshot_as_multiturn = false
 tokenizer_name = "/opt/rwkv/tokenizers/rwkv7-g1i-1.5b"
@@ -1074,6 +1077,7 @@ base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/rwkv7-g1j-1.5b-remote"
 max_length = 16384
+max_num_seqs = 5
 apply_chat_template = false
 fewshot_as_multiturn = false
 tokenizer_name = "BBuf/rwkv-5-world-1b5"
@@ -1113,6 +1117,7 @@ base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/rwkv7-g1j-1.5b-remote"
 max_length = 16384
+max_num_seqs = 5
 apply_chat_template = false
 fewshot_as_multiturn = false
 trust_remote_code = true
@@ -1143,6 +1148,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/race"
 max_length = 16384
+max_num_seqs = 5
 tokenizer_name = "some/repo"
 
 [rwkv_profile]
@@ -1172,6 +1178,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/race"
 max_length = 16384
+max_num_seqs = 5
 
 [rwkv_profile]
 prompt_template = "assistant"
@@ -1210,6 +1217,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/race"
 max_length = 16384
+max_num_seqs = 5
 model_args = "deprecated"
 
 [rwkv_profile]
@@ -1222,6 +1230,134 @@ wkv_mode = "fp32io16"
 
         with pytest.raises(ValueError, match="Unknown versioned config fields"):
             EvaluatorConfig.load_config(config)
+
+    def test_versioned_config_derives_request_budget_from_max_num_seqs(self, tmp_path):
+        """The endpoint's declared capacity is the evaluator's request budget.
+
+        Mirrors lighteval-rwkv, where the model client is built with
+        ``concurrent_requests = sum(max_num_seqs)`` instead of a hand-tuned
+        request concurrency.
+        """
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1k-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/race"
+max_length = 16384
+max_num_seqs = 1024
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        cfg = EvaluatorConfig.from_config(config)
+
+        assert cfg.model_args["num_concurrent"] == 1024
+
+    def test_versioned_config_requires_max_num_seqs(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1k-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/race"
+max_length = 16384
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ValueError, match="Missing versioned config fields: max_num_seqs"
+        ):
+            EvaluatorConfig.from_config(config)
+
+    def test_versioned_config_requires_base_url(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1k-1.5b"
+benchmarks = ["race"]
+output_dir = "results/race"
+max_length = 16384
+max_num_seqs = 64
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ValueError, match="Missing versioned config fields: base_url"
+        ):
+            EvaluatorConfig.from_config(config)
+
+    @pytest.mark.parametrize(
+        "extra, unknown_field",
+        [
+            ("num_concurrent = 5\n", "num_concurrent"),
+            ('pool_manifest = "pools/rwkv7_pool.toml"\n', "pool_manifest"),
+            ("[scheduler]\nmax_concurrent_benchmarks = 2\n", "scheduler"),
+        ],
+    )
+    def test_versioned_config_rejects_manual_concurrency_knobs(
+        self, tmp_path, extra, unknown_field
+    ):
+        """Hand-tuned request concurrency and benchmark scheduling are gone."""
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1k-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/race"
+max_length = 16384
+max_num_seqs = 64
+"""
+            + extra
+            + """
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ValueError, match=f"Unknown versioned config fields: {unknown_field}"
+        ):
+            EvaluatorConfig.from_config(config)
 
     def test_versioned_config_rejects_duplicate_benchmarks(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
@@ -1236,6 +1372,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["race", "race"]
 output_dir = "results/race"
 max_length = 16384
+max_num_seqs = 5
 
 [rwkv_profile]
 prompt_template = "assistant"
@@ -1261,6 +1398,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["graphwalks"]
 output_dir = "results/graphwalks"
 max_length = 16384
+max_num_seqs = 5
 
 [rwkv_profile]
 prompt_template = "assistant"
@@ -1290,6 +1428,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["graphwalks"]
 output_dir = "results/graphwalks"
 max_length = 16384
+max_num_seqs = 5
 include_defaults = false
 include_path = ["lm_eval/tasks/graphwalks", "lm_eval/tasks/rwkv_adapter"]
 
@@ -1323,6 +1462,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["graphwalks"]
 output_dir = "results/graphwalks"
 max_length = 16384
+max_num_seqs = 5
 
 [rwkv_profile]
 prompt_template = "assistant"
@@ -1361,6 +1501,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["race", "drop", "xquad"]
 output_dir = "results/formal"
 max_length = 16384
+max_num_seqs = 5
 
 [rwkv_profile]
 prompt_template = "assistant"
@@ -1392,6 +1533,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/race"
 max_length = 16384
+max_num_seqs = 5
 {field} = "task-owned"
 
 [rwkv_profile]
@@ -1420,6 +1562,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/race"
 max_length = 16384
+max_num_seqs = 5
 
 [rwkv_profile]
 prompt_template = "assistant"
@@ -1446,6 +1589,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["race", "drop"]
 output_dir = "results/publication"
 max_length = 16384
+max_num_seqs = 5
 
 [rwkv_profile]
 prompt_template = "assistant"
@@ -1496,6 +1640,7 @@ base_url = "http://127.0.0.1:8000/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/publication"
 max_length = 16384
+max_num_seqs = 5
 log_samples = false
 
 [rwkv_profile]

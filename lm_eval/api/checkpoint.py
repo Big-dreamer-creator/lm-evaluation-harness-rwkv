@@ -118,11 +118,13 @@ def serialize_response(response: Any) -> str:
                 "kind": "rwkv_loglikelihood",
                 "value": list(response),
                 "prompt": getattr(response, "prompt", None),
+                "text": getattr(response, "text", None),
                 "raw_response": response.raw_response,
                 "finish_reason": response.finish_reason,
                 "output_token_ids": getattr(response, "output_token_ids", None),
                 "truncated": bool(getattr(response, "truncated", False)),
                 "unparsed": bool(getattr(response, "unparsed", False)),
+                "parsed_answer": getattr(response, "parsed_answer", None),
             },
             default=str,
             ensure_ascii=False,
@@ -160,11 +162,13 @@ def deserialize_response(data: str) -> Any:
             loglikelihood,
             is_greedy,
             prompt=payload.get("prompt"),
+            text=payload.get("text"),
             raw_response=payload.get("raw_response"),
             finish_reason=payload.get("finish_reason"),
             output_token_ids=payload.get("output_token_ids"),
             truncated=bool(payload.get("truncated", False)),
             unparsed=bool(payload.get("unparsed", False)),
+            parsed_answer=payload.get("parsed_answer"),
         )
     if kind == "rwkv_completion":
         from lm_eval.models.openai_completions import _RWKVCompletion
@@ -251,7 +255,7 @@ class CheckpointStore:
     synchronous sqlite3 call to a dedicated executor (not asyncio's shared
     default one -- see ``self._executor``) so it can never block the event
     loop driving concurrent requests, nor queue behind unrelated
-    ``asyncio.to_thread`` callers under heavy concurrent-benchmark load.
+    ``asyncio.to_thread`` callers.
     """
 
     def __init__(self, db_path: str, config_fingerprint: str, fresh: bool = False) -> None:
@@ -261,9 +265,8 @@ class CheckpointStore:
             os.makedirs(parent, exist_ok=True)
         self._lock = threading.Lock()
         # All writes are serialized by `self._lock` anyway, so this doesn't
-        # need to be large -- just large enough that concurrent-benchmark
-        # runs (several `evaluate()` worker threads, each with its own
-        # `num_concurrent` HTTP requests, all potentially calling
+        # need to be large -- just large enough that the `max_num_seqs`
+        # HTTP requests in flight (all potentially calling
         # `mark_items_completed_async` at once) don't queue behind asyncio's
         # small shared default executor (`min(32, cpu_count+4)`), which is
         # also used by unrelated `asyncio.to_thread` callers elsewhere in the

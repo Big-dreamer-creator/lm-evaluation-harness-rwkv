@@ -100,31 +100,30 @@ VERSIONED_CONFIG_FIELDS = {
     "limit",
     "log_samples",
     "max_length",
+    "max_num_seqs",
+    "max_retries",
     "model_overrides",
     "model_name",
-    "num_concurrent",
     "output_dir",
-    "pool_manifest",
     "publication",
     "publish",
     "scoreboard",
     "rwkv_profile",
-    "scheduler",
     "samples",
     "schema_version",
     "seed",
     "task_overrides",
+    "timeout",
     "tokenizer_name",
     "trust_remote_code",
     "use_cache",
 }
-# base_url and pool_manifest are mutually exclusive alternatives; exactly one
-# is required, so neither is in VERSIONED_REQUIRED_FIELDS -- see the dedicated
-# check in _normalize_versioned_config.
 VERSIONED_REQUIRED_FIELDS = {
     "backend",
+    "base_url",
     "benchmarks",
     "max_length",
+    "max_num_seqs",
     "model_name",
     "output_dir",
     "rwkv_profile",
@@ -232,15 +231,6 @@ class EvaluatorConfig:
         default=False,
         metadata={
             "help": "CLI sugar for checkpoint.enabled = true (see [checkpoint])."
-        },
-    )
-    scheduler: dict = field(
-        default_factory=dict,
-        metadata={
-            "help": (
-                "Cross-benchmark concurrent scheduling settings: "
-                "{max_concurrent_benchmarks}. See [scheduler]."
-            )
         },
     )
 
@@ -491,26 +481,26 @@ class EvaluatorConfig:
         completion_path = (
             "/v1/chat/completions" if backend == "rwkv7-remote-chat" else "/v1/completions"
         )
-        has_base_url = "base_url" in config
-        has_pool_manifest = "pool_manifest" in config
-        if has_base_url == has_pool_manifest:
-            raise ValueError(
-                "Exactly one of base_url or pool_manifest must be set"
-            )
-        base_url = None
-        pool_manifest = None
-        if has_base_url:
-            base_url = cls._completion_url(config["base_url"], completion_path)
-        else:
-            pool_manifest = cls._non_empty_string(
-                config["pool_manifest"], "pool_manifest"
-            )
+        base_url = cls._completion_url(config["base_url"], completion_path)
         benchmarks = cls._string_list(config["benchmarks"], "benchmarks")
         output_dir = cls._non_empty_string(config["output_dir"], "output_dir")
         max_length = cls._positive_int(config["max_length"], "max_length")
         batch_size = cls._positive_int(config.get("batch_size", 1), "batch_size")
-        num_concurrent = cls._positive_int(
-            config.get("num_concurrent", 5), "num_concurrent"
+        # The evaluator never hand-tunes its own request concurrency: the
+        # config declares what the inference endpoint can hold at once (the
+        # server's own --max-num-seqs), and the request budget is that declared
+        # capacity -- mirroring lighteval-rwkv, where the model client is built
+        # with concurrent_requests = sum(max_num_seqs).
+        max_num_seqs = cls._positive_int(config["max_num_seqs"], "max_num_seqs")
+        request_timeout = (
+            cls._positive_int(config["timeout"], "timeout")
+            if "timeout" in config
+            else None
+        )
+        request_max_retries = (
+            cls._positive_int(config["max_retries"], "max_retries")
+            if "max_retries" in config
+            else None
         )
 
         profile = config["rwkv_profile"]
@@ -604,47 +594,34 @@ class EvaluatorConfig:
             if checkpoint_value.get("dir") is not None:
                 cls._non_empty_string(checkpoint_value["dir"], "checkpoint.dir")
 
-        scheduler_value = config.get("scheduler")
-        if scheduler_value is None:
-            scheduler_value = {}
-        elif not isinstance(scheduler_value, dict):
-            raise TypeError("scheduler must be a table")
-        else:
-            unknown_scheduler = sorted(
-                set(scheduler_value) - {"max_concurrent_benchmarks"}
-            )
-            if unknown_scheduler:
-                raise ValueError(
-                    "Unknown scheduler fields: " + ", ".join(unknown_scheduler)
-                )
-            if "max_concurrent_benchmarks" in scheduler_value:
-                cls._positive_int(
-                    scheduler_value["max_concurrent_benchmarks"],
-                    "scheduler.max_concurrent_benchmarks",
-                )
-
         if backend in ("rwkv7-http", "rwkv7-remote-chat"):
             model_args = {
                 "model": model_name,
                 "rwkv_prompt_template": prompt_template,
                 "rwkv_generation_prompt": generation_prompt,
-                "num_concurrent": num_concurrent,
+                # Derived, not user-facing: see the max_num_seqs comment above.
+                "num_concurrent": max_num_seqs,
                 "max_length": max_length,
             }
         else:
             model_args = {
                 "model": model_name,
-                "num_concurrent": num_concurrent,
+                "num_concurrent": max_num_seqs,
                 "max_length": max_length,
                 "rwkv_prompt_template": prompt_template,
                 "rwkv_generation_prompt": generation_prompt,
             }
             if tokenizer_name is not None:
                 model_args["tokenizer"] = tokenizer_name
-        if base_url is not None:
-            model_args["base_url"] = base_url
-        else:
-            model_args["pool_manifest"] = pool_manifest
+        model_args["base_url"] = base_url
+        # HTTP robustness knobs. Like max_num_seqs they only change how
+        # requests are retried, not prompts, sampling or model identity, so
+        # they are excluded from the checkpoint fingerprint (see
+        # lm_eval/_cli/run.py) to keep an existing run resumable.
+        if request_timeout is not None:
+            model_args["timeout"] = request_timeout
+        if request_max_retries is not None:
+            model_args["max_retries"] = request_max_retries
 
         normalized: dict[str, Any] = {
             "model": backend,
@@ -666,7 +643,6 @@ class EvaluatorConfig:
             },
             "publication": publication,
             "checkpoint": checkpoint_value,
-            "scheduler": scheduler_value,
         }
         if "limit" in config:
             limit = config["limit"]

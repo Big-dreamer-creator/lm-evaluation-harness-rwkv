@@ -53,9 +53,11 @@ checkpoint size or revision, copy the preset and change `model_name`,
 `model_args` and result metadata from this public schema, removing duplicated
 model and profile fields. `rwkv_profile.wkv_mode` remains a declared server-side
 fact and must be checked against the vllm-rwkv startup log. The TOML owns the
-exact model version, endpoint, ordered benchmark selectors, RWKV profile,
-concurrency, and result location. The runner preserves the `benchmarks` array
-order. For `rwkv7-http`, these ordinary names are resolved through the
+exact model version, endpoint, benchmark selectors, served endpoint capacity
+(`max_num_seqs`), RWKV profile, and result location. The `benchmarks` array
+keeps its configured order as the stable tie-break, but benchmarks execute one
+at a time in ascending pending-rollout order (see
+`lm_eval/api/benchmark_scheduler.py`). For `rwkv7-http`, these ordinary names are resolved through the
 model-specific task adapter declared in the adapted task YAML; internal RWKV
 task names never appear in this file. Each benchmark YAML owns its prompt,
 answer extraction, metrics, stop conditions, and `max_gen_toks`. See the
@@ -81,11 +83,11 @@ arguments. Unknown fields fail before model or dataset initialization.
 | `backend` | string | required | Must be `"rwkv7-http"` |
 | `model_name` | string | required | Complete served RWKV7 version name |
 | `base_url` | string | required | HTTP(S) `/v1/completions` endpoint |
-| `benchmarks` | list | required | Unique public benchmark names in execution order |
+| `benchmarks` | list | required | Unique public benchmark names; configured order is the stable tie-break for the runtime ascending-pending-rollout order |
 | `output_dir` | string | required | Result directory |
 | `max_length` | int | required | Positive service context limit |
 | `batch_size` | int | `1` | lm-eval request batch size |
-| `num_concurrent` | int | `5` | HTTP request concurrency |
+| `max_num_seqs` | int | required | Served endpoint's own `--max-num-seqs`; the evaluator's flat request budget is derived from it (no hand-tuned request concurrency) |
 | `device` | string | `"cpu"` | Evaluation-side device |
 | `rwkv_profile` | table | required | Complete RWKV execution profile |
 | `rwkv_profile.prompt_template` | string | required | Official RWKV template mode |

@@ -454,6 +454,25 @@ class Run(SubCommand):
             db_path = os.path.join(checkpoint_dir, "run.sqlite3")
 
             fingerprint_payload = _asdict(cfg)
+            # HTTP request concurrency and the client-side timeout/retry policy
+            # are scheduling/resource knobs. They do not change prompts,
+            # sampling, or model identity, so changing them must remain
+            # compatible with an existing checkpoint run. `num_concurrent` is
+            # derived from the config's declared `max_num_seqs` (the endpoint's
+            # own inference capacity), so it is excluded here as well.
+            operational_model_args = ("num_concurrent", "timeout", "max_retries")
+            fingerprint_model_args = fingerprint_payload.get("model_args")
+            if isinstance(fingerprint_model_args, dict):
+                fingerprint_model_args = dict(fingerprint_model_args)
+                for key in operational_model_args:
+                    fingerprint_model_args.pop(key, None)
+                fingerprint_payload["model_args"] = fingerprint_model_args
+            fingerprint_metadata = fingerprint_payload.get("metadata")
+            if isinstance(fingerprint_metadata, dict):
+                fingerprint_metadata = dict(fingerprint_metadata)
+                for key in operational_model_args:
+                    fingerprint_metadata.pop(key, None)
+                fingerprint_payload["metadata"] = fingerprint_metadata
             for key in (
                 "config",
                 "checkpoint",
@@ -468,9 +487,6 @@ class Run(SubCommand):
                 # [publication] section to republish an already-completed
                 # run's results would be treated as a brand new run.
                 "publication",
-                # Concurrency knob only, not part of what gets requested/
-                # computed -- must not change the run identity either.
-                "scheduler",
             ):
                 fingerprint_payload.pop(key, None)
             config_fingerprint = compute_config_fingerprint(fingerprint_payload)
@@ -480,10 +496,6 @@ class Run(SubCommand):
                 config_fingerprint=config_fingerprint,
                 fresh=bool(checkpoint_cfg.get("fresh", False)),
             )
-
-        scheduler_cfg = dict(cfg.scheduler or {})
-        max_concurrent_benchmarks_explicit = "max_concurrent_benchmarks" in scheduler_cfg
-        max_concurrent_benchmarks = scheduler_cfg.get("max_concurrent_benchmarks", 3)
 
         # Create task manager (metadata already set up in config validation)
         task_manager, benchmark_map = cfg.process_tasks(cfg.metadata)
@@ -538,8 +550,6 @@ class Run(SubCommand):
             task_callback=scoreboard_callback,
             checkpoint_store=checkpoint_store,
             benchmark_map=benchmark_map,
-            max_concurrent_benchmarks=max_concurrent_benchmarks,
-            max_concurrent_benchmarks_explicit=max_concurrent_benchmarks_explicit,
         )
 
         if checkpoint_store is not None:

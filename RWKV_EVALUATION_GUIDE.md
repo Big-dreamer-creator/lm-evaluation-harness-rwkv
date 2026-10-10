@@ -146,7 +146,7 @@ output_dir = "results/<model-name>"
 
 max_length = <context-length>
 batch_size = 1
-num_concurrent = 5
+max_num_seqs = <served --max-num-seqs>
 device = "cpu"
 
 apply_chat_template = true
@@ -162,15 +162,20 @@ wkv_mode = "fp32io16"
 
 加载器会把这些字段转换为 lm-eval 的 `model`、`tasks`、`model_args`、
 `output_path` 和 `metadata`。`benchmarks` 数组只写普通 benchmark 名称，
-数组顺序就是运行顺序；这些名称本身就是原生 lm-eval-harness 的 task/group/tag
+数组顺序是配置顺序（运行顺序另见 10.4 节：基准按剩余 rollout 数从小到大
+顺序执行，配置顺序只作并列时的稳定次序）；这些名称本身就是原生
+lm-eval-harness 的 task/group/tag
 名称，由 `TaskManager` 直接解析，不存在额外的适配层。`model_name`、
 `rwkv_profile.generation_prompt`、`rwkv_profile.prompt_template` 同时生成执行参数
 和结果元数据，避免重复字段分叉；`rwkv_profile.wkv_mode` 只记录服务端模式，
 仍需与 vllm-rwkv 启动日志核对。
 未知字段、重复 benchmark、非法 URL、非正数并发或上下文长度会在连接模型前报错。
 
-`num_concurrent` 应略大于服务的有效推理并发量，使服务允许少量排队但不空载。
-显存不足时先降低服务端 `--max-num-seqs`，再同步降低评估端并发，不要通过缩短
+`max_num_seqs` 只声明推理端自身的并发容量（与服务端启动参数 `--max-num-seqs`
+同值），评估端不再单独手工填写请求并发数：请求并发预算直接取自该声明值，
+且 benchmark 严格一次只跑一个，预算不会被成倍放大（与 lighteval-rwkv 的
+`concurrent_requests = sum(max_num_seqs)` 一致）。显存不足时先降低服务端
+`--max-num-seqs`，再把这里的 `max_num_seqs` 改成同一个值，不要通过缩短
 权重版本名或混用结果目录来规避配置管理。
 
 ## 7. Prompt 与采样模式
@@ -294,7 +299,7 @@ wkv_mode = "fp32io16"
   （`wkv_mode`、`cot_mode`、`prompt_template`）作为审计记录，不会被发送给
   模型。
 - 该配置下 `rwkv7-remote` 的 `model_args` 只包含 `model`、`base_url`、
-  `num_concurrent`、`max_length`。
+  `max_length`，以及由 `max_num_seqs` 派生的 `num_concurrent`。
 - `config.truncation` 会输出真实的完成数/截断数/截断率（原理见第 9 节），
   不再是恒为 `null` 的占位值。
 
@@ -364,9 +369,18 @@ wkv_mode = "fp32io16"
 
 ### 10.4 并发与断点续跑（crash-safe resume）
 
-`num_concurrent` 控制并发请求数，调度层（`get_batched_requests` +
-`asyncio.Semaphore`）本身就是完成即调度、没有 batch barrier，因此把
-`num_concurrent` 调到评估端能承受的上限即可打满并发，不需要额外配置。
+并发策略与 lighteval-rwkv 保持一致，评估端只有两个概念：
+
+- **请求并发预算**：每个 endpoint 只声明自己的推理容量 `max_num_seqs`，
+  评估端的请求并发数直接取该值（单一扁平预算，见
+  `lm_eval/models/api_models.py` 的 `get_batched_requests`；调度层本身是
+  完成即调度、没有 batch barrier）。不再需要评估端手工填写 `num_concurrent`，
+  也没有多 replica 的动态容量调度。
+- **benchmark 顺序**：严格一次只跑一个 benchmark，顺序由
+  `lm_eval/api/benchmark_scheduler.py` 的 `order_benchmarks` 决定（移植
+  lighteval-rwkv 的 `_order_benchmarks`）：无需生成的 benchmark 在前，其余按
+  剩余 rollout 数从少到多，跑完一个才进入下一个。这样短 benchmark 会尽早
+  计分并上传看板，同时请求预算不会被并行 benchmark 成倍放大。
 
 针对长时间、多 benchmark 的 `rwkv7-remote` 跑批，仓库额外提供了 opt-in 的
 断点续跑机制，用于从网络抖动、远端 5xx 重试耗尽或进程被杀（`kill -9`）等

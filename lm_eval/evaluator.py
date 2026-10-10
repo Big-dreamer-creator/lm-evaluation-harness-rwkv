@@ -4,9 +4,7 @@ import itertools
 import json
 import logging
 import os
-import queue
 import random
-import threading
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, cast
@@ -17,9 +15,7 @@ import lm_eval.api.model
 import lm_eval.api.registry
 from lm_eval.api.benchmark import avg_at_k_plan
 from lm_eval.api.benchmark_scheduler import (
-    _benchmark_pending_rollouts,
-    admission_order,
-    resolve_max_concurrent_benchmarks,
+    order_benchmarks,
 )
 from lm_eval.api.checkpoint import (
     ItemKey,
@@ -272,8 +268,6 @@ def simple_evaluate(
     task_callback: Callable[..., Any] | None = None,
     checkpoint_store: CheckpointStore | None = None,
     benchmark_map: dict[str, BenchmarkSpec] | None = None,
-    max_concurrent_benchmarks: int = 3,
-    max_concurrent_benchmarks_explicit: bool = False,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -605,8 +599,6 @@ def simple_evaluate(
         evaluation_tracker=evaluation_tracker,
         checkpoint_store=checkpoint_store,
         benchmark_map=benchmark_map,
-        max_concurrent_benchmarks=max_concurrent_benchmarks,
-        max_concurrent_benchmarks_explicit=max_concurrent_benchmarks_explicit,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -678,8 +670,6 @@ def evaluate(
     evaluation_tracker: EvaluationTracker | None = None,
     checkpoint_store: CheckpointStore | None = None,
     benchmark_map: dict[str, BenchmarkSpec] | None = None,
-    max_concurrent_benchmarks: int = 3,
-    max_concurrent_benchmarks_explicit: bool = False,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -725,11 +715,8 @@ def evaluate(
         )
     if samples is not None:
         eval_logger.info(f"Evaluating examples for tasks {list(samples.keys())}")
-    # tracks all Instances/requests a model must generate output on.
-    requests = defaultdict(list)
     # stores the amount to pad out reqs per req. type so that
     # number of fwd passes per distributed rank is equal
-    padding_requests = defaultdict(int)
     task_padding_requests: dict[str, dict[str, int]] = {}
 
     # Initialize groups and tasks
@@ -830,10 +817,6 @@ def evaluate(
         )
         if write_out:
             print_writeout(task)
-        if task_callback is None and checkpoint_store is None:
-            for instance in task.instances:
-                requests[instance.request_type].append(instance)
-
         if lm.world_size > 1:
             import torch
 
@@ -850,7 +833,6 @@ def evaluate(
             # compute number of pseudo-batches to pad with (FSDP/DDP require even batches among ranks)
             numpad = max(gathered_item) - gathered_item[lm.rank]
             # todo: may not account for padding in cases like SquadV2 which has multiple req types
-            padding_requests[reqtype] += numpad
             task_padding_requests[task_name] = {reqtype: numpad}
 
     RANK = lm.rank
@@ -1220,103 +1202,37 @@ def evaluate(
             task_fingerprint=task_fingerprint,
         )
 
-    if task_callback is None and checkpoint_store is None:
-        run_requests(requests, padding_requests)
-        for (task_name, acc), task_limit in zip(
-            eval_results_acc.items(), limits, strict=True
-        ):
-            finish_benchmark(task_name, acc, task_limit)
-    else:
-        # Group leaf tasks into schedulable units: every leaf of a benchmark
-        # group runs (sequentially, within one worker thread) as a single
-        # unit so they still aggregate/publish together once all their
-        # leaves are done; a task that isn't part of any benchmark group is
-        # its own one-task unit. Insertion order here matches the original
-        # (pre-scheduler) task order.
-        schedule_units: dict[str, list[tuple[str, ResultAcc, int | None]]] = {}
-        for (task_name, acc), task_limit in zip(
-            eval_results_acc.items(), limits, strict=True
-        ):
-            bname = leaf_to_benchmark.get(task_name, task_name)
-            schedule_units.setdefault(bname, []).append((task_name, acc, task_limit))
+    # Group leaf tasks into schedulable units: every leaf of a benchmark group
+    # runs as one unit so they still aggregate/publish together once all their
+    # leaves are done; a task that isn't part of any benchmark group is its own
+    # one-task unit. Insertion order here matches the configured task order.
+    schedule_units: dict[str, list[tuple[str, ResultAcc, int | None]]] = {}
+    for (task_name, acc), task_limit in zip(
+        eval_results_acc.items(), limits, strict=True
+    ):
+        bname = leaf_to_benchmark.get(task_name, task_name)
+        schedule_units.setdefault(bname, []).append((task_name, acc, task_limit))
 
-        concurrency = resolve_max_concurrent_benchmarks(
-            requested=max_concurrent_benchmarks,
-            explicit=max_concurrent_benchmarks_explicit,
-            world_size=WORLD_SIZE,
-            warn=eval_logger.warning,
-        )
-
-        if concurrency <= 1:
-            # No extra threads, original strictly-sequential task order --
-            # this is both the world_size != 1 path and what users get back
-            # by explicitly setting max_concurrent_benchmarks = 1.
-            for bname in schedule_units:
-                for task_name, acc, task_limit in schedule_units[bname]:
-                    _run_one_task(task_name, acc, task_limit)
-                    finish_benchmark(task_name, acc, task_limit)
-        else:
-            pending_by_unit = {
-                bname: _benchmark_pending_rollouts(
-                    [(task_name, acc["task"]) for task_name, acc, _ in members],
-                    checkpoint_store,
-                )
+    # One benchmark at a time, in lighteval-rwkv's order: benchmarks that do
+    # not generate first, then fewest pending rollouts first, so short
+    # benchmarks publish early. Reordering is only safe when every rank sees
+    # the same instances -- distributed runs build per-rank request splits (see
+    # `build_all_requests` above), so they keep the configured order.
+    if WORLD_SIZE == 1:
+        ordered_benchmarks = order_benchmarks(
+            {
+                bname: [(task_name, acc["task"]) for task_name, acc, _ in members]
                 for bname, members in schedule_units.items()
-            }
-            pending_order = admission_order(pending_by_unit)
+            },
+            checkpoint_store,
+        )
+    else:
+        ordered_benchmarks = list(schedule_units)
 
-            scoring_queue: queue.Queue = queue.Queue()
-            stop_event = threading.Event()
-            active_threads: dict[str, threading.Thread] = {}
-            first_error: BaseException | None = None
-
-            def _run_benchmark_unit(bname: str) -> None:
-                try:
-                    for task_name, acc, task_limit in schedule_units[bname]:
-                        if stop_event.is_set():
-                            break
-                        _run_one_task(task_name, acc, task_limit)
-                    scoring_queue.put((bname, None))
-                except BaseException as exc:  # noqa: BLE001
-                    scoring_queue.put((bname, exc))
-
-            def _admit_next() -> None:
-                while (
-                    pending_order
-                    and not stop_event.is_set()
-                    and len(active_threads) < concurrency
-                ):
-                    bname = pending_order.pop(0)
-                    thread = threading.Thread(
-                        target=_run_benchmark_unit,
-                        args=(bname,),
-                        name=f"benchmark-{bname}",
-                    )
-                    active_threads[bname] = thread
-                    thread.start()
-
-            _admit_next()
-            while active_threads:
-                bname, error = scoring_queue.get()
-                thread = active_threads.pop(bname, None)
-                if thread is not None:
-                    thread.join()
-                if error is not None:
-                    if first_error is None:
-                        first_error = error
-                    stop_event.set()
-                    eval_logger.error(
-                        "Benchmark %s failed during concurrent scheduling: %s",
-                        bname,
-                        error,
-                    )
-                elif not stop_event.is_set():
-                    for task_name, acc, task_limit in schedule_units[bname]:
-                        finish_benchmark(task_name, acc, task_limit)
-                _admit_next()
-
-            if first_error is not None:
-                raise first_error
+    for bname in ordered_benchmarks:
+        for task_name, acc, task_limit in schedule_units[bname]:
+            _run_one_task(task_name, acc, task_limit)
+            finish_benchmark(task_name, acc, task_limit)
 
     if RANK == 0:
         res = _process_results(eval_results_acc, groups, bootstrap_iters)

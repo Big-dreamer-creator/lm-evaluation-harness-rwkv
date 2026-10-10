@@ -1,11 +1,18 @@
-"""Cross-benchmark "shortest-remaining-rollout-first" admission ordering.
+"""Benchmark execution order, mirroring lighteval-rwkv's ``_order_benchmarks``.
 
-Used by :func:`lm_eval.evaluator.evaluate` to decide which benchmark should
-be admitted next when more than one is allowed to run concurrently
-(``[scheduler] max_concurrent_benchmarks``): the benchmark with the fewest
-rollouts left to execute is admitted first, so short benchmarks finish (and
-publish to the scoreboard) promptly instead of being stuck behind one very
-large benchmark that happened to be listed first.
+lighteval-rwkv evaluates one benchmark at a time
+(``src/rwkv_eval/main.py``): the next benchmark starts only after the previous
+wave has been collected. Which benchmark goes first is decided by
+``_order_benchmarks`` -- benchmarks that do not need generation (no CoT) run
+before generative ones, and within each group the benchmark with the fewest
+samples runs first, so short benchmarks finish (and publish to the scoreboard)
+promptly instead of waiting behind one very large benchmark.
+
+This module holds that ordering rule and nothing else: there is no
+cross-benchmark concurrency left to schedule. The evaluator runs every
+benchmark strictly sequentially in the order returned by
+:func:`order_benchmarks`, which also keeps the endpoint's single flat request
+budget from being multiplied by concurrent benchmarks.
 
 A "benchmark" here is a scheduling unit: either every leaf task of a
 benchmark group (aggregated and published together), or a single standalone
@@ -16,7 +23,7 @@ which case it's looking at.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
@@ -24,7 +31,7 @@ if TYPE_CHECKING:
     from lm_eval.api.task import Task
 
 
-def _pending_rollouts_for_task(
+def pending_rollouts_for_task(
     task: "Task", task_name: str, checkpoint_store: "CheckpointStore | None"
 ) -> int:
     """Rollouts (repeated ``Instance`` draws) not yet completed for one task.
@@ -40,62 +47,43 @@ def _pending_rollouts_for_task(
     return max(total, 0)
 
 
-def _benchmark_pending_rollouts(
+def benchmark_pending_rollouts(
     members: list[tuple[str, "Task"]],
     checkpoint_store: "CheckpointStore | None",
 ) -> int:
     """Sum of pending rollouts across every task in one scheduling unit."""
     return sum(
-        _pending_rollouts_for_task(task, task_name, checkpoint_store)
+        pending_rollouts_for_task(task, task_name, checkpoint_store)
         for task_name, task in members
     )
 
 
-def admission_order(pending_by_benchmark: dict[str, int]) -> list[str]:
+def requires_generation(task: "Task") -> bool:
+    """Whether a task's leaves ask the model to generate, not just to score.
+
+    The harness analogue of lighteval-rwkv's ``requires_cot``: tasks whose
+    rollouts are ``generate_until`` requests (open-ended answers, CoT) run
+    after tasks that can be scored from fixed continuations.
+    """
+    return any(instance.request_type == "generate_until" for instance in task.instances)
+
+
+def order_benchmarks(
+    units: dict[str, list[tuple[str, "Task"]]],
+    checkpoint_store: "CheckpointStore | None" = None,
+) -> list[str]:
     """Benchmark names ordered by ascending pending-rollout count.
 
     Ties keep the original (insertion) order, since ``dict`` iteration order
     is preserved and :func:`sorted` is stable.
     """
-    return [name for name, _ in sorted(pending_by_benchmark.items(), key=lambda kv: kv[1])]
-
-
-def resolve_max_concurrent_benchmarks(
-    requested: int,
-    explicit: bool,
-    world_size: int,
-    warn: Any = None,
-) -> int:
-    """Reconcile the configured concurrency with a distributed ``world_size``.
-
-    Concurrent admission of multiple benchmarks relies on each benchmark's
-    ``run_requests``/``finish_benchmark`` calls issuing rank-synchronized
-    collectives (``lm.barrier()``, ``lm.gather_object()``) in the same order
-    across ranks; interleaving two benchmarks per-rank can't guarantee that,
-    so it's only safe when ``world_size == 1`` (always true for HTTP/API
-    backends, which is what this scheduler targets).
-
-    - Left at the default (``explicit=False``) with ``world_size != 1``:
-      silently downgrade to 1 and warn -- existing distributed runs that
-      never touched ``[scheduler]`` must keep working unchanged.
-    - Explicitly set to more than 1 with ``world_size != 1``: raise, since
-      the user asked for something that isn't supported.
-    """
-    if world_size == 1 or requested <= 1:
-        return requested
-    if not explicit:
-        if warn is not None:
-            warn(
-                "Detected a distributed run (world_size=%d): cross-benchmark "
-                "concurrent scheduling has been automatically disabled "
-                "(max_concurrent_benchmarks=1). Set [scheduler] "
-                "max_concurrent_benchmarks explicitly to silence this.",
-                world_size,
-            )
-        return 1
-    raise NotImplementedError(
-        f"[scheduler] max_concurrent_benchmarks={requested} is not supported "
-        f"together with a distributed run (world_size={world_size}); "
-        "concurrent benchmark admission cannot guarantee consistent "
-        "cross-rank barrier ordering. Set max_concurrent_benchmarks = 1."
-    )
+    return [
+        name
+        for name, _ in sorted(
+            units.items(),
+            key=lambda item: (
+                int(any(requires_generation(task) for _, task in item[1])),
+                benchmark_pending_rollouts(item[1], checkpoint_store),
+            ),
+        )
+    ]
