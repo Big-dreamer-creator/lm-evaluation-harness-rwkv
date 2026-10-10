@@ -233,6 +233,73 @@ def test_rwkv7_remote_avg_at_k_defaults_to_one_sample(monkeypatch):
     assert results == [(-1e6, False), (0.0, True)]
 
 
+# A minimal jinja template shaped like the real RWKV assistant-style chat
+# template: a fixed system preamble, User/Assistant turns, then a
+# generation-prompt cue appended independently of `messages`' content --
+# exactly like every real chat template's generation-prompt cue behaves.
+_ASSISTANT_STYLE_TEMPLATE = (
+    "System: You are RWKV, an AI assistant.\n\n"
+    "{% for message in messages %}"
+    "{% if message.role == 'user' %}User: {{ message.content }}\n\n"
+    "{% elif message.role == 'assistant' %}Assistant: {{ message.content }}\n\n"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}Assistant: "
+    "{% if rwkv_generation_prompt == 'open_think' %}<think"
+    "{% else %}<think></think{% endif %}"
+    "{% endif %}"
+)
+
+
+def test_rwkv7_remote_splices_choices_before_pretemplated_generation_cue(monkeypatch):
+    """When the harness applies the chat template itself (apply_chat_template =
+    true), `Instance.args[0]` arrives already ending in the model's turn-start
+    cue (e.g. "Assistant: <think"). Choice content must be spliced in *before*
+    that cue, and the prompt must be rendered exactly once -- not appended
+    after the cue, and not chat-templated a second time on top of itself."""
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token = "<eos>"
+        eos_token_id = 0
+        bos_token_id = 1
+        chat_template = _ASSISTANT_STYLE_TEMPLATE
+
+    with patch("transformers.AutoTokenizer.from_pretrained", return_value=FakeTokenizer()):
+        model = _build(tokenizer="some/repo", rwkv_generation_prompt="open_think")
+
+    question = "Which gas is most abundant in Earth's atmosphere?"
+    pretemplated_context = model.apply_chat_template(
+        [{"role": "user", "content": question}], add_generation_prompt=True
+    )
+    assert pretemplated_context.endswith("Assistant: <think")
+
+    captured = {}
+
+    def fake_generate_until(instances):
+        captured["prompt"] = instances[0].args[0]
+        return [">B"] * len(instances)
+
+    monkeypatch.setattr(model, "generate_until", fake_generate_until)
+
+    requests = _mc_requests(pretemplated_context, ["Oxygen", "Nitrogen"], doc_id=1)
+    model.loglikelihood(requests)
+
+    prompt = captured["prompt"]
+    # The cue is still the exact final thing in the prompt -- nothing landed
+    # after it, so the model's completion region is untouched.
+    assert prompt.endswith("Assistant: <think")
+    # The choice menu was inserted before the cue, inside the user turn.
+    assert prompt.index("A. Oxygen") < prompt.index("Assistant: <think")
+    assert prompt.index("B. Nitrogen") < prompt.index("Assistant: <think")
+    # Exactly one render pass: a second `apply_chat_template()` call on top
+    # of the already-templated context would nest a second "Assistant:"
+    # turn-start marker inside the outer one.
+    assert prompt.count("Assistant:") == 1
+    assert prompt.count("System:") == 1
+
+
 def test_rwkv7_remote_loglikelihood_attaches_real_generation_as_evidence(monkeypatch):
     """The Scoreboard-published assembled_prompt/raw_completion must come
     from the real generative rollout, not be reconstructed from the score

@@ -171,6 +171,34 @@ class RWKV7Remote(LocalCompletionsAPI):
             )
         return key
 
+    @cached_property
+    def _generation_prompt_cue(self) -> Optional[str]:
+        """The literal suffix ``apply_chat_template()`` appends when asked for a
+        generation prompt -- e.g. ``"\\n\\nAssistant: <think"`` for open_think --
+        derived empirically rather than hardcoded, since the real cue text
+        depends on ``rwkv_prompt_template``/``rwkv_generation_prompt`` and lives
+        in the tokenizer's own Jinja template, not in this file.
+
+        When the harness applies the chat template itself (``apply_chat_template
+        = true`` in the eval config), ``Instance.args[0]`` already IS the output
+        of ``apply_chat_template()`` -- a complete prompt ending in this cue,
+        ready for the model to continue directly from (e.g. from ``>`` in
+        open_think mode). That cue marks the boundary between "the real user
+        turn" and "the model's own completion": nothing may be appended after
+        it, only before it. ``loglikelihood()`` uses this to find that boundary
+        in an already-templated context so choice content can be spliced in
+        ahead of the cue instead of tacked on after it.
+        """
+        if self._chat_template_source is None:
+            return None
+        sentinel = "\x00RWKV_CUE_PROBE\x00"
+        probe = self.apply_chat_template(
+            [{"role": "user", "content": sentinel}], add_generation_prompt=True
+        )
+        if sentinel not in probe:
+            return None
+        return probe.split(sentinel, 1)[1]
+
     @property
     def tokenizer_name(self) -> str:
         if self._chat_template_sha256 is None:
@@ -266,21 +294,35 @@ class RWKV7Remote(LocalCompletionsAPI):
             choices = choice_texts
             k = min(len(cg) for cg in choice_positions)
             letters = choice_letters(choices)
-            prompt = build_choice_prompt(context, choices)
-            # The bare menu text has no User:/Assistant: framing, so an
-            # instruct-tuned RWKV model has no cue that it's its turn to
-            # speak -- it frequently either free-continues the passage or
-            # emits an immediate stop token (observed as ~50-100% empty
-            # generations for some model sizes). Wrap it through the same
-            # chat template used for real chat requests so the model gets
-            # the "Assistant: <think></think>" turn cue it was tuned on.
-            # (No tokenizer configured -- e.g. in unit tests -- means no
-            # chat template is available; fall back to the bare prompt.)
-            if self._chat_template_source is not None:
-                prompt = self.apply_chat_template([{"role": "user", "content": prompt}])
+            # `context` may already be the harness's own rendering of the
+            # chat template (whenever the eval config sets
+            # apply_chat_template=true, `fewshot_context()` calls this same
+            # class's `apply_chat_template()` before an Instance is ever
+            # built -- see `_generation_prompt_cue`'s docstring). In that
+            # case it already ends in the model's turn-start cue (e.g.
+            # "Assistant: <think"), and the choice content must be spliced
+            # in *before* that cue -- appending after it, or re-templating
+            # the whole thing again, both land content inside what is
+            # supposed to be the model's own completion.
+            cue = self._generation_prompt_cue
+            if cue and context.endswith(cue):
+                body = context[: -len(cue)]
+                send_prompt = build_choice_prompt(body, choices) + cue
+            else:
+                # `context` is bare, untemplated text (apply_chat_template
+                # was false at the harness level, or no tokenizer is
+                # configured at all): build the menu directly and, if a
+                # chat template is available, render it exactly once so the
+                # model still gets a real turn-start cue to answer from.
+                menu_prompt = build_choice_prompt(context, choices)
+                send_prompt = menu_prompt
+                if self._chat_template_source is not None:
+                    send_prompt = self.apply_chat_template(
+                        [{"role": "user", "content": menu_prompt}]
+                    )
 
             start = len(pending_instances)
-            pending_instances.extend(self._rollout_instances(prompt, k))
+            pending_instances.extend(self._rollout_instances(send_prompt, k))
             doc_plans.append(
                 {
                     "doc_id": group[0].doc_id,
@@ -289,6 +331,7 @@ class RWKV7Remote(LocalCompletionsAPI):
                     "choice_positions": choice_positions,
                     "k": k,
                     "start": start,
+                    "prompt": send_prompt,
                 }
             )
 
@@ -345,6 +388,7 @@ class RWKV7Remote(LocalCompletionsAPI):
                 ),
                 doc_generations[0] if doc_generations else None,
             )
+            parsed_answer = None if doc_unparsed else letters[majority_index]
             for choice_idx, cg in enumerate(plan["choice_positions"]):
                 is_greedy = choice_idx == majority_index
                 loglikelihood = 0.0 if is_greedy else -1e6
@@ -352,7 +396,8 @@ class RWKV7Remote(LocalCompletionsAPI):
                     outcome = RWKVLoglikelihoodResponse(
                         loglikelihood,
                         is_greedy,
-                        prompt=prompt,
+                        prompt=plan["prompt"],
+                        text=str(evidence_generation),
                         raw_response=getattr(evidence_generation, "raw_response", None),
                         finish_reason=getattr(evidence_generation, "finish_reason", None),
                         output_token_ids=getattr(
@@ -360,10 +405,14 @@ class RWKV7Remote(LocalCompletionsAPI):
                         ),
                         truncated=bool(getattr(evidence_generation, "truncated", False)),
                         unparsed=doc_unparsed,
+                        parsed_answer=parsed_answer,
                     )
                 else:
                     outcome = RWKVLoglikelihoodResponse(
-                        loglikelihood, is_greedy, unparsed=doc_unparsed
+                        loglikelihood,
+                        is_greedy,
+                        unparsed=doc_unparsed,
+                        parsed_answer=parsed_answer,
                     )
                 for position in cg:
                     results[position] = outcome

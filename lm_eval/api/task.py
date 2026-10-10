@@ -1559,6 +1559,20 @@ class ConfigurableTask(Task):
                 # TODO: this gets score of 0 on arc_challenge for pythia-70m. need to test that this works properly
                 exact_match = int(is_greedy[gold]) if gold != -100 else 0
 
+            if any(getattr(r, "unparsed", False) for r in results):
+                # None of the k generative samples could be parsed into a
+                # choice letter for this doc (see
+                # RWKVLoglikelihoodResponse.unparsed) -- `pred`/`is_greedy`
+                # above are backed by an arbitrary placeholder index, not a
+                # genuine answer. Score at the random-baseline rate instead
+                # of letting argmax silently credit/debit a choice the model
+                # never actually named.
+                random_baseline = 1.0 / len(choices)
+                acc = random_baseline
+                acc_norm = random_baseline
+                acc_bytes = random_baseline
+                exact_match = 0
+
             prob_norm = utils.softmax(lls)
 
             # TODO use keyword arguments to the metric?

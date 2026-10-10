@@ -918,18 +918,38 @@ def evaluate(
                 continue
             choice = next(iter(raw_response.get("choices") or []), {})
             message = choice.get("message") or {}
-            evidence.append(
-                {
-                    "text": choice.get("text") or message.get("content"),
-                    "prompt": getattr(response, "prompt", None),
-                    "tool_calls": message.get("tool_calls") or [],
-                    "finish_reason": getattr(response, "finish_reason", None)
-                    or choice.get("finish_reason"),
-                    "truncated": bool(getattr(response, "truncated", False)),
-                    "output_token_ids": getattr(response, "output_token_ids", None)
-                    or [],
-                }
-            )
+            # `raw_response` is the entire HTTP response body -- whenever more
+            # than one prompt was batched into that one call (batch_size > 1),
+            # its `choices` list holds every batched completion, not just this
+            # `response`'s own. Blindly reading `choices[0]` would then
+            # silently attribute a different request's completion to this one.
+            # `response` itself already carries its own, correctly-indexed
+            # text (`_RWKVCompletion` *is* that text as a `str`;
+            # `RWKVLoglikelihoodResponse.text` forwards it from the specific
+            # generation it was derived from) -- prefer that, and only fall
+            # back to re-deriving from `choice` for response types that don't
+            # carry it.
+            text = str(response) if isinstance(response, str) else getattr(response, "text", None)
+            if text is None:
+                text = choice.get("text") or message.get("content")
+            entry = {
+                "text": text,
+                "prompt": getattr(response, "prompt", None),
+                "tool_calls": message.get("tool_calls") or [],
+                "finish_reason": getattr(response, "finish_reason", None)
+                or choice.get("finish_reason"),
+                "truncated": bool(getattr(response, "truncated", False)),
+                "output_token_ids": getattr(response, "output_token_ids", None) or [],
+            }
+            # Only `RWKVLoglikelihoodResponse` (the avg@k generative
+            # multiple_choice path) sets `unparsed`/`parsed_answer` at all --
+            # a plain generate_until completion (`_RWKVCompletion`, a bare
+            # `str`) never does, so `hasattr` (not `getattr(..., default)`)
+            # is what actually tells the two cases apart.
+            if hasattr(response, "unparsed"):
+                entry["parsed_answer"] = getattr(response, "parsed_answer", None)
+                entry["unparsed"] = bool(response.unparsed)
+            evidence.append(entry)
         return evidence
 
     def finish_benchmark(

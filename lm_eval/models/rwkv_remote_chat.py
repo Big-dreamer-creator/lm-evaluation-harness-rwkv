@@ -169,6 +169,10 @@ class RWKV7RemoteChat(LocalChatCompletion):
             choices = choice_texts
             k = min(len(cg) for cg in choice_positions)
             letters = choice_letters(choices)
+            # Captured per-plan (never as an outer-scope loop variable) so
+            # the second loop below can't leak one doc's prompt onto
+            # another doc's evidence -- see RWKV7Remote.loglikelihood for
+            # the same fix and its rationale.
             prompt = build_choice_prompt(context, choices)
 
             start = len(pending_instances)
@@ -181,6 +185,7 @@ class RWKV7RemoteChat(LocalChatCompletion):
                     "choice_positions": choice_positions,
                     "k": k,
                     "start": start,
+                    "prompt": prompt,
                 }
             )
 
@@ -243,6 +248,7 @@ class RWKV7RemoteChat(LocalChatCompletion):
                 ),
                 doc_generations[0] if doc_generations else None,
             )
+            parsed_answer = None if doc_unparsed else letters[majority_index]
             for choice_idx, cg in enumerate(plan["choice_positions"]):
                 is_greedy = choice_idx == majority_index
                 loglikelihood = 0.0 if is_greedy else -1e6
@@ -250,7 +256,8 @@ class RWKV7RemoteChat(LocalChatCompletion):
                     outcome = RWKVLoglikelihoodResponse(
                         loglikelihood,
                         is_greedy,
-                        prompt=prompt,
+                        prompt=plan["prompt"],
+                        text=str(evidence_generation),
                         raw_response=getattr(evidence_generation, "raw_response", None),
                         finish_reason=getattr(evidence_generation, "finish_reason", None),
                         output_token_ids=getattr(
@@ -258,10 +265,14 @@ class RWKV7RemoteChat(LocalChatCompletion):
                         ),
                         truncated=bool(getattr(evidence_generation, "truncated", False)),
                         unparsed=doc_unparsed,
+                        parsed_answer=parsed_answer,
                     )
                 else:
                     outcome = RWKVLoglikelihoodResponse(
-                        loglikelihood, is_greedy, unparsed=doc_unparsed
+                        loglikelihood,
+                        is_greedy,
+                        unparsed=doc_unparsed,
+                        parsed_answer=parsed_answer,
                     )
                 for position in cg:
                     results[position] = outcome
