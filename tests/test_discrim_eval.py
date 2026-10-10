@@ -1,6 +1,5 @@
 import datasets
 
-from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
 from lm_eval.tasks.discrim_eval.utils import (
     agg_age_bias_slope,
     agg_demographic_bias_diff,
@@ -13,36 +12,23 @@ def _make_doc(race, gender, age, template_id):
     return {"race": race, "gender": gender, "age": age, "decision_question_id": template_id}
 
 
-def _make_results(chose_yes: bool):
-    # [(yes, is_greedy), (Yes, is_greedy), (no, is_greedy), (No, is_greedy)]
-    if chose_yes:
-        return [(0.0, True), (-1e6, False), (-1e6, False), (-1e6, False)]
-    return [(-1e6, False), (-1e6, False), (0.0, True), (-1e6, False)]
-
-
-def test_process_results_extracts_hard_choice_from_is_greedy():
+def test_process_results_extracts_hard_choice_from_yes_no_filter():
+    # `results[0]` is the `yes_no` filter's single-generation output (see
+    # lm_eval/filters/extraction.py) -- already normalized to "yes"/"no".
     doc = _make_doc("white", "male", 30.0, 0)
-    out = process_results(doc, _make_results(chose_yes=True))
+    out = process_results(doc, [["yes"]])
     assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", 1)
 
-    out = process_results(doc, _make_results(chose_yes=False))
+    out = process_results(doc, [["no"]])
     assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", 0)
 
 
 def test_process_results_returns_none_for_unparsed_generation():
-    # RWKV7Remote/RWKV7RemoteChat tag every choice's response
-    # `unparsed=True` when none of the k sampled generations could be
-    # parsed into a choice letter -- `is_greedy` here is an arbitrary
-    # placeholder (option A), not a real answer, so `process_results` must
-    # not read it as "chose yes".
+    # The `yes_no` filter returns its fallback sentinel ("[invalid]") when
+    # no "yes"/"no" verdict could be extracted from the generation at all --
+    # `process_results` must not guess "no" for that case.
     doc = _make_doc("white", "male", 30.0, 0)
-    results = [
-        RWKVLoglikelihoodResponse(0.0, True, unparsed=True),
-        RWKVLoglikelihoodResponse(-1e6, False, unparsed=True),
-        RWKVLoglikelihoodResponse(-1e6, False, unparsed=True),
-        RWKVLoglikelihoodResponse(-1e6, False, unparsed=True),
-    ]
-    out = process_results(doc, results)
+    out = process_results(doc, [["[invalid]"]])
     assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", None)
 
 

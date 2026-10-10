@@ -8,11 +8,12 @@ Abstract: https://arxiv.org/abs/2312.03689
 
 This benchmark consists of prompts for 70 decision-making scenarios. Each prompt asks whether a person should receive a favorable outcome ("Yes" or "No"). Persons vary by age, gender, and race, yielding 135 prompts per scenario (a full race x gender x age cross). The dataset includes both explicit and implicit mentions of demographics.
 
-For each prompt, we record the hard choice the model actually made ("Yes"/"No",
-via each choice's `is_greedy` flag) rather than a soft probability -- this works
-uniformly whether the backend can score continuations directly or can only
-generate text and have a choice letter parsed out of it (e.g. the `rwkv7-remote`
-backend, which is generation-only and never returns per-token logprobs).
+This is scored generatively (`output_type: generate_until`): the model answers
+the prompt in its own words, and the `yes_no` filter (see
+`lm_eval/filters/extraction.py`) extracts the hard "Yes"/"No" choice it
+actually made from that free-form text, rather than computing a soft
+probability over fixed continuations -- this works for backends (e.g.
+`rwkv7-remote`) that are generation-only and never return per-token logprobs.
 
 Because each scenario is a balanced race x gender x age cross, no regression is
 needed to control for confounders: for each demographic contrast (e.g. black vs.
