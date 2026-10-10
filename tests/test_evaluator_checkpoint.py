@@ -4,6 +4,7 @@ from lm_eval.api.checkpoint import (
     compute_config_fingerprint,
     compute_item_id,
     compute_request_fingerprint,
+    compute_task_fingerprint,
     serialize_response,
 )
 from lm_eval.api.instance import Instance
@@ -159,3 +160,79 @@ def test_content_change_invalidates_cached_item(tmp_path):
     assert len(dispatch_reqs) == 1
     assert dispatch_keys[0] is not None
     store.close()
+
+
+def _task_config(**operational):
+    """A dumped task config shaped like the real one: run metadata is merged in."""
+    return {
+        "task": "task",
+        "generation_kwargs": {"until": [], "max_gen_toks": 8},
+        "metadata": {
+            "model_name": "rwkv7-g1k-1.5b",
+            "cot_mode": "open_think",
+            "prompt_template": "assistant",
+            **operational,
+        },
+    }
+
+
+def test_scheduling_knobs_do_not_invalidate_completed_items(tmp_path):
+    """Resuming with a different concurrency/timeout/retry budget must restore.
+
+    Regression: the run id already ignored those knobs, but the task fingerprint
+    is computed from ``task.dump_config()``, which carries the run metadata --
+    so bumping the request concurrency (or the client timeout) on resume used to
+    flip every per-item fingerprint and re-run the whole benchmark.
+    """
+    store = _make_store(tmp_path)
+    reqs = [_instance(0, 0, ("ctx", "cont"))]
+
+    original = compute_task_fingerprint(
+        _task_config(num_concurrent=64, timeout=300, max_retries=3)
+    )
+    resumed = compute_task_fingerprint(
+        _task_config(num_concurrent=200, timeout=1800, max_retries=10)
+    )
+    assert resumed == original
+
+    item_id = compute_item_id("task", 0, 0, "loglikelihood", 0)
+    store.register_pending_items(
+        [
+            ItemKey(
+                item_id=item_id,
+                request_fingerprint=compute_request_fingerprint(
+                    item_id, reqs[0].args, original, "model-fp"
+                ),
+                idempotency_key="idem",
+                task_name="task",
+                doc_id=0,
+                instance_idx=0,
+                request_type="loglikelihood",
+                repeat_ord=0,
+            )
+        ]
+    )
+    store.mark_items_completed([(item_id, serialize_response((0.5, True)))])
+
+    dispatch_reqs, dispatch_keys = _build_checkpointed_dispatch(
+        store, "task", resumed, "model-fp", reqs, "loglikelihood"
+    )
+
+    assert dispatch_reqs == []
+    assert dispatch_keys == []
+    assert reqs[0].resps == [(0.5, True)]
+    store.close()
+
+
+def test_non_scheduling_change_still_invalidates_completed_items(tmp_path):
+    """Dropping the scheduling knobs must not blunt real content changes."""
+    base = _task_config(num_concurrent=200)
+    assert compute_task_fingerprint(base) != compute_task_fingerprint(
+        {**base, "generation_kwargs": {"until": [], "max_gen_toks": 16}}
+    )
+    assert compute_task_fingerprint(base) != compute_task_fingerprint(
+        {**base, "metadata": {**base["metadata"], "prompt_template": "bot"}}
+    )
+    assert compute_task_fingerprint(base) != compute_task_fingerprint(
+        {**base, "metadata": {**base["metadata"], "model_name": "rwkv7-g1k-2.9b"}}
+    )

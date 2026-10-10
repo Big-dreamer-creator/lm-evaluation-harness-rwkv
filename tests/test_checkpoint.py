@@ -8,8 +8,10 @@ from lm_eval.api.checkpoint import (
     compute_idempotency_key,
     compute_item_id,
     compute_request_fingerprint,
+    compute_task_fingerprint,
     deserialize_response,
     serialize_response,
+    without_operational_args,
 )
 
 
@@ -37,6 +39,52 @@ def test_fresh_db_starts_empty(tmp_path):
     assert store.get_benchmark("task") is None
     assert store.get_items("task") == {}
     store.close()
+
+
+def test_without_operational_args_drops_only_scheduling_knobs():
+    values = {
+        "model": "rwkv7-g1k-1.5b",
+        "num_concurrent": 200,
+        "timeout": 1800,
+        "max_retries": 10,
+        "max_length": 25600,
+    }
+
+    assert without_operational_args(values) == {
+        "model": "rwkv7-g1k-1.5b",
+        "max_length": 25600,
+    }
+    assert without_operational_args(None) == {}
+    assert without_operational_args({}) == {}
+
+
+def test_task_fingerprint_ignores_scheduling_knobs_at_any_level():
+    """Run metadata reaches the task config, so knobs must be dropped there too."""
+    metadata = {
+        "model_name": "rwkv7-g1k-1.5b",
+        "prompt_template": "assistant",
+        "num_concurrent": 64,
+        "timeout": 300,
+        "max_retries": 3,
+    }
+    base = {"task": "mc_taco", "metadata": metadata, "num_concurrent": 64}
+    resumed = {
+        "task": "mc_taco",
+        "metadata": {
+            **metadata,
+            "num_concurrent": 200,
+            "timeout": 1800,
+            "max_retries": 10,
+        },
+        "num_concurrent": 200,
+    }
+
+    assert compute_task_fingerprint(base) == compute_task_fingerprint(resumed)
+
+    # Anything that actually changes what is asked still changes the fingerprint.
+    assert compute_task_fingerprint(base) != compute_task_fingerprint(
+        {**base, "metadata": {**metadata, "prompt_template": "bot"}}
+    )
 
 
 def test_reopen_same_config_resumes(tmp_path):

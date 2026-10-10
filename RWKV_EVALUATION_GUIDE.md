@@ -411,6 +411,17 @@ enabled = true
   `num_fewshot`、`gen_kwargs` 等）算出。若指向同一个 `checkpoint.dir` 但配置
   变了，续跑会直接报错拒绝执行，而不是静默复用旧结果——需要有意丢弃旧
   checkpoint 时显式设置 `checkpoint.fresh = true`。
+- 调度类参数（`max_num_seqs` 派生出的 `num_concurrent`、`timeout`、
+  `max_retries`）不参与任何一层身份判定：既不算进 `run_id`，也不算进每条请求
+  项的 `request_fingerprint`（`lm_eval/api/checkpoint.py` 的
+  `OPERATIONAL_MODEL_ARGS` 是唯一出处，`lm_eval/_cli/run.py` 与
+  `compute_task_fingerprint` 共用它）。因此"调大并发/超时后 `--resume`"只会
+  补齐未完成的项，不会让已完成项失效；改动 prompt、过滤器、metric、
+  `gen_kwargs`、模型名或采样配置仍会照常触发重新调度。
+- 迁移说明：指纹定义修复前写下的 `run.sqlite3`（例如 2026-10-10 之前的跑批）
+  与现在的身份规则不兼容，直接 `--resume` 会把已完成项全部重新派发。确实要
+  复用这些旧结果时，用显式信任开关
+  `LMEVAL_TRUST_COMPLETED_CHECKPOINT=1`（会打印逐项恢复日志）。
 - 若某个 benchmark 已经跑完但发布（scoreboard publication）当时失败或未及
   完成，续跑只会重试发布这一步，不会重新推理、不会重新计分。
 - 发布粒度是整个 benchmark，不是其内部叶子 task：`wmdp` 这类多叶子
@@ -459,6 +470,11 @@ enabled = true
   `checkpoint.dir` 指向的 `run.sqlite3` 记录的是另一次运行的配置指纹；确认
   `checkpoint.dir` 没有被复用于不同 TOML，或有意丢弃时设置
   `checkpoint.fresh = true`，见第 10.4 节。
+- 续跑日志里出现大量 `Checkpoint item ... changed content since the last run;
+  redispatching`，进度条从头开始：本次续跑的有效配置与写入 checkpoint 的那次
+  不一致，harness 正在重跑而不是复用已完成项。先确认是否真的改了 prompt/
+  过滤器/模型/`gen_kwargs`；若只改了并发、超时或重试次数，说明用的是修复前的
+  旧 checkpoint（身份规则已变），见 10.4 节的迁移说明。
 - GPU 空载但评估未结束：检查 SQLite/Hugging Face 缓存是否位于 Windows 挂载盘，
   以及数据集是否在离线模式下反复查询网络元数据。
 

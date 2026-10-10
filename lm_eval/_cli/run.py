@@ -434,7 +434,11 @@ class Run(SubCommand):
         if checkpoint_cfg.get("enabled", False):
             from dataclasses import asdict as _asdict
 
-            from lm_eval.api.checkpoint import CheckpointStore, compute_config_fingerprint
+            from lm_eval.api.checkpoint import (
+                CheckpointStore,
+                compute_config_fingerprint,
+                without_operational_args,
+            )
 
             if cfg.use_cache:
                 raise ValueError(
@@ -459,20 +463,13 @@ class Run(SubCommand):
             # sampling, or model identity, so changing them must remain
             # compatible with an existing checkpoint run. `num_concurrent` is
             # derived from the config's declared `max_num_seqs` (the endpoint's
-            # own inference capacity), so it is excluded here as well.
-            operational_model_args = ("num_concurrent", "timeout", "max_retries")
-            fingerprint_model_args = fingerprint_payload.get("model_args")
-            if isinstance(fingerprint_model_args, dict):
-                fingerprint_model_args = dict(fingerprint_model_args)
-                for key in operational_model_args:
-                    fingerprint_model_args.pop(key, None)
-                fingerprint_payload["model_args"] = fingerprint_model_args
-            fingerprint_metadata = fingerprint_payload.get("metadata")
-            if isinstance(fingerprint_metadata, dict):
-                fingerprint_metadata = dict(fingerprint_metadata)
-                for key in operational_model_args:
-                    fingerprint_metadata.pop(key, None)
-                fingerprint_payload["metadata"] = fingerprint_metadata
+            # own inference capacity), so it is excluded here as well -- with the
+            # same list `compute_task_fingerprint` uses, so the run id and the
+            # per-item fingerprints can never disagree about them.
+            for key in ("model_args", "metadata"):
+                value = fingerprint_payload.get(key)
+                if isinstance(value, dict):
+                    fingerprint_payload[key] = without_operational_args(value)
             for key in (
                 "config",
                 "checkpoint",

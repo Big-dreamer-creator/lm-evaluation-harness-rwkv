@@ -29,11 +29,24 @@ import sqlite3
 import threading
 import time
 import weakref
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
 
 
 eval_logger = logging.getLogger(__name__)
+
+# Scheduling/resource knobs. They decide how many requests are in flight, how
+# long one request may take, and how often it is retried -- never what is asked
+# or how an answer is scored. Checkpoint identity must therefore be invariant
+# under them: both the run id (``lm_eval/_cli/run.py``) and every per-item
+# request fingerprint drop them. Without that, "raise the concurrency and
+# resume" silently invalidates every stored answer and re-runs the benchmark.
+OPERATIONAL_MODEL_ARGS: tuple[str, ...] = (
+    "num_concurrent",
+    "timeout",
+    "max_retries",
+)
 
 
 class CheckpointConfigMismatchError(RuntimeError):
@@ -64,9 +77,31 @@ def compute_config_fingerprint(effective_config: dict) -> str:
     return _canonical_hash(effective_config)
 
 
+def without_operational_args(values: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Copy of ``values`` without the scheduling knobs in ``OPERATIONAL_MODEL_ARGS``."""
+    if not values:
+        return {}
+    return {
+        key: value for key, value in values.items() if key not in OPERATIONAL_MODEL_ARGS
+    }
+
+
 def compute_task_fingerprint(task_config: dict) -> str:
-    """Hash of a single task's resolved config (``task.dump_config()``)."""
-    return _canonical_hash(task_config)
+    """Hash of a single task's resolved config (``task.dump_config()``).
+
+    The dumped config embeds the run's model metadata (``TaskFactory`` merges
+    the run metadata into every task), and that metadata carries the scheduling
+    knobs in ``OPERATIONAL_MODEL_ARGS``. They are dropped here for the same
+    reason they are dropped from the run id: a resume that only changes
+    concurrency/timeout/retries must still match its stored answers. Everything
+    else -- prompt, filters, metrics, generation kwargs, model identity -- keeps
+    invalidating them.
+    """
+    metadata = task_config.get("metadata")
+    payload = without_operational_args(task_config)
+    if isinstance(metadata, Mapping):
+        payload["metadata"] = without_operational_args(metadata)
+    return _canonical_hash(payload)
 
 
 def compute_item_id(
