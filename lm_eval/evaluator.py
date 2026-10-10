@@ -93,6 +93,11 @@ def _build_checkpointed_dispatch(
     response comes back.
     """
     existing_items = checkpoint_store.get_items(task_name)
+    # A resumed campaign may intentionally change only operational settings
+    # (for example concurrency) while keeping the saved answer slots.  The
+    # opt-in mode lets that campaign reuse completed slots even when an older
+    # code/config fingerprint cannot be reproduced exactly.
+    trust_completed = os.environ.get("LMEVAL_TRUST_COMPLETED_CHECKPOINT") == "1"
     dispatch_reqs: list[Any] = []
     dispatch_keys: list[ItemKey | None] = []
     to_register: list[ItemKey] = []
@@ -109,10 +114,17 @@ def _build_checkpointed_dispatch(
             )
             existing = existing_items.get(item_id)
             if existing is not None and existing["status"] == "completed":
-                if existing["request_fingerprint"] == request_fp:
+                if existing["request_fingerprint"] == request_fp or trust_completed:
                     req.resps[repeat_ord] = deserialize_response(
                         existing["result_json"]
                     )
+                    if existing["request_fingerprint"] != request_fp:
+                        eval_logger.info(
+                            "Checkpoint item %s (task=%s) restored by explicit "
+                            "completed-slot trust; pending items remain dispatched.",
+                            item_id,
+                            task_name,
+                        )
                     continue
                 eval_logger.warning(
                     "Checkpoint item %s (task=%s) changed content since the "
