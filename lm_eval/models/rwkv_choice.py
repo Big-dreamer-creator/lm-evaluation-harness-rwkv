@@ -88,6 +88,7 @@ class RWKVLoglikelihoodResponse(tuple):
         truncated: bool = False,
         unparsed: bool = False,
         parsed_answer: Optional[str] = None,
+        rollouts: Optional[List[dict]] = None,
     ) -> "RWKVLoglikelihoodResponse":
         self = super().__new__(cls, (loglikelihood, is_greedy))
         self.prompt = prompt
@@ -118,7 +119,84 @@ class RWKVLoglikelihoodResponse(tuple):
         # instead of the fabricated `(loglikelihood, is_greedy)` tuple this
         # type otherwise looks like.
         self.parsed_answer = parsed_answer
+        # One entry per independently-sampled rollout of this doc
+        # (``{"index": <chosen choice index, -1 when unparsed>,
+        # "truncated": <hit the output cap>}``), in generation order.
+        # The k rollouts themselves are otherwise unobservable once the
+        # request returns -- only the majority vote survives in `text`/
+        # `parsed_answer` -- so this is what lets avg@k be recomputed from
+        # the responses alone: after a checkpoint resume (where a doc's
+        # requests are restored instead of re-generated)
+        # `RWKV7Remote._avg_k_samples` has no in-memory entry for it, and
+        # without this record the doc would silently drop out of the
+        # benchmark's ``<metric>_avg@k`` average and its truncation rate.
+        # Kept out of the (ll, is_greedy) tuple payload so every existing
+        # consumer keeps unpacking/zipping it unchanged.
+        self.rollouts = rollouts
         return self
+
+
+TRUNCATED_FINISH_REASONS = {"length", "max_tokens", "model_length"}
+
+
+def rollout_encodings(
+    indices: List[int], num_choices: int
+) -> List[List[Tuple[float, bool]]]:
+    """Per-rollout ``(loglikelihood, is_greedy)`` rows for one doc.
+
+    Each rollout names exactly one choice (``index``, or -1 when no letter was
+    parsed); the task's own ``process_results`` is invoked once per row, so a
+    row is the "one sample" avg@k averages correctness over.
+    """
+    return [
+        [
+            (0.0, True)
+            if choice_idx == (index if index >= 0 else 0)
+            else (-1e6, False)
+            for choice_idx in range(num_choices)
+        ]
+        for index in indices
+    ]
+
+
+def rollout_evidence(generations: List[Any], indices: List[int]) -> List[dict]:
+    """Checkpoint-safe per-rollout record for one doc's generations."""
+    return [
+        {
+            "index": int(index),
+            "truncated": bool(getattr(generation, "truncated", False))
+            or str(getattr(generation, "finish_reason", "") or "").lower()
+            in TRUNCATED_FINISH_REASONS,
+        }
+        for generation, index in zip(generations, indices)
+    ]
+
+
+def rollout_indices(responses: List[Any]) -> Optional[List[int]]:
+    """The per-rollout choice indices carried by a doc's scored responses.
+
+    Every response for one doc shares the same record, so the first response
+    that carries one is authoritative; ``None`` means the response predates
+    this record (or came from another backend), leaving the caller to fall
+    back to whatever in-memory recording it has.
+    """
+    for response in responses:
+        rollouts = getattr(response, "rollouts", None)
+        if rollouts:
+            return [int(rollout.get("index", -1)) for rollout in rollouts]
+    return None
+
+
+def rollout_truncation(responses: List[Any]) -> Optional[Tuple[int, int]]:
+    """``(truncated_rollouts, total_rollouts)`` for a doc, or ``None``."""
+    for response in responses:
+        rollouts = getattr(response, "rollouts", None)
+        if rollouts:
+            return (
+                sum(1 for rollout in rollouts if rollout.get("truncated")),
+                len(rollouts),
+            )
+    return None
 
 
 def build_choice_prompt(context: str, choices: List[str]) -> str:

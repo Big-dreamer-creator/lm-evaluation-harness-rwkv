@@ -34,12 +34,9 @@ rerun_reason = "fix mutual/mc_taco/discrim_eval prompt assembly and scoring (gen
 
 [publication.tasks.mutual]
 field = "reasoning"
-avg_k = 1
 
 [publication.tasks.mc_taco]
 field = "reasoning"
-avg_k = 1
 
 [publication.tasks.discrim_eval]
 field = "reasoning"
-avg_k = 1

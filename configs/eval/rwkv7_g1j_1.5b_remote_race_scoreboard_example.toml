@@ -50,4 +50,5 @@ token_env = "SCOREBOARD_PUBLICATION_TOKEN"  # 存放 bearer token 的环境变�
 
 [publication.tasks.race]
 field = "reasoning"  # 可选：knowledge / reasoning / maths / coding / instruction_following / agentic / vision——该 benchmark 在 Scoreboard 中归属的类别（对应 scoreboard-server/db/init.sql 里 benchmarks.field 的约束）。
-avg_k = 1  # 分数是在多少个采样上取平均；必填且必须是数值。单样本点估计填 1。
+# `avg_k` 不再手填：上传时由结果推导（completions / samples，多 leaf 按 completion 加权，
+# 可为小数）。确实要钉住某个值时再显式写上，推导值与它不一致会直接报错，而不是照发。

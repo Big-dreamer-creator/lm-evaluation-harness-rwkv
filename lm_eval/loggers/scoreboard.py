@@ -63,6 +63,20 @@ REQUIRED_SAMPLING_FIELDS = (
     "frequency_penalty",
     "penalty_decay",
 )
+# Run statistics written next to a task's metrics (the same four fields
+# lighteval-rwkv's results JSON carries). They describe how much was sampled,
+# not how well the model did, so publication must never pick one as the
+# headline metric nor let one leak into the benchmark-level aggregation.
+RESULT_BOOKKEEPING_FIELDS = {
+    "sample_len",
+    "n_samples",
+    "n_completions",
+    "n_truncated",
+    "truncation_rate",
+}
+# avg@k surfaces its average under a k-suffixed copy of the task's own metric
+# name (see `lm_eval.evaluator._install_avg_at_k_patch`).
+AVG_AT_K_PATTERN = re.compile(r"^(?P<base>.+)_avg@(?P<k>\d+)$")
 
 
 class ScoreboardError(RuntimeError):
@@ -284,11 +298,26 @@ def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str,
     return detail, outcome, truncated
 
 
+@dataclass(frozen=True, slots=True)
+class _SampleEvidence:
+    """One leaf's per-sample evidence, as read from its samples jsonl."""
+
+    buckets: dict[str, list[dict[str, Any]]]
+    # Docs actually scored by this leaf -- the count the board reports as the
+    # benchmark's `num_samples`, and the denominator of its avg_k.
+    docs: int
+    # Doc-level truncation, i.e. the fraction of scored docs whose reported
+    # completion hit the output cap. Only a fallback: a run that counted its
+    # own completions records a per-completion `truncation_rate` in the
+    # results instead (see `_leaf_upload`).
+    truncation_rate: float
+
+
 def _details(
     path: Path,
     metric_name: str,
     uploaded_counts: dict[str, int],
-) -> tuple[dict[str, list[dict[str, Any]]], int, float]:
+) -> _SampleEvidence:
     """Read one leaf's per-sample details, capped at `MAX_SAMPLES_PER_OUTCOME`.
 
     `uploaded_counts` tracks how many samples of each outcome have already
@@ -298,21 +327,37 @@ def _details(
     benchmark as a whole rather than being re-applied per leaf (which would
     let an N-leaf benchmark upload up to `N * MAX_SAMPLES_PER_OUTCOME`
     samples per outcome).
+
+    One line is written per (doc, filter), so a task with more than one
+    filter would otherwise be counted (and detailed) twice; docs are
+    deduplicated by `doc_id`, which is also what makes the doc count here a
+    trustworthy stand-in for artifacts that predate the recorded counts.
     """
     buckets: dict[str, list[dict[str, Any]]] = {"passed": [], "wrong": [], "failed": []}
-    total = truncated = 0
+    docs = truncated = 0
+    seen: set[Any] = set()
     with path.open(encoding="utf-8") as sample_file:
         for line in sample_file:
             if not line.strip():
                 continue
-            detail, outcome, is_truncated = _detail(json.loads(line), metric_name)
-            total += 1
+            row = json.loads(line)
+            doc_id = row.get("doc_id")
+            if doc_id is not None:
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+            detail, outcome, is_truncated = _detail(row, metric_name)
+            docs += 1
             truncated += is_truncated
             if uploaded_counts[outcome] >= MAX_SAMPLES_PER_OUTCOME:
                 continue
             uploaded_counts[outcome] += 1
             buckets[outcome].append(detail)
-    return buckets, total, (truncated / total if total else 0.0)
+    return _SampleEvidence(
+        buckets=buckets,
+        docs=docs,
+        truncation_rate=(truncated / docs if docs else 0.0),
+    )
 
 
 def _weight_ctx_len(
@@ -470,7 +515,7 @@ def _metrics(results: dict[str, Any], task_name: str) -> dict[str, float]:
     return {
         str(name): float(value)
         for name, value in results["results"][task_name].items()
-        if name != "sample_len"
+        if name not in RESULT_BOOKKEEPING_FIELDS
         and isinstance(value, (int, float))
         and not isinstance(value, bool)
         and math.isfinite(value)
@@ -486,25 +531,109 @@ def _common(values: list[Any]) -> Any:
 
 
 def _benchmark_info(
-    benchmark_name: str, num_samples: int, policy: dict[str, Any]
+    benchmark_name: str, num_samples: int, avg_k: float, policy: dict[str, Any]
 ) -> dict[str, Any]:
+    """Register the benchmark together with how much was sampled for it.
+
+    `num_samples` and `avg_k` are *derived* from what the run actually
+    produced -- docs scored, and completions per doc -- exactly as
+    lighteval-rwkv's producer measures them (`n_completions / num_samples`
+    there, weighted across a benchmark's tasks). A hand-written
+    ``publication.tasks.<name>.avg_k`` is therefore only accepted when it
+    agrees with the results; it can no longer disagree with the score that
+    gets uploaded next to it.
+    """
     field = policy.get("field")
     if field not in BENCHMARK_FIELDS:
         raise ScoreboardError(
             f"publication.tasks.{benchmark_name}.field must be one of "
             f"{sorted(BENCHMARK_FIELDS)}, got {field!r}"
         )
-    avg_k = policy.get("avg_k")
-    if not isinstance(avg_k, (int, float)) or isinstance(avg_k, bool):
-        raise ScoreboardError(
-            f"publication.tasks.{benchmark_name}.avg_k is required and must be numeric"
-        )
+    declared = policy.get("avg_k")
+    if declared is not None:
+        if not isinstance(declared, (int, float)) or isinstance(declared, bool):
+            raise ScoreboardError(
+                f"publication.tasks.{benchmark_name}.avg_k must be numeric when set"
+            )
+        if not math.isclose(float(declared), avg_k, rel_tol=0.0, abs_tol=1e-6):
+            raise ScoreboardError(
+                f"publication.tasks.{benchmark_name}.avg_k is {declared}, but the "
+                f"results were evaluated at avg_k={avg_k:g}; avg_k is derived from "
+                "the results (completions per sample), so remove the field or set "
+                "it to the value the run actually used"
+            )
     return {
         "name": benchmark_name,
         "field": field,
         "num_samples": num_samples,
         "avg_k": avg_k,
     }
+
+
+@dataclass(frozen=True, slots=True)
+class _LeafUpload:
+    """One leaf's contribution to a benchmark upload."""
+
+    docs: int
+    # Completions actually sampled for this leaf = docs x the k of the average
+    # that is available in its results. Benchmark-wide `avg_k` is the
+    # completion-weighted mean of this, so a benchmark whose leaves ran at
+    # different k reports the sampling it really did (lighteval-rwkv's
+    # `total_completions / total_samples`) instead of one hand-typed number.
+    completions: float
+    score: float
+    truncation_rate: float
+    # The task's own primary metric (e.g. `acc,none`) and the key the average
+    # actually came from (e.g. `acc_avg@8,none`). Leaves share a headline
+    # metric when their `metric_name`s agree -- differing only in the avg@k
+    # suffix is expected, since each leaf sizes its own k.
+    metric_name: str
+    metric_key: str
+    k: int
+
+
+def _recorded_count(row: dict[str, Any], field: str) -> float | None:
+    value = row.get(field)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
+
+
+def _leaf_metric_key(
+    metrics: dict[str, float],
+    primary: str,
+    recorded_k: float | None,
+    planned_k: int,
+    leaf_name: str,
+) -> tuple[str, int]:
+    """``(metric_key, k)`` for the average actually available for one leaf."""
+    base, _, filter_key = primary.partition(",")
+    averaged = {
+        int(match.group("k")): name
+        for name in metrics
+        if (match := AVG_AT_K_PATTERN.match(name.partition(",")[0]))
+        and match.group("base") == base
+        and name.partition(",")[2] == filter_key
+    }
+    if not averaged:
+        return primary, 1
+    if recorded_k is not None and int(round(recorded_k)) in averaged:
+        k = int(round(recorded_k))
+        return averaged[k], k
+    if planned_k in averaged:
+        return averaged[planned_k], planned_k
+    if len(averaged) == 1:
+        k = next(iter(averaged))
+        return averaged[k], k
+    k = max(averaged)
+    eval_logger.warning(
+        "leaf %s: several avg@k averages are present (%s) and none matches the "
+        "run's planned k=%d; using the largest.",
+        leaf_name,
+        sorted(averaged),
+        planned_k,
+    )
+    return averaged[k], k
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,50 +671,113 @@ class PublicationConfig:
         )
 
 
-def _build_leaf_score(
-    results: dict[str, Any],
-    samples_path: Path,
-    task_name: str,
-    config: PublicationConfig,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Build one benchmark_info/score pair from one benchmark artifact."""
-    task_config = results["configs"][task_name]
-    task_metadata = task_config.get("metadata") or {}
-    benchmark = str(task_metadata.get("benchmark_name") or task_name)
-    policy = _task_policy(config, task_name, benchmark)
-    run_config = results["config"]
-    model_args = run_config["model_args"]
-    model_name = str(
-        model_args.get("model") or model_args.get("pretrained") or run_config["model"]
+def _leaf_upload(
+    leaf_name: str,
+    leaf_doc: dict[str, Any],
+    policy: dict[str, Any],
+    samples: _SampleEvidence | None,
+    metric_hint: str | None = None,
+) -> _LeafUpload:
+    """Derive one leaf's docs / completions / score / truncation.
+
+    Every number comes from the leaf's own artifacts: the doc count and the
+    completion count the run recorded (falling back to the sample evidence
+    for artifacts written before those were recorded), and the average the
+    results actually carry -- the ``<metric>_avg@k`` value when the task ran
+    more than one sample per doc, the plain metric otherwise. Preferring the
+    recorded count is what makes the published ``avg_k`` agree with the
+    published score; reading only the plain metric (the previous behavior)
+    published a single-sample number under an avg@k label.
+    """
+    task_config = leaf_doc["configs"][leaf_name]
+    row = leaf_doc["results"][leaf_name]
+    metrics = _metrics(leaf_doc, leaf_name)
+    primary = _leaf_primary_metric(metrics, task_config, policy, metric_hint)
+
+    recorded_docs = _recorded_count(row, "n_samples")
+    recorded_completions = _recorded_count(row, "n_completions")
+    recorded_k = (
+        recorded_completions / recorded_docs
+        if recorded_docs and recorded_completions
+        else None
+    )
+    planned = task_config.get("repeats")
+    planned_k = (
+        int(planned)
+        if isinstance(planned, (int, float)) and not isinstance(planned, bool)
+        else 1
     )
 
-    metrics = _metrics(results, task_name)
-    primary_metric = _primary_metric(metrics, task_config, policy)
-    sample_metric = str(policy.get("outcome_metric") or primary_metric.split(",", 1)[0])
-    uploaded_counts = dict.fromkeys(("passed", "wrong", "failed"), 0)
-    buckets, samples_total, truncation_rate = _details(
-        samples_path, sample_metric, uploaded_counts
-    )
-    counts = results["n-samples"][task_name]
+    metric_key, k = _leaf_metric_key(metrics, primary, recorded_k, planned_k, leaf_name)
+    if planned_k > 1 and k < planned_k:
+        eval_logger.warning(
+            "leaf %s: the run planned k=%d but its results only carry %s (k=%d). "
+            "This artifact predates the avg@k coverage fix (or was resumed from a "
+            "checkpoint that restored the doc's requests), so the published score "
+            "and avg_k describe the average that is actually present.",
+            leaf_name,
+            planned_k,
+            metric_key,
+            k,
+        )
 
-    benchmark_info = _benchmark_info(benchmark, counts["effective"], policy)
-    score = {
-        "benchmark_id": None,
-        "model": _rwkv_model(
-            model_name, _weight_ctx_len(model_name, samples_path)
-        ),
-        "cot_mode": config.cot_mode,
-        "sampling_config": _sampling_config(
-            results, task_config, model_args, task_metadata
-        ),
-        "score": metrics[primary_metric],
-        "truncation_rate": truncation_rate,
-        "passed_details": buckets["passed"],
-        "wrong_details": buckets["wrong"],
-        "failed_details": buckets["failed"],
-    }
-    del samples_total  # only informs the truncation-rate weighting for multi-leaf benchmarks
-    return benchmark_info, score
+    if recorded_docs:
+        docs = int(recorded_docs)
+    elif samples is not None:
+        docs = samples.docs
+    else:
+        eval_logger.warning(
+            "leaf %s: no recorded sample count and no sample evidence; falling "
+            "back to n-samples.effective, which under-reports docs evaluated at "
+            "avg@k on pre-fix artifacts.",
+            leaf_name,
+        )
+        docs = int(leaf_doc["n-samples"][leaf_name]["effective"])
+    completions = recorded_completions or float(docs * k)
+
+    if "truncation_rate" in row:
+        truncation_rate = float(row["truncation_rate"])
+    elif samples is not None:
+        truncation_rate = samples.truncation_rate
+    else:
+        truncation_rate = 0.0
+    return _LeafUpload(
+        docs=docs,
+        completions=completions,
+        score=metrics[metric_key],
+        truncation_rate=truncation_rate,
+        metric_name=primary,
+        metric_key=metric_key,
+        k=k,
+    )
+
+
+def _leaf_primary_metric(
+    metrics: dict[str, float],
+    task_config: dict[str, Any],
+    policy: dict[str, Any],
+    hint: str | None,
+) -> str:
+    """The leaf's headline metric key.
+
+    A benchmark names its headline metric at the benchmark level (the
+    group's first aggregated metric, e.g. ``age_bias`` for ``discrim_eval``,
+    or an explicit ``publication.tasks.<name>.primary_metric``), which is
+    what the board used to publish; a leaf's own first `metric_list` entry is
+    only the fallback for a leaf whose benchmark states nothing.
+    """
+    declared = policy.get("primary_metric")
+    for candidate in (declared, hint):
+        if candidate is None:
+            continue
+        key = _match_metric_key(metrics, candidate)
+        if key is not None:
+            return key
+        if candidate is declared:
+            raise ScoreboardError(
+                f"primary metric {declared!r} is not present in results"
+            )
+    return _primary_metric(metrics, task_config, policy)
 
 
 def build_score(
@@ -600,11 +792,27 @@ def build_score(
     aggregated score(s), plus pointers (`leaf_artifact_paths`) to each leaf's
     own artifacts so sample evidence can still be sourced without
     duplicating it on disk.
+
+    Everything the board receives is derived from those leaf artifacts, the
+    way lighteval-rwkv's producer derives it from its own: docs scored and
+    completions sampled are *read off the run* (``num_samples``,
+    ``avg_k = n_completions / n_samples``), the headline score is the
+    per-sample average the results actually carry, and a multi-leaf benchmark
+    blends its leaves by completions. The hand-written ``avg_k`` in the
+    publication policy is only an assertion from here on -- if it disagrees
+    with what was run, publication fails instead of labelling one number with
+    another's sampling.
     """
     benchmark_name = next(iter(results["results"]))
     leaf_artifact_paths: dict[str, dict[str, str]] = (
         results.get("leaf_artifact_paths") or {}
     )
+    if not leaf_artifact_paths:
+        raise ScoreboardError(
+            f"benchmark {benchmark_name!r} has no leaf artifacts to publish; "
+            "publish a benchmark-level results.json produced by "
+            "save_benchmark_artifacts"
+        )
     # The run directory that holds these artifacts is named after the served
     # weight, so it is the fallback source for the weight's context window.
     artifact_hint_paths = [
@@ -614,17 +822,9 @@ def build_score(
         if (value := paths.get(key))
     ]
 
-    if results.get("strategy") == "standalone":
-        leaf_name = next(iter(leaf_artifact_paths))
-        samples_path = Path(leaf_artifact_paths[leaf_name]["samples"])
-        return _build_leaf_score(results, samples_path, benchmark_name, config)
-
     leaf_docs = {
         leaf_name: json.loads(Path(paths["results"]).read_text("utf-8"))
         for leaf_name, paths in leaf_artifact_paths.items()
-    }
-    leaf_configs = {
-        leaf_name: doc["configs"][leaf_name] for leaf_name, doc in leaf_docs.items()
     }
     policy = _task_policy(config, benchmark_name, benchmark_name)
 
@@ -634,70 +834,106 @@ def build_score(
         model_args.get("model") or model_args.get("pretrained") or run_config["model"]
     )
 
-    metrics = _metrics(results, benchmark_name)
-    policy_metric_name = policy.get("primary_metric")
-    primary_metric = _match_metric_key(metrics, policy_metric_name)
-    if primary_metric is None and policy_metric_name is not None:
-        raise ScoreboardError(
-            f"primary metric {policy_metric_name!r} is not present in results"
-        )
-    if primary_metric is None:
-        primary_metric = _match_metric_key(metrics, results.get("primary_metric_hint"))
-    no_shared_metric = not metrics
-
     uploaded_counts = dict.fromkeys(("passed", "wrong", "failed"), 0)
     merged_buckets: dict[str, list[dict[str, Any]]] = {
         "passed": [],
         "wrong": [],
         "failed": [],
     }
-    samples_total = 0
-    weighted_truncated = 0.0
+    uploads: list[_LeafUpload] = []
+    namespaced_scores: dict[str, float] = {}
+    # The benchmark's own headline metric (a group's first aggregated metric;
+    # `primary_metric_hint` on the artifact) or an explicit policy override.
+    metric_hint = policy.get("primary_metric") or results.get("primary_metric_hint")
     for leaf_name, paths in leaf_artifact_paths.items():
         leaf_doc = leaf_docs[leaf_name]
-        leaf_metrics = _metrics(leaf_doc, leaf_name)
         leaf_policy = _task_policy(config, leaf_name, benchmark_name)
-        leaf_primary = _primary_metric(leaf_metrics, leaf_configs[leaf_name], leaf_policy)
-        if no_shared_metric:
-            # Benchmarks like cruxeval/infinitebench mix leaves with no
-            # metric name shared across all of them, so aggregate_benchmark_
-            # fallback intentionally leaves the benchmark-level metrics
-            # empty (see its docstring) rather than synthesize a misleading
-            # headline score. Surface each leaf's own primary metric
-            # namespaced by leaf name instead of a blended score.
-            metrics[f"{leaf_name}/{leaf_primary}"] = leaf_metrics[leaf_primary]
+        leaf_primary = _leaf_primary_metric(
+            _metrics(leaf_doc, leaf_name),
+            leaf_doc["configs"][leaf_name],
+            leaf_policy,
+            metric_hint,
+        )
         sample_metric = str(
             leaf_policy.get("outcome_metric") or leaf_primary.split(",", 1)[0]
         )
-        buckets, leaf_total, leaf_truncation_rate = _details(
-            Path(paths["samples"]), sample_metric, uploaded_counts
+        samples_path = paths.get("samples")
+        evidence = (
+            _details(Path(samples_path), sample_metric, uploaded_counts)
+            if samples_path
+            else None
         )
-        for outcome, samples in merged_buckets.items():
-            samples.extend(buckets[outcome])
-        samples_total += leaf_total
-        weighted_truncated += leaf_truncation_rate * leaf_total
-    if primary_metric is None and metrics:
-        primary_metric = min(metrics)
-    if primary_metric is None:
-        raise ScoreboardError(f"benchmark {benchmark_name!r} has no primary metric")
-    truncation_rate = weighted_truncated / samples_total if samples_total else 0.0
+        upload = _leaf_upload(
+            leaf_name, leaf_doc, leaf_policy, evidence, metric_hint
+        )
+        uploads.append(upload)
+        namespaced_scores[f"{leaf_name}/{upload.metric_key}"] = upload.score
+        if evidence is not None:
+            for outcome, samples in merged_buckets.items():
+                samples.extend(evidence.buckets[outcome])
 
-    counts = results["n-samples"][benchmark_name]
-    benchmark_info = _benchmark_info(benchmark_name, counts["effective"], policy)
-    score = {
+    num_samples = sum(upload.docs for upload in uploads)
+    completions = sum(upload.completions for upload in uploads)
+    if not num_samples or not completions:
+        raise ScoreboardError(
+            f"benchmark {benchmark_name!r} has no evaluated samples to publish"
+        )
+    headline = None
+    if all(upload.k == 1 for upload in uploads):
+        # Nothing was averaged per doc, so the benchmark-level metric the run
+        # already aggregated is the authoritative headline -- it is the only
+        # source that honours a group's own aggregation (e.g. mmlu's macro
+        # average over subtasks rather than a pooled one).
+        benchmark_metrics = _metrics(results, benchmark_name)
+        key = _match_metric_key(
+            benchmark_metrics, policy.get("primary_metric")
+        ) or _match_metric_key(benchmark_metrics, results.get("primary_metric_hint"))
+        if key is not None:
+            headline = benchmark_metrics[key]
+    if headline is None and len({upload.metric_name for upload in uploads}) == 1:
+        # Otherwise (avg@k, whose per-k averages never survive the group
+        # aggregation) blend the leaves by completions, exactly like the
+        # producer on the lighteval side.
+        headline = (
+            sum(upload.score * upload.completions for upload in uploads) / completions
+        )
+    if headline is None:
+        # A benchmark whose leaves report different metrics (e.g. cruxeval /
+        # infinitebench mixing task types) has no meaningful blended score;
+        # keep the per-leaf namespaced report and use the first one.
+        headline = namespaced_scores[min(namespaced_scores)]
+    truncation_rate = (
+        sum(upload.truncation_rate * upload.completions for upload in uploads)
+        / completions
+    )
+
+    # A single-leaf (standalone) benchmark carries its task's own generation
+    # kwargs/metadata, which the run's sampling config must include; a
+    # multi-leaf benchmark has no single such task.
+    sole_config = (
+        leaf_docs[next(iter(leaf_docs))]["configs"][next(iter(leaf_docs))]
+        if len(leaf_docs) == 1
+        else {}
+    )
+    benchmark_info = _benchmark_info(
+        benchmark_name, num_samples, completions / num_samples, policy
+    )
+    payload = {
         "benchmark_id": None,
         "model": _rwkv_model(
             model_name, _weight_ctx_len(model_name, *artifact_hint_paths)
         ),
         "cot_mode": config.cot_mode,
-        "sampling_config": _sampling_config(results, {}, model_args, {}),
-        "score": metrics[primary_metric],
+        "sampling_config": _sampling_config(
+            results, sole_config, model_args, sole_config.get("metadata") or {}
+        ),
+        "score": headline,
         "truncation_rate": truncation_rate,
         "passed_details": merged_buckets["passed"],
         "wrong_details": merged_buckets["wrong"],
         "failed_details": merged_buckets["failed"],
     }
-    return benchmark_info, score
+    return benchmark_info, payload
 
 
 class ScoreboardPublisher:

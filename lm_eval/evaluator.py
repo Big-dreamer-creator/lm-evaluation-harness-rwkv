@@ -7,6 +7,7 @@ import os
 import random
 import time
 from collections import defaultdict
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -26,9 +27,16 @@ from lm_eval.api.checkpoint import (
     deserialize_response,
 )
 from lm_eval.api.checkpoint import model_fingerprint as compute_model_fingerprint
+from lm_eval.api.filter import FilterEnsemble
 from lm_eval.api.metrics import aggregate_benchmark_fallback, mean
 from lm_eval.caching.cache import delete_cache
 from lm_eval.defaults import DEFAULT_OTHER_SEED, DEFAULT_RANDOM_SEED, LMEVAL_HASHMM
+from lm_eval.models.rwkv_choice import (
+    TRUNCATED_FINISH_REASONS,
+    rollout_encodings,
+    rollout_indices,
+    rollout_truncation,
+)
 from lm_eval.evaluator_utils import (
     ResultAcc,
     _compute_task_aggregations,
@@ -39,7 +47,7 @@ from lm_eval.evaluator_utils import (
     print_writeout,
     run_task_tests,
 )
-from lm_eval.filters import build_filter_ensemble
+from lm_eval.filters.selection import PerRepeatFilter
 from lm_eval.loggers.utils import add_env_info, add_tokenizer_info, get_git_commit_hash
 from lm_eval.tasks import TaskManager
 from lm_eval.utils import (
@@ -147,6 +155,36 @@ def _build_checkpointed_dispatch(
     return dispatch_reqs, dispatch_keys
 
 
+def _is_truncated(generation: Any) -> bool:
+    """Whether one generation hit the output cap without finishing."""
+    if getattr(generation, "truncated", False):
+        return True
+    return str(getattr(generation, "finish_reason", "") or "").lower() in (
+        TRUNCATED_FINISH_REASONS
+    )
+
+
+def _record_rollout_stats(
+    task_obj: Task, doc_id: Any, completions: int, truncated: Optional[int]
+) -> None:
+    """Record one doc's rollout counts for the results' ``n_completions``/
+    ``n_truncated``/``truncation_rate`` fields.
+
+    Mirrors lighteval-rwkv, which counts completions (not just docs) in its
+    pipeline (``task_completion_counts``) and derives ``avg_k =
+    n_completions / num_samples`` from them. Keyed by ``doc_id`` so a task
+    with more than one filter (``process_results`` runs once per filter)
+    cannot double count, and ``truncated`` is ``None`` when the backend
+    couldn't report per-rollout truncation at all -- callers then leave the
+    truncation fields out rather than publish a made-up zero.
+    """
+    stats = getattr(task_obj, "_rollout_stats", None)
+    if stats is None:
+        stats = {}
+        task_obj._rollout_stats = stats
+    stats[doc_id] = {"completions": completions, "truncated": truncated}
+
+
 def _install_avg_at_k_patch(
     task_obj: Task, lm: LM, k: int, metric_name: str
 ) -> None:
@@ -162,11 +200,16 @@ def _install_avg_at_k_patch(
       e.g. ``RWKV7Remote``) holding the ``k`` independently-generated
       per-choice encodings for this doc; the task's own (unmodified)
       ``process_results`` is invoked once per encoding and the results
-      averaged.
-    - ``generate_until``: relies on the task's filter having been switched
-      to ``take_first_k`` (below) so ``results[0]`` is the full list of
-      ``k`` generations rather than a single winner; the task's own
-      ``process_results`` is invoked once per generation and averaged.
+      averaged. The responses themselves carry the same information (see
+      ``RWKVLoglikelihoodResponse.rollouts``), which is preferred when
+      present because it also survives a checkpoint resume -- a doc whose
+      requests were restored rather than re-generated never reaches
+      ``loglikelihood()`` again, so ``lm._avg_k_samples`` has no entry for it
+      and the doc would otherwise silently drop out of the average.
+    - ``generate_until``: relies on the task's own ``filter_list`` having been
+      wrapped per repeat (below), so ``results[0]`` is the full list of ``k``
+      *extracted* answers rather than a single winner; the task's own
+      ``process_results`` is invoked once per answer and averaged.
     Any other ``OUTPUT_TYPE`` (loglikelihood/loglikelihood_rolling) is left
     untouched -- avg@k has no meaning for perplexity-style scoring.
     """
@@ -197,34 +240,78 @@ def _install_avg_at_k_patch(
             doc_id = getattr(task_obj, "_avg_k_current_doc_id", None)
             sample_encodings = lm._avg_k_samples.pop(doc_id, None)
             parsed_flags = getattr(lm, "_avg_k_parsed", {}).pop(doc_id, None)
-            if sample_encodings:
-                # A sample whose generation couldn't be parsed into a choice
-                # letter didn't actually "guess wrong" -- it never named a
-                # choice at all. Score it at chance level (1/num_choices)
-                # instead of whatever placeholder index it was encoded with,
-                # so avg@k measures real correctness rather than being
-                # dragged down by answer-format misses.
-                chance = 1.0 / len(sample_encodings[0])
-                per_sample = []
-                for index, enc in enumerate(sample_encodings):
-                    sample_metrics = original_process_results(doc, enc)
-                    if parsed_flags is not None and not parsed_flags[index]:
-                        sample_metrics = {
-                            key: (chance if isinstance(value, (int, float)) else value)
-                            for key, value in sample_metrics.items()
-                        }
-                    per_sample.append(sample_metrics)
-                metrics.update(_average_metrics(per_sample))
+            # Per-rollout record carried by this doc's responses (see
+            # RWKVLoglikelihoodResponse.rollouts). Preferred over the model's
+            # in-memory recording (`lm._avg_k_samples`) because it also
+            # covers docs whose requests were restored from a checkpoint
+            # rather than re-generated.
+            indices = rollout_indices(results)
+            if indices is not None and results:
+                sample_encodings = rollout_encodings(indices, len(results))
+                parsed_flags = [index >= 0 for index in indices]
+            if not sample_encodings:
+                return metrics
+            truncation = rollout_truncation(results)
+            _record_rollout_stats(
+                task_obj,
+                doc_id,
+                len(sample_encodings),
+                truncation[0] if truncation is not None else None,
+            )
+            # A sample whose generation couldn't be parsed into a choice
+            # letter didn't actually "guess wrong" -- it never named a
+            # choice at all. Score it at chance level (1/num_choices)
+            # instead of whatever placeholder index it was encoded with, so
+            # avg@k measures real correctness rather than being dragged down
+            # by answer-format misses.
+            chance = 1.0 / len(sample_encodings[0])
+            per_sample = []
+            for index, enc in enumerate(sample_encodings):
+                sample_metrics = original_process_results(doc, enc)
+                if parsed_flags is not None and not parsed_flags[index]:
+                    sample_metrics = {
+                        key: (chance if isinstance(value, (int, float)) else value)
+                        for key, value in sample_metrics.items()
+                    }
+                per_sample.append(sample_metrics)
+            metrics.update(_average_metrics(per_sample))
             return metrics
     elif output_type == "generate_until":
-        task_obj._filters = [build_filter_ensemble("none", [["take_first_k", {"k": k}]])]
+        # avg@k scores each of the k generations on its own, so every repeat
+        # has to go through the task's own `filter_list` exactly as it would
+        # in a `repeats: 1` run. Replacing the pipeline with a bare
+        # `take_first_k` (as this used to) discarded the task's extraction
+        # entirely, handing `process_results` raw completions instead of
+        # answers: tasks whose metric depends on a filter (`albatross_mcq`,
+        # `yes_no`, `regex`...) then compared chain-of-thought text against
+        # the gold answer and scored every doc wrong.
+        task_obj._filters = [
+            FilterEnsemble(
+                name=ensemble.name,
+                filters=[partial(PerRepeatFilter, ensemble)],
+            )
+            for ensemble in task_obj._filters
+        ]
 
         def patched(doc, results):
-            generations = results[0]
-            per_sample = [
-                original_process_results(doc, [generation])
-                for generation in generations
-            ]
+            repeats = results[0]
+            per_sample = [original_process_results(doc, [repeat]) for repeat in repeats]
+            # The filtered values are bare answers ("A", "no", "42"), so the
+            # per-rollout truncation accounting has to read the raw responses
+            # the evaluator stashed for this doc (see `finish_benchmark`);
+            # without them truncation is unknown, not zero.
+            raw = getattr(task_obj, "_avg_k_current_responses", None)
+            truncated = (
+                sum(1 for generation in raw if _is_truncated(generation))
+                if raw
+                else None
+            )
+            _record_rollout_stats(
+                task_obj,
+                getattr(task_obj, "_avg_k_current_doc_id", None),
+                len(repeats),
+                truncated,
+            )
             return _average_metrics(per_sample)
     else:
         return
@@ -762,6 +849,7 @@ def evaluate(
             "task": task_obj,
             "raw_metrics": defaultdict(list),
             "logged_samples": [],
+            "n_docs": 0,
         }
         for task_name, task_obj in eval_tasks.items()
     }
@@ -954,7 +1042,9 @@ def evaluate(
                 world_size=WORLD_SIZE,
                 samples=indices,
             )
+            docs_in_filter = 0
             for doc_id, doc in doc_iterator:
+                docs_in_filter += 1
                 doc_id_true = indices[doc_id] if indices else doc_id
                 document_requests = instances_by_doc_id[doc_id]
                 # Read by the avg@k process_results patch (see
@@ -962,6 +1052,12 @@ def evaluate(
                 # independently-sampled per-choice encodings; a harmless
                 # no-op for any task that isn't patched.
                 task._avg_k_current_doc_id = doc_id
+                # The avg@k patch scores the filter's per-repeat answers, but
+                # per-rollout truncation can only be read off the raw response
+                # objects, so hand those over too.
+                task._avg_k_current_responses = [
+                    response for req in document_requests for response in req.resps
+                ]
                 metrics = task.process_results(
                     doc,
                     [req.filtered_resps[filter_key] for req in document_requests],
@@ -1001,6 +1097,14 @@ def evaluate(
                     acc["logged_samples"].append(example)
                 for metric, value in metrics.items():
                     acc["raw_metrics"][(metric, filter_key)].append(value)
+            # Every filter scores the same doc set, so the largest count is
+            # the number of docs actually evaluated (``n-samples.effective``
+            # and the results' ``n_samples``). Taken from the docs themselves
+            # rather than from any metric's value list: per-metric lists are
+            # legitimately shorter than the doc count (an avg@k metric only
+            # covers docs that reported it), which is what made the published
+            # sample count disagree with the evaluated doc count.
+            acc["n_docs"] = max(acc["n_docs"], docs_in_filter)
 
         if WORLD_SIZE > 1:
             if log_samples:
@@ -1016,6 +1120,10 @@ def evaluate(
                     )
 
             all_metrics = lm.gather_object({task_name: dict(acc["raw_metrics"])}, dst=0)
+            all_doc_counts = lm.gather_object({task_name: acc["n_docs"]}, dst=0)
+            all_rollout_stats = lm.gather_object(
+                {task_name: dict(getattr(task, "_rollout_stats", None) or {})}, dst=0
+            )
             if RANK == 0:
                 for metric_key in acc["raw_metrics"]:
                     acc["raw_metrics"][metric_key] = list(
@@ -1024,10 +1132,18 @@ def evaluate(
                             for rank_data in all_metrics  # type: ignore
                         )
                     )
+                acc["n_docs"] = sum(
+                    rank_data[task_name] for rank_data in all_doc_counts
+                )
+                rollout_stats: dict = {}
+                for rank_data in all_rollout_stats:
+                    rollout_stats.update(rank_data[task_name])
+                if rollout_stats:
+                    task._rollout_stats = rollout_stats
 
         if RANK == 0 and (task_callback is not None or checkpoint_store is not None):
             aggregated_metrics, sample_len = _compute_task_aggregations(
-                task, acc["raw_metrics"], bootstrap_iters
+                task, acc["raw_metrics"], bootstrap_iters, acc["n_docs"]
             )
             task_config = dict(task.dump_config())
             callback_results = {

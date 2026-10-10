@@ -37,24 +37,18 @@ rerun_reason = "RWKV7-G1K six-benchmark evaluation, limit 50, official Open Thin
 
 [publication.tasks.discrim_eval]
 field = "reasoning"
-avg_k = 1
 
 [publication.tasks.mc_taco]
 field = "reasoning"
-avg_k = 1
 
 [publication.tasks.mutual]
 field = "reasoning"
-avg_k = 1
 
 [publication.tasks.race]
 field = "reasoning"
-avg_k = 1
 
 [publication.tasks.winogender]
 field = "reasoning"
-avg_k = 1
 
 [publication.tasks.wmdp]
 field = "knowledge"
-avg_k = 1

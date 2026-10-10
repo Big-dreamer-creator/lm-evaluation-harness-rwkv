@@ -19,6 +19,8 @@ from lm_eval.models.rwkv_choice import (
     build_choice_prompt,
     choice_letters,
     parse_choice_index,
+    rollout_encodings,
+    rollout_evidence,
 )
 
 
@@ -348,13 +350,13 @@ class RWKV7Remote(LocalCompletionsAPI):
                 for generated in doc_generations
             ]
             parsed_flags = [index >= 0 for index in raw_indices]
-            sample_encodings: List[List[Tuple[float, bool]]] = [
-                [
-                    (0.0, True) if choice_idx == (index if index >= 0 else 0) else (-1e6, False)
-                    for choice_idx in range(len(choices))
-                ]
-                for index in raw_indices
-            ]
+            sample_encodings = rollout_encodings(raw_indices, len(choices))
+            # Per-rollout record carried on every response for this doc, so
+            # avg@k (and its truncation rate) can be recomputed from the
+            # responses themselves -- including after a checkpoint resume,
+            # where this doc's requests are restored rather than
+            # re-generated and `_avg_k_samples` therefore has no entry.
+            rollouts = rollout_evidence(doc_generations, raw_indices)
             self._avg_k_samples[doc_id] = sample_encodings
             self._avg_k_parsed[doc_id] = parsed_flags
 
@@ -406,6 +408,7 @@ class RWKV7Remote(LocalCompletionsAPI):
                         truncated=bool(getattr(evidence_generation, "truncated", False)),
                         unparsed=doc_unparsed,
                         parsed_answer=parsed_answer,
+                        rollouts=rollouts,
                     )
                 else:
                     outcome = RWKVLoglikelihoodResponse(
@@ -413,6 +416,7 @@ class RWKV7Remote(LocalCompletionsAPI):
                         is_greedy,
                         unparsed=doc_unparsed,
                         parsed_answer=parsed_answer,
+                        rollouts=rollouts,
                     )
                 for position in cg:
                     results[position] = outcome

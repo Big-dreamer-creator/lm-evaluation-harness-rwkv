@@ -38,20 +38,15 @@ rerun_reason = "full five-benchmark avg@k campaign with official RWKV7-G1K-1.5B 
 
 [publication.tasks.mc_taco]
 field = "reasoning"
-avg_k = 1
 
 [publication.tasks.mutual]
 field = "reasoning"
-avg_k = 8
 
 [publication.tasks.race]
 field = "reasoning"
-avg_k = 4
 
 [publication.tasks.winogender]
 field = "reasoning"
-avg_k = 8
 
 [publication.tasks.wmdp]
 field = "knowledge"
-avg_k = 4

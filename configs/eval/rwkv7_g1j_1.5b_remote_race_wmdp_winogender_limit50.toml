@@ -41,12 +41,9 @@ model_sha256 = "c43176881caf85fe22ad654ab02e7519260d560f3d20420ab590adb0c823860f
 
 [publication.tasks.race]
 field = "reasoning"
-avg_k = 1
 
 [publication.tasks.wmdp]
 field = "knowledge"
-avg_k = 1
 
 [publication.tasks.winogender]
 field = "reasoning"
-avg_k = 1

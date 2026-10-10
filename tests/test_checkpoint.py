@@ -257,6 +257,32 @@ def test_serialize_deserialize_rwkv_loglikelihood_roundtrip():
     assert restored.truncated is False
 
 
+def test_serialize_deserialize_keeps_the_per_rollout_record():
+    """The per-rollout record is what lets a restored doc still be scored at
+    avg@k (and counted in the truncation rate), so it has to survive the
+    round trip even when the response carries no other evidence.
+    """
+    from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
+
+    rollouts = [
+        {"index": 0, "truncated": False},
+        {"index": -1, "truncated": True},
+    ]
+    response = RWKVLoglikelihoodResponse(0.0, True, rollouts=rollouts)
+
+    restored = deserialize_response(serialize_response(response))
+
+    assert restored == (0.0, True)
+    assert restored.rollouts == rollouts
+
+
+def test_responses_without_a_rollout_record_round_trip_as_plain_tuples():
+    """Older responses (and every non-RWKV backend) keep serializing as bare
+    2-tuples: the per-rollout record must not change their wire shape.
+    """
+    assert deserialize_response(serialize_response((0.5, False))) == (0.5, False)
+
+
 def test_compute_item_id_stable_and_distinguishes_repeat_ord():
     id_0 = compute_item_id("task", 3, 0, "loglikelihood", 0)
     id_0_again = compute_item_id("task", 3, 0, "loglikelihood", 0)

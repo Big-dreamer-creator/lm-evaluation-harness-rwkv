@@ -37,4 +37,3 @@ rerun_reason = "corrected mc_taco prompt, RWKV7-G1K-2.9B 20260930 revision"
 
 [publication.tasks.mc_taco]
 field = "reasoning"
-avg_k = 1

@@ -220,14 +220,25 @@ def test_field_missing_from_policy_raises(tmp_path):
 
 
 def test_avg_k_missing_from_policy_raises(tmp_path):
-    fixtures_dir = tmp_path / "fixtures_missing_avg_k"
+    """avg_k is derived from the artifacts (completions per sample), so a
+    policy that omits it must still publish; a policy that *states* a
+    different value than the run used must fail instead of labelling the
+    score with the wrong sampling.
+    """
+    fixtures_dir = tmp_path / "fixtures_derived_avg_k"
     _write_data_and_leaves(fixtures_dir, [("no_avg_k_leaf", "exact_match")])
     group_yaml = "group: unused\ntask:\n  - no_avg_k_leaf\n"
     results_doc = _run_benchmark(
         fixtures_dir, group_yaml, "no_avg_k_leaf", "standalone", tmp_path
     )
 
-    config = _publish_config({"no_avg_k_leaf": {"field": "reasoning"}})
+    benchmark_info, _score = build_score(
+        results_doc, _publish_config({"no_avg_k_leaf": {"field": "reasoning"}})
+    )
+    assert benchmark_info["avg_k"] == 1
+    assert benchmark_info["num_samples"] == 4
+
+    config = _publish_config({"no_avg_k_leaf": {"field": "reasoning", "avg_k": 8}})
     with pytest.raises(ScoreboardError, match="avg_k"):
         build_score(results_doc, config)
 
@@ -469,10 +480,9 @@ def test_samples_cap_is_shared_across_leaves_of_one_benchmark(tmp_path):
         samples_path.write_text(
             "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
         )
-        buckets, _total, _truncation_rate = _details(
-            samples_path, "exact_match", shared_uploaded_counts
-        )
-        total_uploaded += len(buckets["passed"])
+        evidence = _details(samples_path, "exact_match", shared_uploaded_counts)
+        total_uploaded += len(evidence.buckets["passed"])
+        assert evidence.docs == docs_per_leaf
 
     assert total_uploaded == MAX_SAMPLES_PER_OUTCOME
     assert shared_uploaded_counts["passed"] == MAX_SAMPLES_PER_OUTCOME
@@ -561,3 +571,168 @@ def _fake_response(payload: dict):
         yield io.BytesIO(json.dumps(payload).encode())
 
     return cm()
+
+
+def _choice_row(index: int, score: float = 1.0) -> dict:
+    return {
+        "doc_id": index,
+        "arguments": {"gen_args_0": {"arg_0": "prompt", "arg_1": {}}},
+        "resps": [["A"]],
+        "filtered_resps": [["A"]],
+        "target": "A",
+        "filter": "none",
+        "response_evidence": [{"text": "A", "finish_reason": "stop"}],
+        "acc": score,
+    }
+
+
+def _leaf_artifacts(
+    run_dir: Path,
+    leaf_name: str,
+    *,
+    docs: int,
+    k: int,
+    avg_at_k: float | None = None,
+    plain: float = 0.25,
+    samples_rows: int | None = None,
+    recorded_counts: bool = True,
+    repeats: int | None = None,
+) -> dict[str, str]:
+    """Write one leaf's results.json + samples jsonl and return its paths.
+
+    `docs` is how many docs the leaf evaluated, `k` how many samples each was
+    scored with, `samples_rows` how many per-doc lines its samples file holds
+    (defaults to `docs`), and `avg_at_k=None` writes no ``<metric>_avg@k``
+    average at all -- the shape of an artifact whose avg@k coverage was
+    incomplete, e.g. one resumed from a checkpoint.
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    rows = docs if samples_rows is None else samples_rows
+    samples_path = run_dir / f"samples_{leaf_name}.jsonl"
+    samples_path.write_text(
+        "\n".join(json.dumps(_choice_row(index)) for index in range(rows)) + "\n",
+        encoding="utf-8",
+    )
+
+    metrics: dict = {"acc,none": plain}
+    if avg_at_k is not None:
+        metrics[f"acc_avg@{k},none"] = avg_at_k
+    if recorded_counts:
+        metrics |= {
+            "n_samples": docs,
+            "n_completions": docs * max(k, 1),
+            "n_truncated": docs // 10,
+            "truncation_rate": 0.1,
+        }
+    results_path = run_dir / f"{leaf_name}_results.json"
+    results_path.write_text(
+        json.dumps(
+            {
+                "results": {
+                    leaf_name: {
+                        "name": leaf_name,
+                        "alias": leaf_name,
+                        "sample_len": docs,
+                        **metrics,
+                    }
+                },
+                "configs": {
+                    leaf_name: {
+                        "metric_list": [
+                            {
+                                "metric": "acc",
+                                "aggregation": "mean",
+                                "higher_is_better": True,
+                            }
+                        ],
+                        "repeats": max(k, 1) if repeats is None else repeats,
+                    }
+                },
+                "n-samples": {leaf_name: {"original": docs, "effective": docs}},
+                "config": {"model": _MODEL_NAME, "model_args": dict(_MODEL_ARGS)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "results": str(results_path),
+        "samples": str(samples_path),
+        "metadata": str(run_dir / f"{leaf_name}_metadata.json"),
+    }
+
+
+def _benchmark_doc(run_dir: Path, leaves: dict[str, dict[str, str]], **extra) -> dict:
+    return {
+        "results": {"bench": {"name": "bench", "alias": "bench", "sample_len": 1}},
+        "config": {"model": _MODEL_NAME, "model_args": dict(_MODEL_ARGS)},
+        "n-samples": {"bench": {"original": 1, "effective": 1}},
+        "strategy": "tag_fallback",
+        "leaf_artifact_paths": leaves,
+        **extra,
+    }
+
+
+def test_published_counts_and_score_match_what_the_run_actually_did(tmp_path):
+    """num_samples/avg_k/score are read off the run, not hand-written.
+
+    The benchmark-level doc deliberately claims ``sample_len: 1`` (the old
+    code's source for the published sample count, and the shape a metric's
+    value list takes when only part of a benchmark reports it): the upload
+    must instead report the docs each leaf evaluated and the per-sample
+    average each leaf actually carries.
+    """
+    run_dir = tmp_path / _RUN_DIR_NAME
+    leaves = {
+        "leaf_small": _leaf_artifacts(
+            run_dir, "leaf_small", docs=100, k=2, avg_at_k=0.75, plain=0.5
+        ),
+        "leaf_large": _leaf_artifacts(
+            run_dir, "leaf_large", docs=300, k=8, avg_at_k=0.6, plain=0.25
+        ),
+    }
+
+    benchmark_info, score = build_score(
+        _benchmark_doc(run_dir, leaves),
+        _publish_config({"bench": {"field": "reasoning"}}),
+    )
+
+    assert benchmark_info == {
+        "name": "bench",
+        "field": "reasoning",
+        "num_samples": 400,
+        "avg_k": pytest.approx((100 * 2 + 300 * 8) / 400),
+    }
+    # Completion-weighted blend of the two leaves' avg@k averages -- never
+    # the plain, single-sample `acc` they also report.
+    assert score["score"] == pytest.approx((100 * 2 * 0.75 + 300 * 8 * 0.6) / 2600)
+    assert score["truncation_rate"] == pytest.approx(0.1)
+
+
+def test_pre_fix_artifact_reports_docs_from_its_sample_evidence(tmp_path):
+    """Artifacts written before the run recorded its own counts still must
+    not publish a metric's value-list length as the benchmark's size: the
+    samples file has one line per evaluated doc, and the k of the average
+    that is actually present is read off the ``<metric>_avg@k`` key.
+    """
+    run_dir = tmp_path / _RUN_DIR_NAME
+    leaves = {
+        "leaf_partial": _leaf_artifacts(
+            run_dir,
+            "leaf_partial",
+            docs=720,
+            k=8,
+            avg_at_k=0.47,
+            plain=0.74,
+            samples_rows=720,
+            recorded_counts=False,
+        )
+    }
+
+    benchmark_info, score = build_score(
+        _benchmark_doc(run_dir, leaves),
+        _publish_config({"bench": {"field": "reasoning"}}),
+    )
+
+    assert benchmark_info["num_samples"] == 720
+    assert benchmark_info["avg_k"] == 8
+    assert score["score"] == pytest.approx(0.47)

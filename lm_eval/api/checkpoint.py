@@ -147,6 +147,7 @@ def serialize_response(response: Any) -> str:
         getattr(response, "raw_response", None) is not None
         or getattr(response, "finish_reason", None) is not None
         or getattr(response, "unparsed", False)
+        or getattr(response, "rollouts", None) is not None
     ):
         return json.dumps(
             {
@@ -160,6 +161,13 @@ def serialize_response(response: Any) -> str:
                 "truncated": bool(getattr(response, "truncated", False)),
                 "unparsed": bool(getattr(response, "unparsed", False)),
                 "parsed_answer": getattr(response, "parsed_answer", None),
+                # Per-rollout record of what the doc's k sampled generations
+                # actually answered (and whether each hit the output cap).
+                # Restoring it is what keeps a resumed run's avg@k scoring
+                # and truncation rate covering every doc instead of only the
+                # ones re-generated after the resume -- see
+                # `RWKVLoglikelihoodResponse.rollouts`.
+                "rollouts": getattr(response, "rollouts", None),
             },
             default=str,
             ensure_ascii=False,
@@ -204,6 +212,7 @@ def deserialize_response(data: str) -> Any:
             truncated=bool(payload.get("truncated", False)),
             unparsed=bool(payload.get("unparsed", False)),
             parsed_answer=payload.get("parsed_answer"),
+            rollouts=payload.get("rollouts"),
         )
     if kind == "rwkv_completion":
         from lm_eval.models.openai_completions import _RWKVCompletion

@@ -45,13 +45,10 @@ token_env = "SCOREBOARD_PUBLICATION_TOKEN"
 
 [publication.tasks.race]
 field = "reasoning"
-avg_k = 1
 
 [publication.tasks.wmdp]
 field = "knowledge"
-avg_k = 1
 
 [publication.tasks.winogender]
 field = "reasoning"
-avg_k = 1
 

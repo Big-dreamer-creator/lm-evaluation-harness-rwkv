@@ -44,8 +44,6 @@ rerun_reason = "Winogender and WMDP recovery run with official RWKV7-G1K-13.3B 2
 
 [publication.tasks.winogender]
 field = "reasoning"
-avg_k = 8
 
 [publication.tasks.wmdp]
 field = "knowledge"
-avg_k = 4
