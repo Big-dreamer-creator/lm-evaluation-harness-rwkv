@@ -100,12 +100,26 @@ def extract_albatross_mcq_answer(
     if answer is not None:
         return answer
     for line in reversed(answer_text.splitlines()):
+        stripped = line.strip()
         match = re.fullmatch(
-            rf"\s*(?:final\s+answer\s*[:=]?\s*)?"
-            rf"[\[(]?([{label_class}])[\])]?[.!]?\s*",
-            line,
+            rf"(?:final\s+answer\s*[:=]?\s*)?"
+            rf"[\[(]?([{label_class}])[\])]?[.!]?",
+            stripped,
             re.IGNORECASE,
         )
+        if match is None:
+            # The model may echo the chosen option's full text right after
+            # the label instead of stopping at a bare letter (e.g.
+            # "C. <full option text>") -- require an explicit label
+            # delimiter immediately after the letter (not just trailing
+            # whitespace) so this still rejects ordinary prose that happens
+            # to start with a capital letter (e.g. "A cat sat on the mat.").
+            match = re.match(
+                rf"(?:final\s+answer\s*[:=]?\s*)?"
+                rf"[\[(]?([{label_class}])[\])\].:]\s",
+                stripped,
+                re.IGNORECASE,
+            )
         if match:
             return match.group(1).upper()
     if think_closed:
@@ -154,6 +168,110 @@ class AlbatrossMultiChoiceFilter(Filter):
                     response,
                     choice_labels=self.choice_labels,
                     require_think_close=self.require_think_close,
+                )
+                or self.fallback
+                for response in response_set
+            ]
+            for response_set in resps
+        ]
+
+
+_YES_NO_EXPLICIT_RES = (
+    re.compile(
+        r"(?:final\s+answer|correct\s+answer|my\s+answer|the\s+answer)\s*"
+        r"(?:is\s*|would\s+be\s*|[:=]\s*)[\"']?\s*(yes|no)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(yes|no)[\"']?\s*[,.]?\s+(?:is|would\s+be)\s+(?:the\s+)?"
+        r"(?:final\s+|correct\s+)?answer",
+        re.IGNORECASE,
+    ),
+)
+_YES_NO_BARE_LINE_RE = re.compile(r"^\s*[\"'(]?\s*(yes|no)\s*[\"').!]*\s*$", re.IGNORECASE)
+_YES_NO_WORD_RE = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
+
+
+def _last_yes_no_match(text: str, patterns: tuple[re.Pattern[str], ...]) -> str | None:
+    matches = [
+        (match.start(), match.group(1).lower())
+        for pattern in patterns
+        for match in pattern.finditer(text)
+    ]
+    return max(matches, key=lambda item: item[0])[1] if matches else None
+
+
+def _last_bare_yes_no_line(text: str) -> str | None:
+    for line in reversed(text.splitlines()):
+        match = _YES_NO_BARE_LINE_RE.match(line)
+        if match:
+            return match.group(1).lower()
+    return None
+
+
+def extract_yes_no_answer(text: str, *, require_think_close: bool = False) -> str | None:
+    """Extract a final "yes"/"no" verdict from the concluding segment only
+    (after ``</think>``, if present) -- an explicit "the answer is yes/no"
+    statement outranks a bare trailing "yes."/"no." line, which outranks
+    the last bare mention of either word anywhere in that segment. A
+    chain-of-thought model may say "yes" while reasoning before settling
+    on "no" at the end, so only the *last* occurrence in each tier is
+    trusted, and reasoning text before ``</think>`` is never searched --
+    treating a mid-reasoning "yes" as the verdict would misattribute an
+    answer the model never actually gave.
+    """
+    if not isinstance(text, str):
+        return None
+    if require_think_close and "</think>" not in text:
+        return None
+
+    _before_think, think_closed, answer_text = text.rpartition("</think>")
+    answer_text = _ALBATROSS_ANSWER_MARKUP.sub(
+        "", answer_text if think_closed else text
+    )
+
+    answer = _last_yes_no_match(answer_text, _YES_NO_EXPLICIT_RES)
+    if answer is not None:
+        return answer
+
+    answer = _last_bare_yes_no_line(answer_text)
+    if answer is not None:
+        return answer
+
+    answer = _last_yes_no_match(answer_text, (_YES_NO_WORD_RE,))
+    if answer is not None:
+        return answer
+
+    return None
+
+
+@register_filter("yes_no")
+class YesNoFilter(Filter):
+    """Extract a final "yes"/"no" verdict from free-form generations.
+
+    Companion to ``AlbatrossMultiChoiceFilter``/``albatross_mcq`` for tasks
+    whose answer space is yes/no rather than lettered choices (e.g.
+    ``mc_taco``, ``discrim_eval``) -- these should be scored generatively
+    from the model's actual words instead of being dressed up as a lettered
+    multiple-choice question for ``build_choice_prompt``/``parse_choice_index``
+    (see ``lm_eval/models/rwkv_choice.py``) to resolve.
+    """
+
+    def __init__(
+        self,
+        require_think_close: bool = False,
+        fallback: str = "[invalid]",
+    ) -> None:
+        self.require_think_close = require_think_close
+        self.fallback = fallback
+
+    def apply(
+        self, resps: Iterable[Sequence[str]], docs: Sequence[dict[str, Any]]
+    ) -> list[list[str]]:
+        return [
+            [
+                extract_yes_no_answer(
+                    response, require_think_close=self.require_think_close
                 )
                 or self.fallback
                 for response in response_set
