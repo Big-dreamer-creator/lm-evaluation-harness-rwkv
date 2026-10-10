@@ -5,7 +5,7 @@ schema_version = 1
 backend = "rwkv7-remote"
 
 model_name = "rwkv7-g1k-13.3b"
-base_url = "https://api.rwkv.rs/v1/completions"
+base_url = "https://vllm.rwkvos.com/v1/completions"
 tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/13.3b"
 trust_remote_code = true
 benchmarks = ["mc_taco"]
