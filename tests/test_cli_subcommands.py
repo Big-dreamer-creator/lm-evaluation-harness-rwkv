@@ -1763,3 +1763,482 @@ log_samples: true
         # 0 is a valid explicit value and should override YAML
         assert cfg.num_fewshot == 0, "CLI 0 should override YAML's 5"
         assert cfg.batch_size == 1, "Truthy CLI value overrides YAML"
+
+
+CAMPAIGN_TOML = """
+schema_version = 1
+backend = "rwkv7-remote"
+
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["mutual"]
+max_length = 25600
+max_num_seqs = 100
+log_samples = true
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "open_think"
+wkv_mode = "fp32io16"
+
+[[models]]
+model_name = "rwkv7-g1k-1.5b"
+tokenizer_name = "/weights/1.5b"
+output_dir = "results/1.5b"
+
+[[models]]
+model_name = "rwkv7-g1k-7.2b"
+tokenizer_name = "/weights/7.2b"
+output_dir = "results/7.2b"
+max_num_seqs = 20
+"""
+
+
+def _write_campaign(tmp_path, text=CAMPAIGN_TOML, name="campaign.toml"):
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+class TestEvaluatorConfigCampaignModels:
+    """One campaign TOML covers the whole model ladder."""
+
+    def test_campaign_expands_to_one_config_per_model(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        configs = EvaluatorConfig.load_configs(_write_campaign(tmp_path))
+
+        assert [cfg["metadata"]["model_name"] for cfg in configs] == [
+            "rwkv7-g1k-1.5b",
+            "rwkv7-g1k-7.2b",
+        ]
+        assert [cfg["output_path"] for cfg in configs] == [
+            "results/1.5b",
+            "results/7.2b",
+        ]
+        # Shared settings come from the top-level table, per-model deviations
+        # from the entry itself.
+        assert [cfg["model_args"]["num_concurrent"] for cfg in configs] == [100, 20]
+        assert [cfg["model_args"]["tokenizer"] for cfg in configs] == [
+            "/weights/1.5b",
+            "/weights/7.2b",
+        ]
+        assert all(cfg["tasks"] == ["mutual"] for cfg in configs)
+        assert all(cfg["metadata"]["cot_mode"] == "open_think" for cfg in configs)
+
+    def test_model_overrides_beat_every_entry(self, tmp_path):
+        """Launch-time overlays own the campaign-wide knobs."""
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        _write_campaign(tmp_path)
+        overlay = tmp_path / "overlay.toml"
+        overlay.write_text(
+            """
+include = ["campaign.toml"]
+
+[model_overrides]
+max_num_seqs = 200
+timeout = 1800
+max_retries = 6
+""",
+            encoding="utf-8",
+        )
+
+        configs = EvaluatorConfig.load_configs(overlay)
+
+        assert [cfg["model_args"]["num_concurrent"] for cfg in configs] == [200, 200]
+        assert all(cfg["model_args"]["timeout"] == 1800 for cfg in configs)
+        assert all(cfg["model_args"]["max_retries"] == 6 for cfg in configs)
+
+    def test_campaign_requires_distinct_output_dirs(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(
+            tmp_path,
+            CAMPAIGN_TOML.replace(
+                'output_dir = "results/7.2b"', 'output_dir = "results/1.5b"'
+            ),
+        )
+
+        with pytest.raises(ValueError, match="each model needs its own output_dir"):
+            EvaluatorConfig.load_configs(campaign)
+
+    def test_campaign_requires_distinct_model_names(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(
+            tmp_path,
+            CAMPAIGN_TOML.replace(
+                'model_name = "rwkv7-g1k-7.2b"', 'model_name = "rwkv7-g1k-1.5b"'
+            ),
+        )
+
+        with pytest.raises(ValueError, match="duplicate model_name in models"):
+            EvaluatorConfig.load_configs(campaign)
+
+    def test_campaign_entry_must_name_its_model(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(
+            tmp_path, CAMPAIGN_TOML.replace('model_name = "rwkv7-g1k-7.2b"\n', "")
+        )
+
+        with pytest.raises(ValueError, match=r"models\[1\] must set model_name"):
+            EvaluatorConfig.load_configs(campaign)
+
+    def test_campaign_entry_rejects_unknown_fields(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(tmp_path, CAMPAIGN_TOML + "\nmax_lengths = 4096\n")
+
+        with pytest.raises(
+            ValueError, match=r"Unknown models\[1\] fields: max_lengths"
+        ):
+            EvaluatorConfig.load_configs(campaign)
+
+    def test_campaign_entry_errors_name_the_entry(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(tmp_path, CAMPAIGN_TOML + "\nmax_length = 0\n")
+
+        with pytest.raises(ValueError, match=r"models\[1\]: max_length must be"):
+            EvaluatorConfig.load_configs(campaign)
+
+    def test_model_overrides_requires_a_models_array(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(
+            tmp_path,
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1k-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["mutual"]
+output_dir = "results/1.5b"
+max_length = 25600
+max_num_seqs = 100
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "open_think"
+wkv_mode = "fp32io16"
+
+[model_overrides]
+max_num_seqs = 200
+""",
+        )
+
+        with pytest.raises(ValueError, match="model_overrides requires a"):
+            EvaluatorConfig.load_configs(campaign)
+
+    def test_models_require_the_versioned_schema(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(
+            tmp_path,
+            """
+model = "rwkv7-remote"
+tasks = ["mutual"]
+
+[[models]]
+model_name = "rwkv7-g1k-1.5b"
+""",
+        )
+
+        with pytest.raises(ValueError, match="models requires the versioned"):
+            EvaluatorConfig.load_configs(campaign)
+
+    def test_load_config_needs_a_selection_for_a_campaign(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(tmp_path)
+
+        with pytest.raises(ValueError, match="declares 2 models"):
+            EvaluatorConfig.load_config(campaign)
+
+    def test_only_model_selects_a_declared_model(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(tmp_path)
+
+        cfg = EvaluatorConfig.load_config(campaign, only_model="rwkv7-g1k-7.2b")
+
+        assert cfg["metadata"]["model_name"] == "rwkv7-g1k-7.2b"
+        assert cfg["output_path"] == "results/7.2b"
+        assert cfg["model_args"]["num_concurrent"] == 20
+
+    def test_only_model_rejects_an_unknown_model(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(tmp_path)
+
+        with pytest.raises(ValueError, match="is not declared by this config"):
+            EvaluatorConfig.load_config(campaign, only_model="rwkv7-g1k-13.3b")
+
+    def test_only_model_requires_a_campaign_config(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(
+            tmp_path,
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1k-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["mutual"]
+output_dir = "results/1.5b"
+max_length = 25600
+max_num_seqs = 100
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "open_think"
+wkv_mode = "fp32io16"
+""",
+        )
+
+        with pytest.raises(ValueError, match=r"requires a versioned config"):
+            EvaluatorConfig.load_config(campaign, only_model="rwkv7-g1k-1.5b")
+
+    def test_campaign_entry_resolves_like_the_equivalent_single_model_file(
+        self, tmp_path
+    ):
+        """A campaign entry must reproduce the per-model file it replaces.
+
+        The checkpoint fingerprint is derived from the resolved config, so this
+        equality is what keeps an in-flight run resumable after per-model files
+        collapse into one campaign file.
+        """
+        from dataclasses import asdict
+
+        from lm_eval.api.checkpoint import (
+            compute_config_fingerprint,
+            without_operational_args,
+        )
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        campaign = _write_campaign(tmp_path)
+        single = tmp_path / "single.toml"
+        single.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1k-7.2b"
+base_url = "https://api.rwkv.rs/v1/completions"
+tokenizer_name = "/weights/7.2b"
+benchmarks = ["mutual"]
+output_dir = "results/7.2b"
+max_length = 25600
+max_num_seqs = 20
+log_samples = true
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "open_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        def resolved(source):
+            return asdict(EvaluatorConfig(**source)._configure())
+
+        def fingerprint(source):
+            payload = resolved(source)
+            payload["model_args"] = without_operational_args(payload["model_args"])
+            payload["metadata"] = without_operational_args(payload["metadata"])
+            for key in ("checkpoint", "publication", "resume"):
+                payload.pop(key, None)
+            return compute_config_fingerprint(payload)
+
+        entry = EvaluatorConfig.load_config(campaign, only_model="rwkv7-g1k-7.2b")
+        entry.pop("config", None)
+        single_config = EvaluatorConfig.load_config(single)
+
+        assert resolved(entry)["model_args"] == resolved(single_config)["model_args"]
+        assert fingerprint(entry) == fingerprint(single_config)
+
+
+class _FakeProcess:
+    """Stand-in for a campaign child process."""
+
+    def __init__(self, command, returncode, created, waits):
+        self.command = command
+        self.returncode = returncode
+        self._created = created
+        self._waits = waits
+        self.terminated = False
+
+    def wait(self):
+        self._waits.append(len(self._created))
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+
+def _campaign_configs(tmp_path):
+    """Two-model campaign whose result dirs live under tmp_path."""
+    from lm_eval.config.evaluate_config import EvaluatorConfig
+
+    configs = EvaluatorConfig.load_configs(_write_campaign(tmp_path))
+    for cfg in configs:
+        cfg["output_path"] = str(tmp_path / cfg["metadata"]["model_name"])
+    return configs
+
+
+class TestRunCampaignFanOut:
+    """`lm-eval run` fans one campaign TOML out into one process per model."""
+
+    def test_child_command_selects_the_model(self):
+        command = Run._campaign_child_command(
+            "rwkv7-g1k-7.2b", ["run", "-C", "campaign.toml", "--resume"]
+        )
+
+        assert command[1:4] == ["-m", "lm_eval", "run"]
+        assert command[4:] == [
+            "-C",
+            "campaign.toml",
+            "--resume",
+            "--only-model",
+            "rwkv7-g1k-7.2b",
+        ]
+
+    def test_execute_dispatches_a_campaign_to_one_child_per_model(
+        self, tmp_path, monkeypatch
+    ):
+        campaign = _write_campaign(tmp_path)
+        args = argparse.Namespace(config=str(campaign), only_model=None, jobs=None)
+        dispatched = []
+        monkeypatch.setattr(Run, "_execute_campaign", lambda a, c: dispatched.append(c))
+        monkeypatch.setattr(
+            Run, "_execute_single", lambda a: dispatched.append("single")
+        )
+
+        Run._execute(args)
+
+        assert len(dispatched) == 1
+        assert [cfg["metadata"]["model_name"] for cfg in dispatched[0]] == [
+            "rwkv7-g1k-1.5b",
+            "rwkv7-g1k-7.2b",
+        ]
+
+    def test_execute_keeps_a_single_model_config_in_process(
+        self, tmp_path, monkeypatch
+    ):
+        single = tmp_path / "single.toml"
+        single.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1k-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["mutual"]
+output_dir = "results/1.5b"
+max_length = 25600
+max_num_seqs = 100
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "open_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(config=str(single), only_model=None, jobs=None)
+        dispatched = []
+        monkeypatch.setattr(Run, "_execute_campaign", lambda a, c: dispatched.append(c))
+        monkeypatch.setattr(
+            Run, "_execute_single", lambda a: dispatched.append("single")
+        )
+
+        Run._execute(args)
+
+        assert dispatched == ["single"]
+
+    def test_execute_does_not_fan_out_from_within_a_child(
+        self, tmp_path, monkeypatch
+    ):
+        """`--only-model` is the child's own invocation; it must not recurse."""
+        campaign = _write_campaign(tmp_path)
+        args = argparse.Namespace(
+            config=str(campaign), only_model="rwkv7-g1k-7.2b", jobs=None
+        )
+        dispatched = []
+        monkeypatch.setattr(Run, "_execute_campaign", lambda a, c: dispatched.append(c))
+        monkeypatch.setattr(
+            Run, "_execute_single", lambda a: dispatched.append("single")
+        )
+
+        Run._execute(args)
+
+        assert dispatched == ["single"]
+
+    def test_campaign_runs_every_model_and_reports_failures(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        configs = _campaign_configs(tmp_path)
+        created, waits, popens = [], [], []
+
+        def fake_popen(command, **_kwargs):
+            created.append(command)
+            process = _FakeProcess(
+                command, 3 if "7.2b" in " ".join(command) else 0, created, waits
+            )
+            popens.append(process)
+            return process
+
+        monkeypatch.setattr("lm_eval._cli.run.subprocess.Popen", fake_popen)
+
+        with pytest.raises(SystemExit) as exit_info:
+            Run._execute_campaign(argparse.Namespace(jobs=None), configs)
+
+        assert exit_info.value.code == 1
+        assert len(created) == 2
+        assert waits == [2, 2]
+        assert not any(process.terminated for process in popens)
+        logs = sorted(tmp_path.glob("*/console.log"))
+        assert [log.parent.name for log in logs] == [
+            "rwkv7-g1k-1.5b",
+            "rwkv7-g1k-7.2b",
+        ]
+        assert "--only-model rwkv7-g1k-7.2b" in logs[1].read_text(encoding="utf-8")
+        summary = capsys.readouterr().out
+        assert "campaign summary: 1/2 models completed" in summary
+        assert "fail  rwkv7-g1k-7.2b" in summary
+
+    def test_jobs_caps_the_fan_out(self, tmp_path, monkeypatch):
+        configs = _campaign_configs(tmp_path)
+        created, waits = [], []
+
+        def fake_popen(command, **_kwargs):
+            created.append(command)
+            return _FakeProcess(command, 0, created, waits)
+
+        monkeypatch.setattr("lm_eval._cli.run.subprocess.Popen", fake_popen)
+
+        Run._execute_campaign(argparse.Namespace(jobs=1), configs)
+
+        # Only one child is in flight when the first wait happens; the second
+        # model starts after that one is reaped.
+        assert waits == [1, 2]
+
+    def test_campaign_stops_children_when_interrupted(self, tmp_path, monkeypatch):
+        configs = _campaign_configs(tmp_path)
+        popens = []
+
+        def fake_popen(command, **_kwargs):
+            process = _FakeProcess(command, 0, [], [])
+            process.wait = _raise_interrupt
+            popens.append(process)
+            return process
+
+        def _raise_interrupt():
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("lm_eval._cli.run.subprocess.Popen", fake_popen)
+
+        with pytest.raises(KeyboardInterrupt):
+            Run._execute_campaign(argparse.Namespace(jobs=None), configs)
+
+        assert all(process.terminated for process in popens)

@@ -178,6 +178,32 @@ lm-eval-harness 的 task/group/tag
 `--max-num-seqs`，再把这里的 `max_num_seqs` 改成同一个值，不要通过缩短
 权重版本名或混用结果目录来规避配置管理。
 
+### 6.1 全量跑：一份 TOML 覆盖全部权重（`[[models]]`）
+
+同一套 benchmark 在 1.5b/2.9b/7.2b/13.3b 上跑时，各权重的差异只有
+`model_name`、`tokenizer_name`、`output_dir` 和该权重在推理端的容量
+（`max_num_seqs`）。把这些差异写成 `[[models]]` 条目，其余字段放在顶层表里，
+一份 TOML 即可覆盖整个权重梯队（与 lighteval-rwkv 的 `configs/models.toml`
+同一思路，示例见 [docs/config_files.md](docs/config_files.md#one-file-per-benchmark-set)）：
+
+```toml
+[[models]]
+model_name = "rwkv7-g1k-1.5b"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/1.5b"
+max_num_seqs = 64
+output_dir = "results/rwkv7-g1k-1.5b-...-full"
+```
+
+取值优先级由低到高为：顶层表 → `[[models]]` 条目 → `[model_overrides]`。
+每个条目必须自带 `model_name` 与 `output_dir`，且各条目的
+`model_name`/`output_dir` 不得重复（否则结果与 checkpoint 会互相覆盖）。
+`lm-eval run -C <campaign.toml>` 会为每个权重各起一个子进程（默认同时运行，
+才能让推理端四个权重都保持满载），子进程用 `--only-model <model_name>` 读同一
+份 TOML，因此 checkpoint 指纹、结果目录与发布参数与原来的单权重配置完全一致，
+已有断点续跑不受影响；日志追加到各自 `output_dir/console.log`。`--jobs N`
+限制同时运行的权重数；任一权重失败时命令以非 0 退出。启动期的临时覆盖项放到
+`[model_overrides]`，因为它作用在每个条目之上。
+
 ## 7. Prompt 与采样模式
 
 `rwkv_profile.prompt_template` 仅接受官方模板中的三种模式：

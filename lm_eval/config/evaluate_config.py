@@ -102,6 +102,7 @@ VERSIONED_CONFIG_FIELDS = {
     "max_length",
     "max_num_seqs",
     "max_retries",
+    "models",
     "model_overrides",
     "model_name",
     "output_dir",
@@ -138,6 +139,10 @@ RWKV_PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
 RWKV_GENERATION_PROMPTS = {"fake_think", "open_think"}
 RWKV_WKV_MODES = {"fp16", "fp32io16"}
 RWKV_BACKENDS = {"rwkv7-http", "rwkv7-remote", "rwkv7-remote-chat"}
+# The two campaign-container keys are consumed by `_expand_models` before a
+# model entry is validated, so a `[[models]]` entry may carry every field a
+# single-model config may carry except the containers themselves.
+VERSIONED_MODEL_ENTRY_FIELDS = VERSIONED_CONFIG_FIELDS - {"models", "model_overrides"}
 # rwkv7-remote-chat renders no chat template locally (the server does, via
 # chat_template_kwargs) so it never needs a tokenizer, same as rwkv7-http.
 RWKV_BACKENDS_WITHOUT_TOKENIZER = {"rwkv7-http", "rwkv7-remote-chat"}
@@ -349,10 +354,17 @@ class EvaluatorConfig:
 
         # Load and merge TOML/YAML config if provided
         if used_config := getattr(namespace, "config", None):
-            config.update(cls.load_config(cast("str", used_config)))
+            config.update(
+                cls.load_config(
+                    cast("str", used_config),
+                    only_model=getattr(namespace, "only_model", None),
+                )
+            )
 
         # Override with CLI args (only truthy values or 0, exclude non-config args)
-        excluded_args = {"command", "func"}  # argparse internal args
+        # `only_model` only selects which model of a campaign file to load; it is
+        # not an evaluation setting and must never reach the config dataclass.
+        excluded_args = {"command", "func", "only_model"}  # argparse internal args
         cli_args = {
             k: v
             for k, v in vars(namespace).items()
@@ -374,12 +386,16 @@ class EvaluatorConfig:
         return instance
 
     @classmethod
-    def from_config(cls, config_path: str | Path) -> EvaluatorConfig:
+    def from_config(
+        cls, config_path: str | Path, *, only_model: str | None = None
+    ) -> EvaluatorConfig:
         """Build an EvaluationConfig from a TOML or YAML config file.
 
-        Merges with built-in defaults and validates.
+        Merges with built-in defaults and validates. A config that declares
+        several models is ambiguous here; pass ``only_model`` (or use
+        ``load_configs``) to pick one.
         """
-        file_config = cls.load_config(config_path)
+        file_config = cls.load_config(config_path, only_model=only_model)
         return cls(**file_config)._configure()
 
     @classmethod
@@ -388,10 +404,136 @@ class EvaluatorConfig:
         config_path: str | Path,
         *,
         _seen: set[Path] | None = None,
+        only_model: str | None = None,
     ) -> dict[str, Any]:
-        """Load and validate a TOML or YAML evaluation config file."""
+        """Load, validate, and resolve one model's evaluation config.
+
+        Single-model files and ``[[models]]`` campaign files share this entry
+        point: ``only_model`` selects one model from a campaign file, which is
+        how the CLI fans a campaign out into one process per model without
+        writing per-model config files.
+        """
+        configs = cls.load_configs(config_path, _seen=_seen, only_model=only_model)
+        if len(configs) > 1:
+            raise ValueError(
+                f"{config_path} declares {len(configs)} models; pass "
+                "only_model=<model_name> or use load_configs() to resolve them all"
+            )
+        return configs[0]
+
+    @classmethod
+    def load_configs(
+        cls,
+        config_path: str | Path,
+        *,
+        _seen: set[Path] | None = None,
+        only_model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve every model a TOML or YAML config declares, in file order.
+
+        A file that names a single model at the top level yields exactly one
+        resolved config, so both shapes run through one code path. A campaign
+        file lists ``[[models]]`` entries instead: the top-level table holds
+        everything the models share (benchmarks, profile, publication,
+        checkpointing), each entry holds that model's own identity
+        (``model_name``, ``tokenizer_name``, ``output_dir``) plus any versioned
+        field it needs to differ in (for example its own ``max_num_seqs``
+        budget), and ``[model_overrides]`` holds values forced onto every entry
+        last -- the launch-time overlay hook.
+        """
         config_data = cls._load_config_mapping(config_path, _seen=_seen)
-        return cls._normalize_versioned_config(config_data)
+        return cls._expand_models(config_data, only_model=only_model)
+
+    @classmethod
+    def _expand_models(
+        cls, config: dict[str, Any], *, only_model: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Turn one raw config mapping into one resolved config per model."""
+        if "schema_version" not in config:
+            if "models" in config:
+                raise ValueError("models requires the versioned schema_version = 1")
+            if only_model is not None:
+                raise ValueError(
+                    "only_model requires a versioned config that declares [[models]]"
+                )
+            return [cls._normalize_versioned_config(config)]
+
+        models = config.pop("models", None)
+        model_overrides = config.pop("model_overrides", None)
+        if models is None:
+            if model_overrides is not None:
+                raise ValueError("model_overrides requires a [[models]] array")
+            if only_model is not None:
+                raise ValueError(
+                    "only_model requires a versioned config that declares [[models]]"
+                )
+            return [cls._normalize_versioned_config(config)]
+
+        if not isinstance(models, list) or not models:
+            raise TypeError("models must be a non-empty array of tables")
+        if model_overrides is None:
+            model_overrides = {}
+        elif not isinstance(model_overrides, dict):
+            raise TypeError("model_overrides must be a table")
+
+        resolved: list[dict[str, Any]] = []
+        for index, entry in enumerate(models):
+            if not isinstance(entry, dict):
+                raise TypeError(f"models[{index}] must be a table")
+            unknown = sorted(set(entry) - VERSIONED_MODEL_ENTRY_FIELDS)
+            if unknown:
+                raise ValueError(
+                    f"Unknown models[{index}] fields: " + ", ".join(unknown)
+                )
+            if "model_name" not in entry:
+                raise ValueError(f"models[{index}] must set model_name")
+            # Shared campaign settings first, this model's own deviations over
+            # them, and the campaign-wide overrides last.
+            merged = cls._merge_config(config, entry)
+            if model_overrides:
+                merged = cls._merge_config(merged, model_overrides)
+            try:
+                resolved.append(cls._normalize_versioned_config(merged))
+            except (TypeError, ValueError) as error:
+                raise type(error)(f"models[{index}]: {error}") from error
+
+        cls._check_distinct_models(resolved)
+        if only_model is not None:
+            for config_data in resolved:
+                if config_data["metadata"]["model_name"] == only_model:
+                    return [config_data]
+            declared = ", ".join(
+                config_data["metadata"]["model_name"] for config_data in resolved
+            )
+            raise ValueError(
+                f"only_model {only_model!r} is not declared by this config; "
+                f"declared models: {declared}"
+            )
+        return resolved
+
+    @staticmethod
+    def _check_distinct_models(configs: list[dict[str, Any]]) -> None:
+        """Every campaign model needs its own identity and its own result dir.
+
+        Sharing ``output_dir`` would make concurrent campaign children write
+        over each other's results, samples, and checkpoints, and sharing
+        ``model_name`` would make ``only_model`` ambiguous and publish two
+        models under one name.
+        """
+        names = [config_data["metadata"]["model_name"] for config_data in configs]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError("duplicate model_name in models: " + ", ".join(duplicates))
+        output_dirs = [config_data["output_path"] for config_data in configs]
+        duplicates = sorted(
+            {path for path in output_dirs if output_dirs.count(path) > 1}
+        )
+        if duplicates:
+            raise ValueError(
+                "each model needs its own output_dir; duplicated: "
+                + ", ".join(duplicates)
+            )
+
 
     @classmethod
     def _load_config_mapping(

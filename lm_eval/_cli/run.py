@@ -1,9 +1,14 @@
 import argparse
+import io
 import json
 import logging
 import os
+import subprocess
+import sys
 import textwrap
+from collections.abc import Sequence
 from functools import partial
+from pathlib import Path
 
 from lm_eval._cli.subcommand import SubCommand
 from lm_eval._cli.utils import (
@@ -90,6 +95,17 @@ class Run(SubCommand):
             type=str,
             metavar="<path>",
             help="Set initial arguments from YAML config",
+        )
+        config_group.add_argument(
+            "--only-model",
+            type=str,
+            default=None,
+            metavar="<model_name>",
+            help=textwrap.dedent("""
+                Evaluate only the named model of a config that declares
+                [[models]]. The campaign fan-out passes this to each child
+                process; single-model configs never need it.
+            """).strip(),
         )
 
         # Model and Tasks
@@ -374,6 +390,18 @@ class Run(SubCommand):
             help="Confirm understanding of unsafe code execution risks",
         )
         advanced_group.add_argument(
+            "--jobs",
+            type=int,
+            default=None,
+            metavar="<n>",
+            help=textwrap.dedent("""
+                How many models of a [[models]] campaign config to evaluate at
+                once (default: all of them, one child process per model). Each
+                model still keeps its own request budget, checkpoint, and
+                result directory.
+            """).strip(),
+        )
+        advanced_group.add_argument(
             "--metadata",
             type=json.loads,
             default=None,
@@ -386,7 +414,133 @@ class Run(SubCommand):
 
     @staticmethod
     def _execute(args: argparse.Namespace) -> None:
-        """Runs the evaluation harness with the provided arguments."""
+        """Runs the evaluation harness with the provided arguments.
+
+        A config that declares `[[models]]` describes a campaign: every declared
+        model is evaluated, one child process per model, so a single TOML covers
+        the whole model ladder. Any other config runs in this process exactly as
+        before.
+        """
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config_path = getattr(args, "config", None)
+        if config_path and not getattr(args, "only_model", None):
+            configs = EvaluatorConfig.load_configs(config_path)
+            if len(configs) > 1:
+                Run._execute_campaign(args, configs)
+                return
+
+        Run._execute_single(args)
+
+    @staticmethod
+    def _campaign_child_command(model_name: str, argv: Sequence[str]) -> list[str]:
+        """Command that re-runs this same invocation for a single campaign model."""
+        return [sys.executable, "-m", "lm_eval", *argv, "--only-model", model_name]
+
+    @staticmethod
+    def _start_campaign_model(
+        model: tuple[str, str], argv: Sequence[str]
+    ) -> tuple[str, subprocess.Popen, io.BufferedWriter]:
+        """Start one model of a campaign, logging it inside its own output_dir."""
+        model_name, output_dir = model
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        log = (Path(output_dir) / "console.log").open("ab")
+        command = Run._campaign_child_command(model_name, argv)
+        log.write(
+            f"# campaign model {model_name}\n# command: {' '.join(command)}\n".encode()
+        )
+        log.flush()
+        process = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
+            command,
+            cwd=os.getcwd(),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        return model_name, process, log
+
+    @staticmethod
+    def _execute_campaign(
+        args: argparse.Namespace,
+        configs: list[dict],
+        argv: Sequence[str] | None = None,
+    ) -> None:
+        """Evaluate every model a campaign config declares.
+
+        Each model keeps its own request budget, checkpoint, result directory,
+        and publication settings; the child re-reads the very same campaign file
+        with `--only-model`, so its resolved config -- and therefore its
+        checkpoint fingerprint -- is exactly what the equivalent per-model
+        config file produced. Models default to running all at once, which is
+        what keeps a served endpoint busy across the whole ladder; `--jobs` caps
+        the fan-out.
+        """
+        eval_logger = logging.getLogger(__name__)
+        models = [
+            (config_data["metadata"]["model_name"], config_data["output_path"])
+            for config_data in configs
+        ]
+        jobs = max(1, len(models) if not args.jobs else min(args.jobs, len(models)))
+        argv = list(sys.argv[1:] if argv is None else argv)
+        eval_logger.info(
+            "Campaign config declares %d models, running %d at a time: %s",
+            len(models),
+            jobs,
+            ", ".join(model_name for model_name, _ in models),
+        )
+
+        failures: list[tuple[str, int]] = []
+        running: list[tuple[str, subprocess.Popen, io.BufferedWriter]] = []
+        pending = list(models)
+        try:
+            while pending or running:
+                while pending and len(running) < jobs:
+                    running.append(Run._start_campaign_model(pending.pop(0), argv))
+                # Peek instead of popping so an interrupt during the wait still
+                # finds every live child -- including this one -- to stop.
+                model_name, process, log = running[0]
+                returncode = process.wait()
+                running.pop(0)
+                log.close()
+                if returncode == 0:
+                    eval_logger.info("Campaign model %s finished", model_name)
+                else:
+                    failures.append((model_name, returncode))
+                    eval_logger.error(
+                        "Campaign model %s exited with status %d",
+                        model_name,
+                        returncode,
+                    )
+        except BaseException:
+            for _, process, log in running:
+                process.terminate()
+            for _, process, log in running:
+                process.wait()
+                log.close()
+            raise
+
+        failed = {model_name for model_name, _ in failures}
+        print(
+            "\n".join(
+                [
+                    f"campaign summary: {len(models) - len(failures)}/{len(models)} "
+                    "models completed",
+                    *(
+                        f"  {'ok  ' if model_name not in failed else 'fail'}  "
+                        f"{model_name}  {Path(output_dir) / 'console.log'}"
+                        for model_name, output_dir in models
+                    ),
+                ]
+            )
+        )
+        if failures:
+            raise SystemExit(1)
+
+    @staticmethod
+    def _execute_single(args: argparse.Namespace) -> None:
+        """Runs one resolved model config through the evaluation harness."""
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
         from lm_eval.config.evaluate_config import EvaluatorConfig

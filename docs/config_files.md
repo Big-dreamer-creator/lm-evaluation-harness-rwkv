@@ -81,10 +81,10 @@ arguments. Unknown fields fail before model or dataset initialization.
 |----------------------|------|---------|-------------|
 | `schema_version` | int | required | Must be `1` |
 | `backend` | string | required | Must be `"rwkv7-http"` |
-| `model_name` | string | required | Complete served RWKV7 version name |
+| `model_name` | string | required | Complete served RWKV7 version name (top level for a single-model file, per `[[models]]` entry for a campaign) |
 | `base_url` | string | required | HTTP(S) `/v1/completions` endpoint |
 | `benchmarks` | list | required | Unique public benchmark names; configured order is the stable tie-break for the runtime ascending-pending-rollout order |
-| `output_dir` | string | required | Result directory |
+| `output_dir` | string | required | Result directory (top level for a single-model file, per `[[models]]` entry for a campaign) |
 | `max_length` | int | required | Positive service context limit |
 | `batch_size` | int | `1` | lm-eval request batch size |
 | `max_num_seqs` | int | required | Served endpoint's own `--max-num-seqs`; the evaluator's flat request budget is derived from it (no hand-tuned request concurrency) |
@@ -93,12 +93,96 @@ arguments. Unknown fields fail before model or dataset initialization.
 | `rwkv_profile.prompt_template` | string | required | Official RWKV template mode |
 | `rwkv_profile.generation_prompt` | string | required | `fake_think` or `open_think` |
 | `rwkv_profile.wkv_mode` | string | required | Recorded server WKV mode |
+| `models` | array of tables | unset | The model ladder of a campaign; see [One file per benchmark set](#one-file-per-benchmark-set) |
+| `model_overrides` | table | `{}` | Versioned fields forced onto every `[[models]]` entry last; the launch-time overlay hook |
 | `apply_chat_template` | bool | `true` | Render the service's official template |
 | `fewshot_as_multiturn` | bool | chat setting | Render few-shot examples as turns |
 | `log_samples` | bool | `true` | Save inputs and model outputs |
 | `seed` | list[int] | `[0,1234,1234,1234]` | Four lm-eval random seeds |
 | `limit` | number | unset | Smoke-only sample limit |
 | `use_cache` | string | unset | Response cache path |
+
+---
+
+## One file per benchmark set
+
+A full campaign evaluates the same benchmark set on every RWKV7 size, so the
+per-size TOMLs differ only in `model_name`, `tokenizer_name`, `output_dir`, and
+the endpoint capacity each size is served with. Declare those once as
+`[[models]]` entries and keep everything else in the shared top-level table:
+
+```toml
+# configs/eval/rwkv7_g1k_campaign_five_benchmarks_full_scoreboard.toml
+schema_version = 1
+backend = "rwkv7-remote"
+
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["mc_taco", "mutual", "race", "winogender", "wmdp"]
+include_path = ["configs/eval/offline_six_tasks"]
+max_length = 25600
+apply_chat_template = true
+fewshot_as_multiturn = true
+log_samples = true
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "open_think"
+wkv_mode = "fp32io16"
+
+[[models]]
+model_name = "rwkv7-g1k-1.5b"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/1.5b"
+max_num_seqs = 64
+output_dir = "results/rwkv7-g1k-1.5b-...-full"
+
+[[models]]
+model_name = "rwkv7-g1k-2.9b"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/2.9b"
+max_num_seqs = 64
+output_dir = "results/rwkv7-g1k-2.9b-...-full"
+
+# ... one entry per size, in run order
+```
+
+The top-level table holds what the models share; an entry holds what is specific
+to one model and may carry any versioned field. Precedence, lowest to highest:
+top-level table, `[[models]]` entry, `[model_overrides]`. Each entry must name
+its own `model_name` and `output_dir`, and the resolved `output_dir`s and
+`model_name`s must be distinct so that no two models write into the same result
+directory or publish under the same name.
+
+`lm-eval run -C <campaign.toml>` then evaluates every declared model: one child
+process per model, running at the same time by default, because a campaign only
+keeps the served endpoint busy when the whole ladder has requests in flight.
+Each child re-reads the same file with `--only-model <model_name>`, so it keeps
+its own request budget, checkpoint, result directory, and publication settings
+— and resolves to exactly the config the equivalent single-model file
+produced, checkpoint fingerprint included, so an in-progress run stays
+resumable across the switch to one file. Per-model console output is appended to
+`<output_dir>/console.log`. `--jobs N` caps how many models run at once;
+`--only-model <model_name>` runs one model without fanning out (that is what the
+children do, and it is also the way to re-run a single size by hand).
+
+Launch-time overlays keep working: because the overlay cannot know which
+per-model values it should beat, put campaign-wide launch knobs under
+`[model_overrides]`.
+
+```toml
+# local launch overlay (gitignored temp/, one file for the whole ladder)
+schema_version = 1
+include = ["../configs/eval/rwkv7_g1k_campaign_five_benchmarks_full_scoreboard.toml"]
+
+[model_overrides]
+max_num_seqs = 200
+timeout = 1800
+max_retries = 6
+```
+
+The campaign exits non-zero if any model failed, after reporting a one-line
+summary per model, so a batch launcher can tell success from partial failure.
+`lm-eval publish -C <campaign.toml>` reads the top-level `[publication]` table;
+pass `--rerun_reason` when a single model's note has to differ from the shared
+one.
 
 Unversioned TOML and YAML files remain compatible with upstream lm-eval. Their
 keys correspond directly to CLI arguments:
