@@ -43,10 +43,12 @@ enabled = true
 fresh = false
 
 # timeout/max_retries are scheduling knobs excluded from the checkpoint
-# fingerprint (lm_eval/api/checkpoint.OPERATIONAL_MODEL_ARGS), so raising
-# them after an interruption only redispatches unfinished requests.
+# fingerprint (lm_eval/api/checkpoint.OPERATIONAL_MODEL_ARGS), so changing
+# them after an interruption only redispatches unfinished requests. Five
+# minutes is well above a 128-token no_think answer; the earlier 30-minute
+# value let a handful of stalled tail requests freeze a whole task.
 [model_overrides]
-timeout = 1800
+timeout = 300
 max_retries = 6
 
 [publication]
