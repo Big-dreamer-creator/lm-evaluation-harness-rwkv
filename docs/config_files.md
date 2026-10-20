@@ -126,6 +126,33 @@ The protocol identity is `rwkv-generative-v2`. Use a separate output/checkpoint
 directory for runs made before this version. Old raw answers need a versioned
 replay before their scores can be published using the new protocol.
 
+### Local RWKV coding
+
+`lm-eval coding -C configs/eval/rwkv7_coding_local.toml` uses the same validated
+RWKV model/profile fields and adds a strict `[coding]` table. This entry point
+reads a local JSONL problem suite, generates over HTTP, and executes Python tests
+in local Docker containers. It does not resolve `rwkv_coding_local` through the
+ordinary task registry. Model metadata and samples are always saved locally;
+automatic publication and generic run-only task/checkpoint overrides are rejected.
+
+| Coding field | Default | Meaning |
+| --- | --- | --- |
+| `coding.problems` | required | Local JSONL or JSONL.gz file; relative to the config |
+| `coding.num_samples` | `8` | Fixed independent generations per problem |
+| `coding.pass_k` | `[1, num_samples]` | Values of k, each no greater than num_samples |
+| `coding.workers` | `2` | Local grading workers; separate from inference concurrency |
+| `coding.test_timeout` | `5.0` | Per-candidate execution timeout in seconds |
+| `coding.memory_mb` | `4096` | Memory limit per container |
+| `coding.docker_image` | `python:3.11-slim` | Existing local image, resolved to an immutable ID |
+
+The exact `weight_revision` must include `ctx<number>`. Raw completions require
+the official local `tokenizer_name`; the chat backend delegates the native RWKV
+template to its server. Both require `apply_chat_template = true`. `output_dir`
+also resolves relative to the config. Use `--phase generate` without Docker or
+`--phase score --samples ... --output-dir ...` for offline replay into an empty
+directory. Only an incomplete generation may use `--resume`; scoring identities
+and full problem/repeat coverage are verified before accepting saved answers.
+
 
 ## One file per benchmark set
 
