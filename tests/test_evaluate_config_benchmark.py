@@ -1,6 +1,6 @@
 import pytest
 
-from lm_eval.config.evaluate_config import _classify_benchmark
+from lm_eval.config.evaluate_config import EvaluatorConfig, _classify_benchmark
 from lm_eval.tasks import TaskManager
 
 

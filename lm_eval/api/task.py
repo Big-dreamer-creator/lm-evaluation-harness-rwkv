@@ -1560,17 +1560,9 @@ class ConfigurableTask(Task):
                 exact_match = int(is_greedy[gold]) if gold != -100 else 0
 
             if any(getattr(r, "unparsed", False) for r in results):
-                # None of the k generative samples could be parsed into a
-                # choice letter for this doc (see
-                # RWKVLoglikelihoodResponse.unparsed) -- `pred`/`is_greedy`
-                # above are backed by an arbitrary placeholder index, not a
-                # genuine answer. Score at the random-baseline rate instead
-                # of letting argmax silently credit/debit a choice the model
-                # never actually named.
-                random_baseline = 1.0 / len(choices)
-                acc = random_baseline
-                acc_norm = random_baseline
-                acc_bytes = random_baseline
+                # Missing/invalid answers earn no correctness credit.
+                pred = pred_norm = pred_byte = -1
+                acc = acc_norm = acc_bytes = 0.0
                 exact_match = 0
 
             prob_norm = utils.softmax(lls)

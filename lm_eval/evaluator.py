@@ -165,7 +165,7 @@ def _is_truncated(generation: Any) -> bool:
 
 
 def _record_rollout_stats(
-    task_obj: Task, doc_id: Any, completions: int, truncated: Optional[int]
+    task_obj: Task, doc_id: Any, completions: int, truncated: int | None
 ) -> None:
     """Record one doc's rollout counts for the results' ``n_completions``/
     ``n_truncated``/``truncation_rate`` fields.
@@ -183,6 +183,10 @@ def _record_rollout_stats(
         stats = {}
         task_obj._rollout_stats = stats
     stats[doc_id] = {"completions": completions, "truncated": truncated}
+
+
+class _RepeatedMetricValues(list):
+    """Aggregation inputs from every rollout of one document."""
 
 
 def _install_avg_at_k_patch(
@@ -221,16 +225,17 @@ def _install_avg_at_k_patch(
     def _average_metrics(per_sample: list[dict]) -> dict:
         metrics = dict(per_sample[0])
         for key in per_sample[0]:
-            values = [m[key] for m in per_sample if key in m]
-            if values and all(isinstance(v, (int, float)) for v in values):
-                avg_key = f"{key}_{metric_name}"
-                metrics[avg_key] = sum(values) / len(values)
-                task_obj._aggregation_list[avg_key] = task_obj._aggregation_list.get(
-                    key, mean
-                )
-                task_obj._higher_is_better[avg_key] = task_obj._higher_is_better.get(
-                    key, True
-                )
+            values = [sample[key] for sample in per_sample if key in sample]
+            if not values:
+                continue
+            avg_key = f"{key}_{metric_name}"
+            metrics[avg_key] = (
+                sum(values) / len(values)
+                if all(isinstance(value, (int, float)) for value in values)
+                else _RepeatedMetricValues(values)
+            )
+            task_obj._aggregation_list[avg_key] = task_obj._aggregation_list.get(key, mean)
+            task_obj._higher_is_better[avg_key] = task_obj._higher_is_better.get(key, True)
         return metrics
 
     if output_type == "multiple_choice":
@@ -258,19 +263,13 @@ def _install_avg_at_k_patch(
                 len(sample_encodings),
                 truncation[0] if truncation is not None else None,
             )
-            # A sample whose generation couldn't be parsed into a choice
-            # letter didn't actually "guess wrong" -- it never named a
-            # choice at all. Score it at chance level (1/num_choices)
-            # instead of whatever placeholder index it was encoded with, so
-            # avg@k measures real correctness rather than being dragged down
-            # by answer-format misses.
-            chance = 1.0 / len(sample_encodings[0])
+            # Invalid output is an unsuccessful rollout, not a random guess.
             per_sample = []
             for index, enc in enumerate(sample_encodings):
                 sample_metrics = original_process_results(doc, enc)
                 if parsed_flags is not None and not parsed_flags[index]:
                     sample_metrics = {
-                        key: (chance if isinstance(value, (int, float)) else value)
+                        key: (0.0 if isinstance(value, (int, float)) else value)
                         for key, value in sample_metrics.items()
                     }
                 per_sample.append(sample_metrics)
@@ -583,6 +582,17 @@ def simple_evaluate(
     # Log selected tasks with hierarchy
     _log_selected_tasks(loaded["tasks"], loaded["groups"], task_manager)
 
+    # Size one sampling budget per requested benchmark, across all its leaves.
+    budget_docs = {}
+    for benchmark_name, spec in (benchmark_map or {}).items():
+        if spec.leaf_task_names is not None:
+            leaves = list(spec.leaf_task_names)
+        else:
+            group = loaded["groups"].get(benchmark_name)
+            leaves = [task.task_name for task in group.get_all_tasks(recursive=True)] if group else []
+        total = sum(len(loaded["tasks"][leaf].eval_docs) for leaf in leaves if leaf in loaded["tasks"])
+        budget_docs.update({leaf: total for leaf in leaves})
+
     # Apply config overrides to tasks
     for task_name, task_obj in loaded["tasks"].items():
         if task_obj.get_config("output_type") == "generate_until":
@@ -620,6 +630,20 @@ def simple_evaluate(
         # fewshot_random_seed set for tasks, even with a default num_fewshot (e.g. in the YAML file)
         task_obj.set_fewshot_seed(seed=fewshot_random_seed)
 
+        if getattr(lm, "EVALUATION_PROTOCOL_VERSION", None):
+            if task_obj.OUTPUT_TYPE not in {"generate_until", "multiple_choice"} or task_obj.multiple_input:
+                raise NotImplementedError(f"{task_name}: generative remote scoring requires generation or single-context multiple choice")
+            if set(task_obj._metric_fn_list) & {"acc_mutual_info", "brier_score", "perplexity", "likelihood"}:
+                raise NotImplementedError(f"{task_name}: likelihood metrics require real prompt log probabilities")
+
+        if getattr(lm, "EVALUATION_PROTOCOL_VERSION", None) and task_obj.OUTPUT_TYPE == "generate_until":
+            from lm_eval.filters.extraction import FinalAnswerFilter
+            for ensemble in task_obj._filters:
+                ensemble.filters.insert(0, partial(
+                    FinalAnswerFilter,
+                    require_think_close=getattr(lm, "rwkv_generation_prompt", None) == "open_think",
+                ))
+
         # avg@k: only for backends that declare support (RWKV7Remote), and only
         # for tasks that haven't already opted into their own repeated-sampling
         # scoring (e.g. cruxeval's native repeats=10 pass@k) -- clobbering those
@@ -627,8 +651,8 @@ def simple_evaluate(
         if getattr(lm, "SUPPORTS_AVG_AT_K", False) and task_obj.get_config(
             "repeats"
         ) in (None, 1):
-            num_docs = len(task_obj.eval_docs)
-            k, metric_name = avg_at_k_plan(num_docs, limited=limit is not None)
+            num_docs = budget_docs.get(task_name, len(task_obj.eval_docs))
+            k, metric_name = avg_at_k_plan(num_docs, limited=limit is not None or samples is not None)
             task_obj.set_config(key="repeats", value=k, update=False)
             _install_avg_at_k_patch(task_obj, lm, k, metric_name)
 
@@ -658,7 +682,11 @@ def simple_evaluate(
             "batch_size": batch_size,
             "device": device,
             "gen_kwargs": gen_kwargs,
+            "limit": limit,
+            "samples": samples,
             "max_length": _callback_model_args.get("max_length"),
+            "metadata": metadata or {},
+            "evaluation_protocol": getattr(lm, "EVALUATION_PROTOCOL_VERSION", None),
         },
         "lm_eval_version": lm_eval.__version__,
         "git_hash": get_git_commit_hash(),
@@ -705,6 +733,7 @@ def simple_evaluate(
         results["config"] = {
             "model": model_name,
             "model_args": model_args,
+            "metadata": metadata or {},
         }
         # add more detailed model info if available
         if hasattr(lm, "get_model_info"):
@@ -954,6 +983,13 @@ def evaluate(
             else:
                 cloned_reqs = [req for req in reqs for _ in range(req.repeats)]
                 item_keys = None
+            if item_keys is not None and reqtype == "loglikelihood" and getattr(lm, "SUPPORTS_AVG_AT_K", False):
+                docs = defaultdict(list)
+                for request in reqs:
+                    docs[request.doc_id].extend(request.resps)
+                if any(any(value is None for value in values) and any(value is not None for value in values)
+                       for values in docs.values()):
+                    raise ValueError("Partial generative-choice checkpoint cannot be safely resumed; use a separate fresh run")
             for _ in range(task_padding.get(reqtype, 0)):
                 cloned_reqs.extend([reqs[-1]] * reqs[-1].repeats)
                 if item_keys is not None:
@@ -1096,7 +1132,10 @@ def evaluate(
                     example.update(metrics)
                     acc["logged_samples"].append(example)
                 for metric, value in metrics.items():
-                    acc["raw_metrics"][(metric, filter_key)].append(value)
+                    if isinstance(value, _RepeatedMetricValues):
+                        acc["raw_metrics"][(metric, filter_key)].extend(value)
+                    else:
+                        acc["raw_metrics"][(metric, filter_key)].append(value)
             # Every filter scores the same doc set, so the largest count is
             # the number of docs actually evaluated (``n-samples.effective``
             # and the results' ``n_samples``). Taken from the docs themselves
@@ -1216,6 +1255,23 @@ def evaluate(
                 bname, leaves, metrics
             )
 
+        # Apply the benchmark's own aggregation to the per-leaf avg@k
+        # values. This retains macro averages and declared subgroup weights.
+        averaged_leaves = {}
+        for leaf in leaves:
+            averaged_leaves[leaf] = dict(metrics[leaf])
+            for key, value in metrics[leaf].items():
+                base, separator, filt = key.partition(",")
+                if "_avg@" in base:
+                    original = base.rsplit("_avg@", 1)[0] + (separator + filt if separator else "")
+                    averaged_leaves[leaf][original] = value
+        if spec.strategy == "standalone":
+            averaged_benchmark = averaged_leaves[leaves[0]]
+        elif spec.strategy == "group_aggregate":
+            averaged_benchmark = groups[bname].aggregate(averaged_leaves)
+        else:
+            averaged_benchmark, _ = aggregate_benchmark_fallback(bname, leaves, averaged_leaves)
+
         n_original = sum(
             len(eval_tasks[leaf].eval_docs) for leaf in leaves if leaf in eval_tasks
         )
@@ -1250,6 +1306,7 @@ def evaluate(
             "n-samples": {
                 bname: {"original": n_original, "effective": n_effective}
             },
+            "averaged_results": averaged_benchmark,
             "strategy": spec.strategy,
             "primary_metric_hint": primary_metric_hint,
             "leaf_artifact_paths": dict(tracker["collected_artifacts"]),

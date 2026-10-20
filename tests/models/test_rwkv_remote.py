@@ -13,6 +13,179 @@ def _build(**kwargs):
     return RWKV7Remote(**kwargs)
 
 
+def test_remote_sends_sampling_fields_to_vllm_directly():
+    model = _build(rwkv_generation_prompt="open_think")
+    payload = model._create_payload("question", generate=True,
+                                    gen_kwargs={"max_gen_toks": 32, "until": []})
+    assert "generation_config" not in payload
+    for name in ("temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "penalty_decay"):
+        assert payload[name] == model._generation_profile[name]
+    assert payload["stop"] == [model.PROMPT_STOPS[model.rwkv_prompt_template]]
+
+
+def test_remote_independent_seeds_share_one_concurrent_dispatch(monkeypatch):
+    model = _build(num_concurrent=4, seed=100)
+    captured = []
+
+    async def dispatch(requests, cache_keys, **kwargs):
+        captured.append((requests, cache_keys, kwargs))
+        return [["B"] for _ in requests]
+
+    monkeypatch.setattr(model, "get_batched_requests", dispatch)
+    request = Instance(request_type="generate_until", doc={}, arguments=("question", {"until": [], "max_gen_toks": 32}), idx=0, metadata=("task", 7, 4))
+    model.generate_until([request] * 4)
+    assert len(captured) == 1
+    seeds = sorted(key[1].get("seed") for key in captured[0][1])
+    assert seeds == [100, 101, 102, 103]
+    assert "seed" not in request.args[1]
+
+
+def test_remote_context_budget_preserves_all_prompt_tokens(monkeypatch):
+    model = _build(num_concurrent=4, max_length=100)
+    model.tokenized_requests = True
+    monkeypatch.setattr(model, "tok_encode", lambda texts, **kw: [list(range(len(text))) for text in texts])
+    captured = []
+
+    async def dispatch(requests, cache_keys, **kwargs):
+        captured.append((requests, cache_keys))
+        return [["B"] for _ in requests]
+
+    monkeypatch.setattr(model, "get_batched_requests", dispatch)
+    request = Instance(request_type="generate_until", doc={}, arguments=("q" * 80, {"until": [], "max_gen_toks": 8192}), idx=0)
+    model.generate_until([request])
+    assert len(captured[0][0][0]) == 80
+    assert captured[0][1][0][1]["max_gen_toks"] == 20
+
+
+def test_remote_checkpoint_identity_includes_prompt_mode():
+    from lm_eval.api.checkpoint import model_fingerprint
+    first = _build(rwkv_prompt_template="assistant")
+    second = _build(rwkv_prompt_template="bot")
+    assert model_fingerprint(first) != model_fingerprint(second)
+
+
+def test_remote_retains_every_raw_rollout(monkeypatch):
+    model = _build()
+    monkeypatch.setattr(model, "generate_until", lambda instances: ["A", "B"])
+    responses = model.loglikelihood(_mc_requests("question", ["cats", "dogs"], repeats=2))
+    assert [row["text"] for row in responses[0].rollouts] == ["A", "B"]
+
+
+def test_remote_repeat_seeds_are_concurrent_and_reproducible(monkeypatch):
+    import asyncio
+
+    model = _build(num_concurrent=4, seed=100)
+    seen = []
+    active = 0
+    peak = 0
+
+    async def call(*, sem, gen_kwargs, **kwargs):
+        nonlocal active, peak
+        async with sem:
+            active += 1
+            peak = max(peak, active)
+            seen.append(gen_kwargs["seed"])
+            await asyncio.sleep(0.01)
+            active -= 1
+        return ["B"]
+
+    monkeypatch.setattr(model, "amodel_call", call)
+    request = Instance("generate_until", {}, ("question", {"max_gen_toks": 32, "until": []}), 0, ("task", 7, 4))
+    values = model.generate_until([request] * 4)
+    assert sorted(seen) == [100, 101, 102, 103]
+    assert peak == 4
+    assert [value.seed for value in values] == [100, 101, 102, 103]
+
+
+def test_remote_writes_thinking_contract_to_checkpoint_before_return(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+    from lm_eval.api.checkpoint import CheckpointStore, ItemKey, deserialize_response
+
+    monkeypatch.setenv("RWKV_API_KEY", "unit-test")
+    model = _build(rwkv_generation_prompt="open_think", seed=100)
+    store = CheckpointStore(str(tmp_path / "run.sqlite3"), "test")
+    key = ItemKey("slot", "request", "idempotency", "task", 0, 0, "generate_until", 2)
+    store.register_pending_items([key])
+    model.set_checkpoint_store(store)
+    response = Mock(ok=True)
+    response.json.return_value = {"choices": [{"index": 0, "text": ">The answer is B", "finish_reason": "length"}]}
+    monkeypatch.setattr("lm_eval.models.api_models.requests.post", lambda *a, **kw: response)
+    request = Instance("generate_until", {}, ("question", {"max_gen_toks": 32, "until": []}), 0, ("task", 0, 3))
+    model.generate_until([request], item_keys=[key])
+    restored = deserialize_response(store.get_items("task")["slot"]["result_json"])
+    assert restored.seed == 102
+    assert restored.requires_think_close is True
+    store.close()
+
+
+def test_remote_resume_preserves_repeat_ord_seed(monkeypatch):
+    from types import SimpleNamespace
+
+    model = _build(num_concurrent=4, seed=100)
+    seen = []
+
+    async def dispatch(requests, cache_keys, **kwargs):
+        seen.extend(key[1]["seed"] for key in cache_keys)
+        return [["B"] for _ in requests]
+
+    monkeypatch.setattr(model, "get_batched_requests", dispatch)
+    request = Instance("generate_until", {}, ("question", {"max_gen_toks": 32, "until": []}), 0, ("task", 7, 4))
+    values = model.generate_until([request, request], item_keys=[SimpleNamespace(repeat_ord=1), SimpleNamespace(repeat_ord=3)])
+    assert sorted(seen) == [101, 103]
+    assert [value.seed for value in values] == [101, 103]
+
+
+@pytest.mark.parametrize("gold", range(4))
+def test_remote_invalid_output_earns_zero_for_every_gold(monkeypatch, gold):
+    from types import SimpleNamespace
+    from lm_eval.api.task import ConfigurableTask
+    from lm_eval.evaluator import _install_avg_at_k_patch
+
+    model = _build()
+    monkeypatch.setattr(model, "generate_until", lambda instances: ["I cannot answer this question."] * len(instances))
+    responses = model.loglikelihood(_mc_requests("question", ["cats", "dogs", "birds", "fish"], repeats=4))[::4]
+    task = SimpleNamespace(config=SimpleNamespace(process_results=None), OUTPUT_TYPE="multiple_choice",
+                           _metric_fn_list={"acc": None}, multiple_input=False, multiple_target=False,
+                           doc_to_choice=lambda doc: ["cats", "dogs", "birds", "fish"], doc_to_target=lambda doc: gold,
+                           _aggregation_list={"acc": None}, _higher_is_better={"acc": True}, _avg_k_current_doc_id=0)
+    task.process_results = lambda doc, results: ConfigurableTask.process_results(task, doc, results)
+    _install_avg_at_k_patch(task, model, 4, "avg@4")
+    score = task.process_results({}, responses)
+    assert score == {"acc": 0.0, "acc_avg@4": 0.0}
+
+
+def test_remote_rejects_partial_choice_groups(monkeypatch):
+    model = _build()
+    monkeypatch.setattr(model, "generate_until", lambda instances: ["B"] * len(instances))
+    with pytest.raises(ValueError, match="complete"):
+        model.loglikelihood(_mc_requests("question", ["cats", "dogs"], repeats=2)[:-1])
+
+
+def test_remote_does_not_copy_history_into_each_quoted_option(monkeypatch):
+    model = _build()
+    model._chat_template_source = _ASSISTANT_STYLE_TEMPLATE.replace(
+        "{% if message.role == 'user' %}",
+        "{% if message.role == 'system' %}System: {{ message.content }}\n\n{% elif message.role == 'user' %}",
+    )
+    prompt = model.apply_chat_template([
+        {"role": "system", "content": "Unique system instruction"},
+        {"role": "user", "content": "Unique demonstration"},
+        {"role": "assistant", "content": "yes"},
+        {"role": "user", "content": 'My answer would be "'},
+    ])
+    sent = []
+
+    def generate(instances):
+        sent.extend(inst.args[0] for inst in instances)
+        return ["B"] * len(instances)
+
+    monkeypatch.setattr(model, "generate_until", generate)
+    model.loglikelihood(_mc_requests(prompt, ["yes", "no"]))
+    assert sent[0].count("Unique system instruction") == 1
+    assert sent[0].count("Unique demonstration") == 1
+    assert 'A. My answer would be "yes' in sent[0]
+
+
 def test_rwkv7_remote_construction_defaults(monkeypatch):
     monkeypatch.setenv("RWKV_API_KEY", "test-key")
     model = _build()
@@ -48,6 +221,7 @@ def test_rwkv7_remote_tokenizer_enables_tokenized_requests(monkeypatch):
     monkeypatch.setenv("RWKV_API_KEY", "test-key")
 
     with patch("transformers.AutoTokenizer.from_pretrained") as mock_from_pretrained:
+        mock_from_pretrained.return_value.chat_template = "{{ messages }}"
         model = _build(tokenizer="some/repo")
 
     mock_from_pretrained.assert_called_once()
@@ -77,7 +251,7 @@ def test_rwkv7_remote_without_tokenizer_reports_fixed_sampling_config(monkeypatc
             "frequency_penalty": 0.0,
             "penalty_decay": 0.996,
             "do_sample": True,
-            "stop": ["✿", "\nUser:", "\n### User"],
+            "stop": ["\nUser:"],
         }
     }
 
@@ -106,7 +280,7 @@ def test_rwkv7_remote_get_model_info_reports_sampling_config_with_tokenizer(monk
             "frequency_penalty": 0.0,
             "penalty_decay": 0.996,
             "do_sample": True,
-            "stop": ["✿", "\nUser:", "\n### User"],
+            "stop": ["\nUser:"],
         }
     }
 
@@ -124,7 +298,7 @@ def test_rwkv7_remote_open_think_uses_its_own_fixed_sampling_config(monkeypatch)
             "frequency_penalty": 0.1,
             "penalty_decay": 0.988,
             "do_sample": True,
-            "stop": ["✿", "\nUser:", "\n### User"],
+            "stop": ["\nUser:"],
         }
     }
 

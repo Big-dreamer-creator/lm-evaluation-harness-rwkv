@@ -92,6 +92,7 @@ def _write_run_and_get_results_json(tmp_path: Path) -> Path:
                     "seed": 42,
                 },
                 "max_length": 4096,
+                "metadata": {"weight_revision": "rwkv7-g1j-1.5b-ctx4096"},
             },
             "lm_eval_version": "test",
         },

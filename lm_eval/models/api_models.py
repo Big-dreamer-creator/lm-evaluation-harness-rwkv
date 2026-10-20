@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from functools import cached_property
 from typing import (
     TYPE_CHECKING,
@@ -556,6 +557,16 @@ class TemplateAPI(TemplateLM):
             )
         return self.base_url
 
+    def _annotate_generation(self, value, gen_kwargs):
+        if not getattr(self, "INDEPENDENT_ROLLOUTS", False) or value is None:
+            return value
+        from lm_eval.models.openai_completions import _RWKVCompletion
+        if not hasattr(value, "__dict__"):
+            value = _RWKVCompletion(str(value))
+        value.seed = (gen_kwargs or {}).get("seed", self._seed)
+        value.requires_think_close = getattr(self, "rwkv_generation_prompt", None) == "open_think"
+        return value
+
     def model_call(
         self,
         messages: Union[List[List[int]], List[str], List[JsonChatStr]],
@@ -584,6 +595,7 @@ class TemplateAPI(TemplateLM):
                     json=payload,
                     headers=headers,
                     verify=self.verify_certificate,
+                    timeout=self.timeout,
                 )
                 if response.ok:
                     return response.json()
@@ -695,6 +707,9 @@ class TemplateAPI(TemplateLM):
                 )
             )
 
+            if generate:
+                tmp_answers = [self._annotate_generation(value, gen_kwargs) for value in tmp_answers]
+
             # Convert `None`` values to `LMEVAL_MODEL_NONE_ANSWER_PLACEHOLDER` string to maintain consistency
             answers = []
             for a in tmp_answers:
@@ -765,6 +780,9 @@ class TemplateAPI(TemplateLM):
     ) -> Union[List[List[str]], List[List[Tuple[float, bool]]]]:
         ctxlens = ctxlens if ctxlens else [None] * len(requests)
         item_keys = item_keys if item_keys else [None] * len(requests)
+        per_request_kwargs = kwargs.pop("gen_kwargs_per_request", None)
+        if per_request_kwargs is not None and (len(per_request_kwargs) != len(requests) or self._batch_size != 1):
+            raise ValueError("per-request generation kwargs require one request per batch")
         self._endpoint_url()
         sem = asyncio.Semaphore(self._concurrent)
         async with AsyncExitStack() as stack:
@@ -791,7 +809,7 @@ class TemplateAPI(TemplateLM):
             )(self.amodel_call)
 
             async def _guarded(
-                message: list, cache_key: list, ctxlen: list, item_key: list
+                message: list, cache_key: list, ctxlen: list, item_key: list, request_kwargs: dict
             ) -> list:
                 try:
                     return await retry_(
@@ -802,9 +820,11 @@ class TemplateAPI(TemplateLM):
                         item_keys=item_key,
                         generate=generate,
                         ctxlens=ctxlen,
-                        **kwargs,
+                        **request_kwargs,
                     )
                 except ContextLengthExhausted as e:
+                    if getattr(self, "PRESERVE_INPUT_CONTEXT", False):
+                        raise
                     eval_logger.warning(
                         f"Context length exhausted for one batch; recording "
                         f"placeholder result(s) instead of failing the run: {e}"
@@ -828,13 +848,16 @@ class TemplateAPI(TemplateLM):
             # dispatch HTTP themselves (e.g. LiteLLMChatCompletion) accept the
             # session argument and ignore it.
             tasks = [
-                asyncio.create_task(_guarded(message, cache_key, ctxlen, item_key))
-                for message, cache_key, ctxlen, item_key in zip(
+                asyncio.create_task(_guarded(
+                    message, cache_key, ctxlen, item_key,
+                    {**kwargs, **({"gen_kwargs": per_request_kwargs[index]} if per_request_kwargs is not None else {})},
+                ))
+                for index, (message, cache_key, ctxlen, item_key) in enumerate(zip(
                     chunks(requests, n=self._batch_size),
                     chunks(cache_keys, n=self._batch_size),
                     chunks(ctxlens, n=self._batch_size),
                     chunks(item_keys, n=self._batch_size),
-                )
+                ))
             ]
 
             try:
@@ -965,6 +988,36 @@ class TemplateAPI(TemplateLM):
         if item_keys is None:
             item_keys = [None] * len(requests)
 
+        if not requests:
+            return []
+        independent = getattr(self, "INDEPENDENT_ROLLOUTS", False)
+        strict_context = getattr(self, "PRESERVE_INPUT_CONTEXT", False)
+        prepared_seeds = []
+        if independent:
+            counts = {}
+            token_counts = {}
+            prepared = []
+            for request, key in zip(requests, item_keys, strict=True):
+                args = request.args
+                gen = dict(args[1])
+                slot = (request.task_name, request.doc_id)
+                ordinal = key.repeat_ord if key is not None else (
+                    request.idx if request.task_name is None else counts.get(slot, 0)
+                )
+                counts[slot] = counts.get(slot, 0) + 1
+                gen["seed"] = int(gen.get("seed", self._seed)) + ordinal
+                prepared_seeds.append(gen["seed"])
+                if strict_context and self.tokenized_requests:
+                    if args[0] not in token_counts:
+                        token_counts[args[0]] = len(self.tok_encode([args[0]], add_special_tokens=self.add_bos_token)[0])
+                    room = self.max_length - token_counts[args[0]]
+                    if room <= 0:
+                        raise ContextLengthExhausted("Prompt exhausts the context window; input was preserved")
+                    cap_key = "max_tokens" if "max_tokens" in gen else "max_gen_toks"
+                    gen[cap_key] = min(int(gen.get(cap_key, self._max_gen_toks)), room)
+                prepared.append(replace(request, arguments=(args[0], gen, *args[2:])))
+            requests = prepared
+
         def _collate_gen(_requests):
             # sort by the length of the non-tokenized contexts
             return -len(_requests[0])
@@ -1009,6 +1062,7 @@ class TemplateAPI(TemplateLM):
             requests,
             sort_fn=_collate_gen,
             group_by="gen_kwargs",
+            group_fn=(lambda x: {} if independent else x[1]),
         )
         chunked = re_ord.get_batched(
             n=self._batch_size if self._concurrent <= 1 else 0, batch_fn=None
@@ -1027,7 +1081,7 @@ class TemplateAPI(TemplateLM):
                     )
                     max_context_len = self.max_length - max_gen_toks
 
-                    encodings_list = [x[-max_context_len:] for x in encodings_list]
+                    encodings_list = [x if strict_context else x[-max_context_len:] for x in encodings_list]
 
                     if any(
                         len(x) + max_gen_toks > self.max_length for x in encodings_list
@@ -1052,7 +1106,10 @@ class TemplateAPI(TemplateLM):
                         outputs=outputs,
                         contexts=contexts,
                     )
+                    generations = [self._annotate_generation(value, all_gen_kwargs[0]) for value in generations]
                 except ContextLengthExhausted as e:
+                    if strict_context:
+                        raise
                     eval_logger.warning(
                         f"Context length exhausted for generate_until request; "
                         f"recording empty completion(s) instead of failing the run: {e}"
@@ -1099,7 +1156,7 @@ class TemplateAPI(TemplateLM):
                     )
                     max_context_len = self.max_length - max_gen_toks
 
-                    encodings_list = [x[-max_context_len:] for x in encodings_list]
+                    encodings_list = [x if strict_context else x[-max_context_len:] for x in encodings_list]
 
                     if any(
                         len(x) + max_gen_toks > self.max_length for x in encodings_list
@@ -1113,10 +1170,11 @@ class TemplateAPI(TemplateLM):
                     asyncio.run(
                         self.get_batched_requests(
                             req,
-                            cache_keys=[(ctx, all_gen_kwargs[0]) for ctx in contexts],
+                            cache_keys=list(zip(contexts, all_gen_kwargs, strict=True)),
                             item_keys=list(chunk_item_keys),
                             generate=True,
                             gen_kwargs=copy.deepcopy(all_gen_kwargs[0]),
+                            **({"gen_kwargs_per_request": list(all_gen_kwargs)} if independent else {}),
                         )
                     )
                 )
@@ -1124,7 +1182,17 @@ class TemplateAPI(TemplateLM):
                 for r in results:
                     res.append(r)
 
-        return re_ord.get_original(res)
+        ordered = re_ord.get_original(res)
+        if independent:
+            from lm_eval.models.openai_completions import _RWKVCompletion
+
+            for index, (value, seed) in enumerate(zip(ordered, prepared_seeds, strict=True)):
+                if not hasattr(value, "__dict__"):
+                    value = _RWKVCompletion(str(value))
+                    ordered[index] = value
+                value.seed = seed
+                value.requires_think_close = getattr(self, "rwkv_generation_prompt", None) == "open_think"
+        return ordered
 
     def loglikelihood_rolling(
         self, requests: List[Instance], disable_tqdm: bool = False

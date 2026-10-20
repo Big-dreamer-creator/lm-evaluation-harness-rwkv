@@ -3,6 +3,7 @@ from lm_eval.models.rwkv_choice import (
     choice_letters,
     parse_choice_index,
 )
+import pytest
 
 LETTERS = ["A", "B", "C", "D"]
 CHOICES = ["cats", "dogs", "birds", "fish"]
@@ -67,9 +68,9 @@ def test_concluding_segment_after_think_takes_priority_over_reasoning_mentions()
     assert parse_choice_index(text, LETTERS, CHOICES) == 1
 
 
-def test_falls_back_to_think_segment_when_conclusion_is_truncated():
+def test_rejects_thought_without_a_final_answer():
     text = "<think>After careful analysis, the answer is C</think>"
-    assert parse_choice_index(text, LETTERS, CHOICES) == 2
+    assert parse_choice_index(text, LETTERS, CHOICES) == -1
 
 
 def test_last_match_wins_within_a_tier():
@@ -90,3 +91,23 @@ def test_returns_negative_one_when_nothing_can_be_parsed():
 def test_strips_leading_gt_artifact_before_parsing():
     assert parse_choice_index(">A", LETTERS, CHOICES) == 0
     assert parse_choice_index(">B", LETTERS, CHOICES) == 1
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("My final choice is (B)", 1),
+    ("The answer is A. On reflection, my final choice is (B)", 1),
+    (r"Initially \boxed{A}, but my final choice is (B)", 1),
+    ("The answer is B.\nD", 3),
+    ("The answer is blue.", -1),
+    ("I cannot answer this question.", -1),
+    ("<think>The answer is B", -1),
+    ("<think>The answer is B</think>", -1),
+    ("<think>The answer is A</think>I cannot answer.", -1),
+    ("The answer is B or C.", -1),
+])
+def test_choice_parser_final_answer_boundaries(text, expected):
+    assert parse_choice_index(text, LETTERS, LETTERS) == expected
+
+
+def test_choice_parser_does_not_choose_between_multiple_option_mentions():
+    assert parse_choice_index("cats and dogs both seem possible", LETTERS, CHOICES) == -1

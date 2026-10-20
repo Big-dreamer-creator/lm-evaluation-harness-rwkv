@@ -33,37 +33,24 @@ eval_logger = logging.getLogger(__name__)
 MAX_NEW_TOKENS = 8192
 
 
+class _RWKVPrompt(str):
+    """A rendered prompt retaining its original role boundaries locally."""
+
+    def __new__(cls, text, messages=None, add_generation_prompt=True):
+        value = super().__new__(cls, text)
+        value.messages = messages
+        value.add_generation_prompt = add_generation_prompt
+        return value
+
+
 @register_model("rwkv7-remote")
 class RWKV7Remote(LocalCompletionsAPI):
-    """Adapter for RWKV's hosted, standard OpenAI-format HTTP service (e.g. api.rwkv.rs).
+    """RWKV generation through vLLM's completions API.
 
-    Unlike ``rwkv7-http`` (a local, unauthenticated ``transformers serve`` process with
-    no echo/logprobs), this targets a real OpenAI-compatible ``/v1/completions``
-    endpoint assumed to support ``echo``+``logprobs`` natively, so loglikelihood scoring
-    uses LocalCompletionsAPI's inherited echo-based path rather than a generation-based
-    letter-parsing fallback.
-
-    By default no local/HF-Hub tokenizer is required: prompts are sent through as-is
-    (``tokenized_requests=False``), which is sufficient for ``generate_until`` tasks but
-    not for loglikelihood/multiple-choice tasks (those require a local tokenizer to
-    compute context lengths). Pass ``tokenizer=`` (a local directory or HF Hub repo id
-    for the same official RWKV tokenizer the remote service was built with) to enable
-    those tasks: this switches to ``tokenizer_backend="huggingface"`` and
-    ``tokenized_requests=True``, so requests are sent as token-id arrays rather than
-    text -- avoiding any local/remote tokenization mismatch since the server never
-    re-tokenizes the given ids.
-
-    When ``tokenizer`` is provided and the caller applies the harness's chat
-    template (``apply_chat_template=True``), this adapter renders the official
-    RWKV chat template itself -- mirroring ``rwkv7-http`` -- so ``rwkv_prompt_template``
-    actually takes effect for the remote backend too, both point at the same
-    underlying RWKV7 inference stack. Without a tokenizer, chat-template rendering
-    is skipped and that option is a no-op (matching this class's prior behavior).
-
-    ``rwkv_generation_prompt`` (``fake_think``/``open_think``) always selects one of
-    two fixed sampling presets (``SAMPLING_PARAMETERS``) regardless of whether a
-    tokenizer is configured -- these are not read from a per-checkpoint
-    ``generation_config.json`` and cannot be overridden via ``gen_kwargs``.
+    Multiple-choice tasks generate lettered answers; their returned likelihood
+    tuples are scoring encodings, not real log probabilities. The official
+    local tokenizer renders the chat template and budgets the complete prompt.
+    Sampling parameters are sent explicitly as vLLM request fields.
     """
 
     # Signals to the evaluator's per-task override loop (lm_eval/evaluator.py)
@@ -72,6 +59,9 @@ class RWKV7Remote(LocalCompletionsAPI):
     # open_think/fake_think sampling profile) and averaging correctness over
     # them, rather than the echo/logprob loglikelihood path used by default.
     SUPPORTS_AVG_AT_K = True
+    INDEPENDENT_ROLLOUTS = True
+    PRESERVE_INPUT_CONTEXT = True
+    EVALUATION_PROTOCOL_VERSION = "rwkv-generative-v2"
 
     DEFAULT_BASE_URL = "https://api.rwkv.rs/v1/completions"
     PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
@@ -133,6 +123,7 @@ class RWKV7Remote(LocalCompletionsAPI):
 
         self.rwkv_prompt_template = rwkv_prompt_template
         self.rwkv_generation_prompt = rwkv_generation_prompt
+        kwargs.setdefault("max_gen_toks", MAX_NEW_TOKENS)
         super().__init__(
             base_url=base_url,
             tokenizer=tokenizer,
@@ -141,6 +132,9 @@ class RWKV7Remote(LocalCompletionsAPI):
             **kwargs,
         )
 
+        if self._batch_size != 1:
+            raise ValueError("rwkv7-remote requires batch_size=1; use num_concurrent for concurrency")
+        self.max_length = int(kwargs.get("max_length", 2048))
         self._chat_template_source: Optional[str] = None
         self._chat_template_sha256: Optional[str] = None
         self._generation_profile: dict = dict(
@@ -153,7 +147,7 @@ class RWKV7Remote(LocalCompletionsAPI):
         self._avg_k_samples: Dict[Any, List[List[Tuple[float, bool]]]] = {}
         # Parallel to `_avg_k_samples[doc_id]`: whether each of the k samples
         # actually had a choice letter parsed out of it, so the avg@k patch
-        # can score unparseable generations at chance level instead of
+        # can score unparseable generations at zero instead of
         # whatever placeholder index they were encoded with.
         self._avg_k_parsed: Dict[Any, List[bool]] = {}
         if tokenizer is not None:
@@ -211,7 +205,7 @@ class RWKV7Remote(LocalCompletionsAPI):
         )
 
     def get_model_info(self) -> dict:
-        return {"sampling_config": _rwkv_sampling_config(self._generation_profile)}
+        return {"sampling_config": _rwkv_sampling_config({**self._generation_profile, "stop_strings": [self.PROMPT_STOPS[self.rwkv_prompt_template]]})}
 
     def loglikelihood(
         self,
@@ -260,22 +254,8 @@ class RWKV7Remote(LocalCompletionsAPI):
             positions = sorted(positions, key=lambda p: requests[p].idx)
             group = [requests[p] for p in positions]
             contexts = {req.args[0] for req in group}
-            if "" in contexts and len(contexts) > 1:
-                eval_logger.warning(
-                    "RWKV7Remote's avg@k generative scoring does not support "
-                    "the unconditional likelihood acc_mutual_info needs; "
-                    "acc_mutual_info results for this task are not meaningful."
-                )
-                kept_positions, kept_group = [], []
-                for position, request in zip(positions, group):
-                    if request.args[0] == "":
-                        results[position] = (0.0, False)
-                    else:
-                        kept_positions.append(position)
-                        kept_group.append(request)
-                positions, group = kept_positions, kept_group
-                if not group:
-                    continue
+            if len(contexts) != 1:
+                raise NotImplementedError("Generative choice scoring requires one shared context and no unconditional likelihood requests")
 
             # `Instance.repeats` (avg@k's k) duplicates each *choice* Instance
             # k times consecutively (see evaluator.py's `cloned_reqs`), so this
@@ -294,6 +274,8 @@ class RWKV7Remote(LocalCompletionsAPI):
 
             context = group[0].args[0]
             choices = choice_texts
+            if len({len(cg) for cg in choice_positions}) != 1 or len(choice_positions) < 2:
+                raise ValueError("Generative choice scoring requires complete, equally repeated option groups")
             k = min(len(cg) for cg in choice_positions)
             letters = choice_letters(choices)
             # `context` may already be the harness's own rendering of the
@@ -307,7 +289,17 @@ class RWKV7Remote(LocalCompletionsAPI):
             # the whole thing again, both land content inside what is
             # supposed to be the model's own completion.
             cue = self._generation_prompt_cue
-            if cue and context.endswith(cue):
+            if isinstance(context, _RWKVPrompt) and context.messages is not None:
+                from copy import deepcopy
+                messages = deepcopy(context.messages)
+                for message in reversed(messages):
+                    if message["role"] == "user":
+                        message["content"] = build_choice_prompt(message["content"], choices)
+                        break
+                else:
+                    raise ValueError("Choice scoring requires a user turn")
+                send_prompt = self.apply_chat_template(messages, add_generation_prompt=context.add_generation_prompt)
+            elif cue and context.endswith(cue):
                 body = context[: -len(cue)]
                 send_prompt = build_choice_prompt(body, choices) + cue
             else:
@@ -346,7 +338,7 @@ class RWKV7Remote(LocalCompletionsAPI):
             k = plan["k"]
             doc_generations = generations[plan["start"] : plan["start"] + k]
             raw_indices = [
-                parse_choice_index(str(generated), letters, choices)
+                parse_choice_index(str(generated), letters, choices, require_think_close=self.rwkv_generation_prompt == "open_think")
                 for generated in doc_generations
             ]
             parsed_flags = [index >= 0 for index in raw_indices]
@@ -369,7 +361,7 @@ class RWKV7Remote(LocalCompletionsAPI):
                 # "no answer given", not "the model chose option A" --
                 # `majority_index` stays 0 only as a placeholder index, and
                 # every outcome below is tagged `unparsed=True` so
-                # task-specific `process_results` can exclude it instead of
+                # task-specific `process_results` can reject it instead of
                 # reading the placeholder as a genuine answer.
                 majority_index = 0
                 eval_logger.warning(
@@ -432,8 +424,7 @@ class RWKV7Remote(LocalCompletionsAPI):
 
         return results
 
-    @staticmethod
-    def _rollout_instances(prompt: str, k: int) -> List[Instance]:
+    def _rollout_instances(self, prompt: str, k: int) -> List[Instance]:
         """Build ``k`` independent generate_until instances for one doc's prompt.
 
         Every doc's rollouts share this same ``gen_kwargs`` literal, so
@@ -443,7 +434,7 @@ class RWKV7Remote(LocalCompletionsAPI):
         semaphore parallelizes across docs, not just within one doc's k
         samples.
         """
-        gen_kwargs = {"until": [], "max_gen_toks": MAX_NEW_TOKENS}
+        gen_kwargs = {"until": [], "max_gen_toks": self._max_gen_toks}
         return [
             Instance(
                 request_type="generate_until",
@@ -469,7 +460,7 @@ class RWKV7Remote(LocalCompletionsAPI):
         """
         generations = self.generate_until(self._rollout_instances(prompt, k))
         return [
-            parse_choice_index(str(generated), letters, choices) for generated in generations
+            parse_choice_index(str(generated), letters, choices, require_think_close=self.rwkv_generation_prompt == "open_think") for generated in generations
         ]
 
     def apply_chat_template(
@@ -479,9 +470,7 @@ class RWKV7Remote(LocalCompletionsAPI):
         **kwargs,
     ) -> str:
         if self._chat_template_source is None:
-            return super().apply_chat_template(
-                chat_history, add_generation_prompt=add_generation_prompt, **kwargs
-            )
+            raise ValueError("rwkv7-remote needs a tokenizer to render its chat template; use rwkv7-remote-chat for server-side templating")
 
         from lm_eval.utils import env
 
@@ -499,7 +488,7 @@ class RWKV7Remote(LocalCompletionsAPI):
             and rendered.endswith("<think></think")
         ):
             rendered += ">\n"
-        return rendered
+        return _RWKVPrompt(rendered, chat_history, add_generation_prompt)
 
     def _create_payload(
         self,
@@ -514,21 +503,12 @@ class RWKV7Remote(LocalCompletionsAPI):
         if not generate:
             return payload
 
-        profile = dict(self._generation_profile)
-        payload["temperature"] = profile.get("temperature", 1.0)
-        payload["generation_config"] = json.dumps(
-            profile, separators=(",", ":"), sort_keys=True
-        )
-        for name in (
-            "top_p",
-            "top_k",
-            "presence_penalty",
-            "frequency_penalty",
-            "penalty_decay",
-        ):
-            payload.pop(name, None)
-        if not payload["stop"]:
-            payload["stop"] = [self.PROMPT_STOPS[self.rwkv_prompt_template]]
+        # vLLM reads sampling parameters from the request's top level.
+        payload.update({key: self._generation_profile[key] for key in (
+            "temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "penalty_decay"
+        )})
+        payload["stop"] = list(dict.fromkeys([*(payload.get("stop") or []), self.PROMPT_STOPS[self.rwkv_prompt_template]]))
+
         return payload
 
     @staticmethod

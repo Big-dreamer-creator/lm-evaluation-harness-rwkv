@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import yaml
+import pytest
 
 from lm_eval.filters.extraction import (
     AlbatrossMultiChoiceFilter,
@@ -109,3 +110,34 @@ def test_albatross_mcq_extracts_all_mmlu_prox_localized_suffixes():
         )
 
         assert filt.apply([[language_prompts[5].format("J")]], [{}]) == [["J"]]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("My final choice is (B)", "B"),
+    ("The correct one is C.", "C"),
+    ("The answer is A. On reflection, my final choice is (B)", "B"),
+    ("The answer is B.\nD", "D"),
+    ("The answer is B or C.", "[invalid]"),
+    ("<think>Final answer is C</think>", "[invalid]"),
+])
+def test_generation_and_multiple_choice_share_final_answer_rules(text, expected):
+    assert AlbatrossMultiChoiceFilter().apply([[text]], [{}]) == [[expected]]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("<think>wrong answer</think>\n\nright answer", "right answer"),
+    ("<think>right answer but unfinished", ""),
+    (">still thinking", ""),
+    ("<think>plan</think>\n\ndef solve():\n    return 1\n", "def solve():\n    return 1\n"),
+])
+def test_default_generation_metrics_only_receive_final_answers(raw, expected):
+    from lm_eval.filters.extraction import FinalAnswerFilter
+    result = FinalAnswerFilter(require_think_close=True).apply([[raw]], [{}])
+    assert result == [[expected]]
+
+
+def test_final_answer_stage_retains_thinking_attestation_for_strict_mcq_filter():
+    from lm_eval.filters.extraction import FinalAnswerFilter
+    raw = "<think>The answer is A</think>My final choice is (B)"
+    final = FinalAnswerFilter(True).apply([[raw]], [{}])
+    assert AlbatrossMultiChoiceFilter(require_think_close=True).apply(final, [{}]) == [["B"]]

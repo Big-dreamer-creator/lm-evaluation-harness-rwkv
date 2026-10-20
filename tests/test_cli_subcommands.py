@@ -271,7 +271,9 @@ class TestRunCommand:
         mock_cfg_instance.num_fewshot = 0
         mock_cfg_instance.batch_size = 1
         mock_cfg_instance.log_samples = False
-        mock_cfg_instance.process_tasks.return_value = MagicMock()
+        mock_cfg_instance.checkpoint = {}
+        mock_cfg_instance.resume = False
+        mock_cfg_instance.process_tasks.return_value = (MagicMock(), {})
         mock_config.from_cli.return_value = mock_cfg_instance
 
         # Mock evaluation results
@@ -1022,6 +1024,10 @@ wkv_mode = "fp32io16"
             "base_url": "https://api.rwkv.rs/v1/completions",
             "num_concurrent": 5,
             "max_length": 16384,
+            "seed": 1234,
+            "max_gen_toks": 8192,
+            "rwkv_prompt_template": "assistant",
+            "rwkv_generation_prompt": "fake_think",
         }
         assert cfg.metadata["wkv_mode"] == "fp32io16"
         assert cfg.metadata["cot_mode"] == "fake_think"
@@ -1059,7 +1065,11 @@ wkv_mode = "fp32io16"
             "base_url": "https://api.rwkv.rs/v1/completions",
             "num_concurrent": 5,
             "max_length": 16384,
+            "seed": 1234,
+            "max_gen_toks": 8192,
             "tokenizer": "/opt/rwkv/tokenizers/rwkv7-g1i-1.5b",
+            "rwkv_prompt_template": "assistant",
+            "rwkv_generation_prompt": "fake_think",
         }
 
     def test_toml_config_rwkv7_remote_tokenizer_name_with_trust_remote_code(
@@ -1098,8 +1108,12 @@ wkv_mode = "fp32io16"
             "base_url": "https://api.rwkv.rs/v1/completions",
             "num_concurrent": 5,
             "max_length": 16384,
+            "seed": 1234,
+            "max_gen_toks": 8192,
             "tokenizer": "BBuf/rwkv-5-world-1b5",
             "trust_remote_code": True,
+            "rwkv_prompt_template": "assistant",
+            "rwkv_generation_prompt": "fake_think",
         }
 
     def test_versioned_config_rejects_trust_remote_code_without_tokenizer_name(
@@ -1518,7 +1532,7 @@ wkv_mode = "fp32io16"
 
     @pytest.mark.parametrize(
         "field",
-        ["doc_to_text", "filter_list", "metric_list", "until", "max_gen_toks"],
+        ["doc_to_text", "filter_list", "metric_list", "until", "max_tokens"],
     )
     def test_versioned_config_rejects_task_protocol_fields(self, tmp_path, field):
         from lm_eval.config.evaluate_config import EvaluatorConfig

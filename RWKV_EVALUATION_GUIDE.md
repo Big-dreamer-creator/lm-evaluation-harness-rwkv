@@ -287,10 +287,11 @@ Linux 本地文件系统；WSL 下将 SQLite 缓存放在 `/mnt/c` 或 `/mnt/e` 
 直接对接标准 OpenAI 格式的托管 RWKV 服务（例如 `https://api.rwkv.rs`）。两者
 互不影响：`rwkv7-remote` 是独立新增的 backend，不改动 `rwkv7-http` 的行为。
 
-`rwkv7-remote` 只使用 `/v1/completions`，并假定该端点原生支持标准 OpenAI 的
-`echo`+`logprobs`（用于 loglikelihood/多选任务评分）。这一假设已通过对
-`api.rwkv.rs` 的真实请求验证：`drop`（generate_until）和 `race`
-（loglikelihood/多选，需配合下文的 `tokenizer_name`）均已实测跑通。
+`rwkv7-remote` 使用 `/v1/completions`。生成题直接生成答案；选择题虽然在
+lm-eval 内部表现为 `loglikelihood` 请求，实际执行的是带字母选项的生成与
+答案抽取，返回的数值仅供选择题判分，不能解释为真实 log probability。
+需要真实似然的任务或指标会在启动时拒绝。聊天消息也可通过
+`rwkv7-remote-chat` 交给服务端渲染。
 
 ### 10.1 仅生成类任务（`generate_until`，如 DROP）
 
@@ -321,19 +322,19 @@ wkv_mode = "fp32io16"
 - `apply_chat_template` 必须设为 `false`：未设置 `tokenizer_name` 时
   `rwkv7-remote` 没有接入任何 tokenizer/chat_template 来源，无法渲染聊天
   模板。
-- `rwkv_profile` 三个字段仍为必填，但只写入结果 `metadata`
-  （`wkv_mode`、`cot_mode`、`prompt_template`）作为审计记录，不会被发送给
-  模型。
-- 该配置下 `rwkv7-remote` 的 `model_args` 只包含 `model`、`base_url`、
-  `max_length`，以及由 `max_num_seqs` 派生的 `num_concurrent`。
+- `rwkv_profile.generation_prompt` 决定固定采样参数，`prompt_template` 决定
+  角色停止符；`wkv_mode` 是服务端执行模式的审计记录。未配置 tokenizer 时，
+  输入必须已经包含适当的原生角色与生成前缀；这里只支持原始文本直传。
+- `seed[2]` 作为生成基础 seed，同一题的第 r 次采样使用 `base_seed + r`。
+  顶层 `max_gen_toks` 控制选择题的输出预算，默认 8192。
 - `config.truncation` 会输出真实的完成数/截断数/截断率（原理见第 9 节），
   不再是恒为 `null` 的占位值。
 
 ### 10.2 loglikelihood/多选任务（如 RACE）：`tokenizer_name`
 
-`race` 等 `multiple_choice`/loglikelihood 任务需要在本地算出 prompt/continuation
-的 token 边界，因此必须设置 `tokenizer_name` 指向一个 `transformers.AutoTokenizer`
-可加载的分词器（本地目录路径或 HF Hub repo id 均可）：
+`race` 等选择题通过生成作答。正式使用 `rwkv7-remote` 时应设置
+`tokenizer_name` 并启用 `apply_chat_template = true`，由本地官方模板构造
+原生提示词并计算完整输入长度。分词器可为本地目录或 HF Hub repo id：
 
 ```toml
 schema_version = 1
@@ -349,7 +350,7 @@ benchmarks = ["race"]
 output_dir = "results/rwkv7-g1j-1.5b-remote-race"
 
 max_length = 16384
-apply_chat_template = false
+apply_chat_template = true
 fewshot_as_multiturn = false
 
 [rwkv_profile]
@@ -362,9 +363,9 @@ wkv_mode = "fp32io16"
 
 - **正确性前提，代码不做校验，必须人工核对**：`tokenizer_name` 必须和
   `api.rwkv.rs` 上该 `model_name` 实际使用的词表完全一致。设置后请求会以
-  `tokenized_requests=True` 方式发送——本地用该 tokenizer 把 context/continuation
-  编码成 token-id 数组，直接作为 `prompt` 发给服务端，服务端不会重新分词。
-  如果词表不一致，不会报错，只会**静默产生错误的 loglikelihood 分数**。
+  `tokenized_requests=True` 方式发送——本地把完整生成提示词编码成 token-id
+  数组，直接作为 `prompt` 发给服务端。服务端不会重新分词；若词表不一致，
+  输入语义和生成成绩都会失真。
   正式测评前应确认这份 tokenizer 与该权重在 `rwkv7-http`/`vllm-rwkv` 侧已经
   验证过的官方 tokenizer 资产是同一个。
 - `trust_remote_code` 仅在设置了 `tokenizer_name` 时才允许出现，否则报错
@@ -389,9 +390,9 @@ wkv_mode = "fp32io16"
   绝不要把密钥写进 TOML——`RWKV_API_KEY` 只在进程环境中读取，不会进入
   `model_args` 或结果文件的 metadata。未设置该变量时，`rwkv7-remote` 会在
   构造模型时直接报错，而不是发送空 Bearer token。
-- 该服务同时暴露的 `/v1/chat/completions`（含 `chat_template_kwargs`）和
-  `/v1/responses` 目前未被本仓库任何 backend 使用；`rwkv7-remote` 只走
-  `/v1/completions`。
+- `rwkv7-remote` 使用 `/v1/completions`；`rwkv7-remote-chat` 使用
+  `/v1/chat/completions` 并发送 `chat_template_kwargs`；本仓库未使用
+  `/v1/responses`。
 
 ### 10.4 并发与断点续跑（crash-safe resume）
 
@@ -507,3 +508,41 @@ enabled = true
 本仓库只新增 LightEval 和 EvalScope 尚未收录的 benchmark。新增或调整任务时，
 应先核对这两个框架的当前可运行注册表，再按 lm-eval 的 task YAML、filter 和 metric
 边界实现，不应把模型专用 prompt 或判分逻辑写入 HTTP 后端。
+
+## 12. rwkv7-remote 测评协议审查（2026-10-20）
+
+审查基线为 `feature/scoreboard-upload-rewrite` 的
+`01926a51cf950a5995b582c9c71ec4fc2ec0516c`。范围覆盖远程请求、原生提示词、
+最终答案判分、avg@k、结果证据、checkpoint 和 Scoreboard 发布。
+
+| 已修复问题 | 旧行为与影响 |
+| --- | --- |
+| 采样参数未按 vLLM 协议发送 | 参数藏在 `generation_config` 字符串中，vLLM 会忽略未知字段；实际采样可能偏离记录 |
+| 重复作答使用同一 seed | avg@k 可能反复生成同一答案；现按原始 repeat ordinal 分配 seed，并保持请求并发 |
+| 长输入被截去开头 | 输入与 benchmark 定义不一致；现保留完整输入，按剩余窗口缩短输出预算，无剩余空间则报错 |
+| 两套选择题解析器行为不一致 | 漏掉 `My final choice is (B)` 等结论，或让较早的 boxed 答案覆盖最终更正；现共用最终答案解析 |
+| 无效输出获得随机猜测分 | 四选一未作答也可获得 0.25；现记零分并保留 invalid 证据 |
+| 思考内容参与最终判分 | 未闭合思考、仅在思考中出现的答案可能获分；现 open_think 必须闭合，生成题只判最终正文 |
+| 引号续写选择题重复历史 | system/few-shot 历史可能被复制进每个候选项；现只重建最后一个 user turn |
+| 结构化指标和组聚合丢失重复作答语义 | Discrim-Eval 只聚合首条作答，组成绩可能丢失既定权重；现保留全部输入并使用原组聚合 |
+| 原始证据与恢复身份不足 | 每次 rollout 现记录原文、seed、结束原因和原始响应；模板、模式和协议版本纳入恢复身份 |
+| 上传分数与样本明细不一致 | 按所选 filter 提取样本，实际采样 profile 优先，使用正确的 avg@k 聚合；补齐 weight_revision 与上传重试 |
+
+协议版本为 `rwkv-generative-v2`。旧 checkpoint 不会静默续用；应使用独立运行目录，
+保留旧文件用于对照。旧生成式结果也不能直接标成新协议发布，必须先使用原始回答
+进行有版本记录的重新判分。选择题同一题部分恢复、部分缺失时会明确报错，避免混用
+两组字母映射或不同重复作答。
+
+输出预算默认 8192，可通过顶层 `max_gen_toks` 调整。G1j/G1k 对比必须同时记录
+上下文窗口、实际输出预算、提示词和采样参数。此前 G1k 的未结束思考、长重复以及
+先输出示例围栏再输出代码的现象，不能全部归因于本分支的选择题解析。没有重放
+历史 campaign 的原始回答，不能量化修复后 G1j/G1k 的分数变化。
+
+本地相关回归覆盖模拟 HTTP 到真实结果工件与 Scoreboard 数据构建的生成题、
+选择题链路；具体命令与通过数量记录在对应 PR。未启动真实 GPU 推理，
+未向在线榜单发布；部署侧仍需核对 tokenizer/模板身份、上下文与并发容量，以及
+自定义 `penalty_decay` 的 Rapid 采样支持。
+
+尚未实现 RWKV `no_think`。现有
+`rwkv7_g1j_campaign_ruler_xquad_nocot_full_scoreboard.toml` 仍会在配置校验时失败；
+不能静默换为 `fake_think` 并沿用相同实验身份。
