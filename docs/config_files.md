@@ -86,6 +86,7 @@ arguments. Unknown fields fail before model or dataset initialization.
 | `benchmarks` | list | required | Unique public benchmark names; configured order is the stable tie-break for the runtime ascending-pending-rollout order |
 | `output_dir` | string | required | Result directory (top level for a single-model file, per `[[models]]` entry for a campaign) |
 | `max_length` | int | required | Positive service context limit |
+| `max_gen_toks` | int | `8192` | Remote RWKV choice-generation output budget; preserve the full input and reduce output to the remaining context window |
 | `batch_size` | int | `1` | lm-eval request batch size |
 | `max_num_seqs` | int | required | Served endpoint's own `--max-num-seqs`; the evaluator's flat request budget is derived from it (no hand-tuned request concurrency) |
 | `device` | string | `"cpu"` | Evaluation-side device |
@@ -101,8 +102,30 @@ arguments. Unknown fields fail before model or dataset initialization.
 | `seed` | list[int] | `[0,1234,1234,1234]` | Four lm-eval random seeds |
 | `limit` | number | unset | Smoke-only sample limit |
 | `use_cache` | string | unset | Response cache path |
+| `weight_revision` | string | unset | Exact weight identity, including `ctx<number>` for Scoreboard; separate from the evaluation's `max_length` |
 
----
+### Remote RWKV evaluation protocol
+
+`rwkv7-remote` renders the official local tokenizer's template and sends token
+IDs to `/v1/completions`. Set `tokenizer_name` to the same official tokenizer
+used by the server and keep `apply_chat_template = true`. The native
+open-thinking prefix ends in `<think` intentionally. A completed `</think>`
+is required before final-answer grading; raw responses remain in the artifacts.
+Without a tokenizer, this backend only passes raw text through and cannot apply
+a chat template. `rwkv7-remote-chat` delegates template rendering to the server.
+
+RWKV sampling presets are sent as top-level vLLM fields. The custom server must
+support `penalty_decay` and its required sampler. Each document's repeats use
+`seed[2] + repeat_ord`, including after resume, and share one concurrency budget.
+The full input is preserved. `max_gen_toks` defaults to 8192 for choice rollouts;
+set it explicitly when comparing models with different reasoning lengths.
+A prompt that exhausts the context window aborts rather than receiving a score
+for an empty completion. Multi-leaf benchmarks share one avg@k sizing budget.
+
+The protocol identity is `rwkv-generative-v2`. Use a separate output/checkpoint
+directory for runs made before this version. Old raw answers need a versioned
+replay before their scores can be published using the new protocol.
+
 
 ## One file per benchmark set
 

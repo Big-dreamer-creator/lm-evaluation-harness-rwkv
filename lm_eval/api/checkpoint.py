@@ -42,6 +42,8 @@ eval_logger = logging.getLogger(__name__)
 # under them: both the run id (``lm_eval/_cli/run.py``) and every per-item
 # request fingerprint drop them. Without that, "raise the concurrency and
 # resume" silently invalidates every stored answer and re-runs the benchmark.
+EVALUATION_PROTOCOL_VERSION = "rwkv-generative-v2"
+
 OPERATIONAL_MODEL_ARGS: tuple[str, ...] = (
     "num_concurrent",
     "timeout",
@@ -133,6 +135,11 @@ def model_fingerprint(lm: Any) -> str:
             info = {}
     info.setdefault("model", getattr(lm, "model", type(lm).__name__))
     info.setdefault("base_url", getattr(lm, "base_url", None))
+    if getattr(lm, "EVALUATION_PROTOCOL_VERSION", None):
+        info["evaluation_protocol"] = lm.EVALUATION_PROTOCOL_VERSION
+        info["prompt_identity"] = getattr(lm, "tokenizer_name", "")
+        for name in ("rwkv_prompt_template", "rwkv_generation_prompt", "enable_thinking", "_seed", "_max_gen_toks", "max_length"):
+            info[name] = getattr(lm, name, None)
     return _canonical_hash(info)
 
 
@@ -177,11 +184,13 @@ def serialize_response(response: Any) -> str:
     if isinstance(response, str):
         finish_reason = getattr(response, "finish_reason", None)
         raw_response = getattr(response, "raw_response", None)
-        if finish_reason is not None or raw_response is not None:
+        if finish_reason is not None or raw_response is not None or hasattr(response, "requires_think_close"):
             return json.dumps(
                 {
                     "kind": "rwkv_completion",
                     "text": str(response),
+                    "requires_think_close": bool(getattr(response, "requires_think_close", False)),
+                    "seed": getattr(response, "seed", None),
                     "finish_reason": finish_reason,
                     "raw_response": raw_response,
                 },
@@ -217,11 +226,10 @@ def deserialize_response(data: str) -> Any:
     if kind == "rwkv_completion":
         from lm_eval.models.openai_completions import _RWKVCompletion
 
-        return _RWKVCompletion(
-            payload["text"],
-            payload.get("finish_reason"),
-            raw_response=payload.get("raw_response"),
-        )
+        value = _RWKVCompletion(payload["text"], payload.get("finish_reason"), raw_response=payload.get("raw_response"))
+        value.requires_think_close = bool(payload.get("requires_think_close", False))
+        value.seed = payload.get("seed")
+        return value
     if kind == "str":
         return payload["text"]
     return payload.get("value")

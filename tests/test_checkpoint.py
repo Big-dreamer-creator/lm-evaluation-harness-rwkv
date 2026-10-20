@@ -21,6 +21,19 @@ def _make_store(tmp_path, config=("model", "a")):
     return CheckpointStore(db_path, fingerprint)
 
 
+def test_completion_resume_retains_seed_and_thinking_contract():
+    from lm_eval.filters.extraction import AlbatrossMultiChoiceFilter
+    from lm_eval.models.openai_completions import _RWKVCompletion
+
+    answer = _RWKVCompletion(">The answer is B", "length")
+    answer.requires_think_close = True
+    answer.seed = 104
+    restored = deserialize_response(serialize_response(answer))
+    assert restored.seed == 104
+    assert restored.requires_think_close is True
+    assert AlbatrossMultiChoiceFilter().apply([[restored]], [{}]) == [["[invalid]"]]
+
+
 def _item_key(task_name="task", item_id="item-1", repeat_ord=0):
     return ItemKey(
         item_id=item_id,

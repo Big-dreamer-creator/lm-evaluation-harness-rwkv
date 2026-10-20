@@ -65,6 +65,18 @@ class _FakeLM:
         self._avg_k_samples = {}
 
 
+def test_structured_metrics_retain_every_rollout_for_aggregation():
+    from lm_eval.evaluator import _RepeatedMetricValues, _install_avg_at_k_patch
+
+    task = _FakeTask("generate_until", lambda doc, values: {"bias": ("demographic", values[0])})
+    task._aggregation_list["bias"] = list
+    _install_avg_at_k_patch(task, _FakeLM(), 3, "avg@3")
+    metrics = task.process_results({}, [["yes", "no", "yes"]])
+    assert isinstance(metrics["bias_avg@3"], _RepeatedMetricValues)
+    assert metrics["bias_avg@3"] == [("demographic", "yes"), ("demographic", "no"), ("demographic", "yes")]
+    assert task._aggregation_list["bias_avg@3"] is list
+
+
 def test_avg_at_k_survives_a_checkpoint_restored_doc():
     """A doc whose requests were restored instead of re-generated never
     reaches the model's ``loglikelihood()`` again, so ``lm._avg_k_samples``

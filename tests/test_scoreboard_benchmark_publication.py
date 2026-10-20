@@ -704,7 +704,7 @@ def test_published_counts_and_score_match_what_the_run_actually_did(tmp_path):
     }
     # Completion-weighted blend of the two leaves' avg@k averages -- never
     # the plain, single-sample `acc` they also report.
-    assert score["score"] == pytest.approx((100 * 2 * 0.75 + 300 * 8 * 0.6) / 2600)
+    assert score["score"] == pytest.approx((100 * 0.75 + 300 * 0.6) / 400)
     assert score["truncation_rate"] == pytest.approx(0.1)
 
 
@@ -736,3 +736,168 @@ def test_pre_fix_artifact_reports_docs_from_its_sample_evidence(tmp_path):
     assert benchmark_info["num_samples"] == 720
     assert benchmark_info["avg_k"] == 8
     assert score["score"] == pytest.approx(0.47)
+
+
+
+
+def test_publication_uses_actual_profile_over_task_sampling_metadata():
+    from lm_eval.loggers.scoreboard import _sampling_config
+
+    results = {"config": {"model_args": {}, "sampling_config": dict(_MODEL_ARGS)}}
+    sampling = _sampling_config(
+        results,
+        {"generation_kwargs": {"temperature": 99, "max_gen_toks": 16}},
+        {},
+        {"temperature": 42},
+    )
+    assert sampling["temp"] == 0.7
+    assert sampling["max_generated_tokens"] == 16
+
+
+@pytest.mark.parametrize("name", ["rwkv7-x1j-1.5b", "rwkv7-g2j-1.5b"])
+def test_rwkv_model_rejects_incorrect_data_version_prefix(name):
+    with pytest.raises(ScoreboardError, match="data_version"):
+        _rwkv_model(name, 4096)
+
+
+@pytest.mark.parametrize("failure", ["timeout", "503"])
+def test_upload_retries_transient_failures(monkeypatch, failure):
+    import dataclasses
+    import io
+
+    publisher = _publisher(monkeypatch, rerun_reason=None)
+    publisher.config = dataclasses.replace(publisher.config, retries=1)
+    calls = []
+
+    def send(request, timeout=None):
+        calls.append(request)
+        if len(calls) == 1:
+            if failure == "timeout":
+                raise TimeoutError("temporary timeout")
+            raise HTTPError(
+                request.full_url,
+                503,
+                "Unavailable",
+                None,
+                io.BytesIO(b"<html>unavailable</html>"),
+            )
+        return _fake_response({"success": True, "score_id": 22})
+
+    monkeypatch.setattr("lm_eval.loggers.scoreboard.urlopen", send)
+    assert publisher._upload({"benchmark_id": 1})["score_id"] == 22
+    assert len(calls) == 2
+
+
+def test_upload_conflict_after_expire_is_bounded(monkeypatch):
+    publisher = _publisher(monkeypatch, rerun_reason="new run")
+    expirations = []
+
+    def send(request, timeout=None):
+        if request.full_url.endswith("/api/expire"):
+            expirations.append(request)
+            return _fake_response({"success": True})
+        raise _http_error("active_score_exists")
+
+    monkeypatch.setattr("lm_eval.loggers.scoreboard.urlopen", send)
+    with pytest.raises(ScoreboardError, match="409"):
+        publisher._upload({"benchmark_id": 1})
+    assert len(expirations) == 1
+
+
+def test_publisher_preserves_benchmarks_macro_average(tmp_path):
+    run_dir = tmp_path / _RUN_DIR_NAME
+    leaves = {"small": _leaf_artifacts(run_dir, "small", docs=1, k=2, avg_at_k=1),
+              "large": _leaf_artifacts(run_dir, "large", docs=9, k=2, avg_at_k=0)}
+    document = _benchmark_doc(run_dir, leaves, averaged_results={"acc,none": 0.5}, primary_metric_hint="acc")
+    info, score = build_score(document, _publish_config({"bench": {"field": "reasoning"}}))
+    assert score["score"] == 0.5
+    assert info["num_samples"] == 10
+
+
+def test_sample_details_follow_the_selected_metric_filter(tmp_path):
+    from lm_eval.loggers.scoreboard import _details
+
+    path = tmp_path / "samples.jsonl"
+    first = {**_choice_row(0, 0), "filter": "wrong_filter"}
+    second = {**_choice_row(0, 1), "filter": "selected_filter"}
+    path.write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+    evidence = _details(path, "acc", dict.fromkeys(("passed", "wrong", "failed"), 0), "selected_filter")
+    assert evidence.docs == 1
+    assert len(evidence.buckets["passed"]) == 1
+    assert evidence.buckets["wrong"] == []
+
+
+def test_historical_remote_results_cannot_silently_publish_under_new_parser(tmp_path):
+    run_dir = tmp_path / _RUN_DIR_NAME
+    leaves = {"leaf": _leaf_artifacts(run_dir, "leaf", docs=1, k=1)}
+    document = _benchmark_doc(run_dir, leaves)
+    document["config"]["model"] = "rwkv7-remote"
+    with pytest.raises(ScoreboardError, match="versioned raw-answer replay"):
+        build_score(document, _publish_config({"bench": {"field": "reasoning"}}))
+
+
+@pytest.mark.parametrize("output_type", ["generate_until", "multiple_choice"])
+def test_rwkv_remote_wire_to_scoreboard_with_open_thinking(tmp_path, monkeypatch, output_type):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 0
+        bos_token_id = 0
+        eos_token = "<eos>"
+        chat_template = "{% for m in messages %}{{m.role}}: {{m.content}}\n\n{% endfor %}{% if add_generation_prompt %}Assistant: <think{% endif %}"
+
+        def __call__(self, values, **kwargs):
+            return SimpleNamespace(input_ids=[[ord(char) for char in value] for value in values])
+
+    fixtures = tmp_path / "fixtures"
+    data = _write_data_and_leaves(fixtures, [("remote_leaf", "exact_match")])
+    if output_type == "multiple_choice":
+        data.write_text(json.dumps([{"question": "Which pet?", "choices": ["cats", "dogs"], "answer": 1}]))
+        path = fixtures / "remote_leaf.yaml"
+        path.write_text(path.read_text().replace("output_type: generate_until", "output_type: multiple_choice\ndoc_to_choice: choices").replace("metric: exact_match", "metric: acc"))
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *a, **k: Tokenizer())
+    monkeypatch.setenv("RWKV_API_KEY", "unit-test")
+    monkeypatch.setattr(evaluator, "avg_at_k_plan", lambda *a, **k: (2, "avg@2"))
+    sent = []
+
+    def post(url, *, json, **kwargs):
+        sent.append(json)
+        assert kwargs["timeout"] == 300
+        assert "generation_config" not in json
+        assert json["top_p"] == 0.76
+        assert json["top_k"] == 32
+        prompt = "".join(chr(token) for token in json["prompt"][0])
+        assert prompt.endswith("Assistant: <think")
+        if output_type == "multiple_choice":
+            assert prompt.index("B. dogs") < prompt.index("Assistant: <think")
+            answer = "B" if json["seed"] == 40 else "A"
+        else:
+            answer = "lol"
+        response = Mock(ok=True)
+        response.json.return_value = {"choices": [{"index": 0, "text": f">tentative reasoning</think>{answer}", "finish_reason": "stop"}]}
+        return response
+
+    monkeypatch.setattr("lm_eval.models.api_models.requests.post", post)
+    captured = {}
+
+    def callback(task_name, artifact_paths):
+        document = json.loads(Path(artifact_paths["results"]).read_text())
+        captured["publication"] = build_score(document, _publish_config({"remote_leaf": {"field": "reasoning"}}))
+        return {"publication": "validated", "uploaded": False}
+
+    evaluator.simple_evaluate(
+        model="rwkv7-remote", model_args={"model": "rwkv7-g1j-1.5b", "tokenizer": "unit-tokenizer",
+            "base_url": "http://localhost:8000/v1/completions", "rwkv_generation_prompt": "open_think",
+            "max_length": 4096, "seed": 40},
+        tasks=["remote_leaf"], task_manager=TaskManager(include_path=str(fixtures), include_defaults=False),
+        apply_chat_template=True, log_samples=True, bootstrap_iters=0,
+        metadata={"weight_revision": "rwkv7-g1j-1.5b-ctx4096"},
+        evaluation_tracker=EvaluationTracker(output_path=str(tmp_path / "run")), task_callback=callback,
+        benchmark_map={"remote_leaf": BenchmarkSpec(name="remote_leaf", strategy="standalone", leaf_task_names=("remote_leaf",))},
+    )
+    info, score = captured["publication"]
+    assert info["avg_k"] == 2
+    assert score["score"] == (0.5 if output_type == "multiple_choice" else 0.25)
+    assert sorted({payload["seed"] for payload in sent}) == [40, 41]

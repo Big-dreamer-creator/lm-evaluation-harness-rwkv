@@ -32,103 +32,67 @@ def extract_albatross_mcq_answer(
     choice_labels: str = "ABCD",
     require_think_close: bool = False,
 ) -> str | None:
-    """Extract the final letter using Albatross GPQA-style precedence."""
+    """Read a literal final choice, without crediting unfinished reasoning.
+
+    All explicit formats participate in one positional ordering. A later final
+    choice must supersede an earlier boxed answer or tentative answer sentence.
+    """
     if not isinstance(text, str):
         return None
+    require_think_close = (require_think_close or bool(getattr(text, "requires_think_close", False))) and not bool(getattr(text, "thinking_closed", False))
     labels = "".join(dict.fromkeys(choice_labels.upper()))
-    if not labels or any(not label.isalpha() or len(label) != 1 for label in labels):
-        raise ValueError("choice_labels must contain unique alphabetic characters")
-    if require_think_close and "</think>" not in text:
+    if not labels or any(not label.isalpha() for label in labels):
+        raise ValueError("choice_labels must contain alphabetic characters")
+    before, closed, answer = text.rpartition("</think>")
+    if (require_think_close and not closed) or (not closed and "<think" in text):
         return None
+    answer = _ALBATROSS_ANSWER_MARKUP.sub("", answer if closed else text).strip()
+    if answer.startswith(">"):
+        answer = answer[1:].lstrip()
+    if not answer:
+        return None
+    label = re.escape(labels)
+    patterns = (
+        rf"\\boxed\s*\{{\s*(?:\\(?:text|mathrm)\s*\{{\s*)?\(?\s*([{label}])\s*\)?\s*\}}(?:\s*\}})?",
+        rf"\b(?:final\s+(?:answer|choice|option)|correct\s+(?:answer|choice|option|one)|the\s+answer|answer)\s*(?:(?:choice|option)\s*)?(?:is\s*[:=\-]?\s*|[:=]\s*)(?:(?:choice|option)\s*)?\(?\s*([{label}])\b\s*\)?",
+        rf"\b\(?([{label}])\)?\s+(?:is|would\s+be)\s+(?:the\s+)?(?:final\s+|best\s+|correct\s+)?(?:answer|choice|option)\b",
+        rf"\b(?:choose|select|pick|corresponds?\s+to|maps?\s+to)\s*[:=\-]?\s*(?:(?:choice|option|answer)\s*)?\(?\s*([{label}])\b\s*\)?",
+        rf"(?m)^\s*(?:final\s+answer\s*[:=]?\s*)?[\[(]?([{label}])[\])]?[.!]?\s*$",
+        rf"(?m)^\s*(?:final\s+answer\s*[:=]?\s*)?[\[(]?([{label}])[\])\].:]\s+",
+    )
+    matches = [match for pattern in patterns for match in re.finditer(pattern, answer, re.IGNORECASE)]
+    if not matches:
+        return None
+    chosen = max(matches, key=lambda match: (match.start(), match.end()))
+    # A disjunction is not one named answer. Do not resolve it using gold.
+    if re.match(rf"\s*(?:or|and|/)\s*\(?[{label}]\b", answer[chosen.end():], re.IGNORECASE):
+        return None
+    return chosen.group(1).upper()
 
-    label_class = re.escape(labels)
-    answer_patterns = (
-        re.compile(
-            rf"\\boxed\s*\{{\s*(?:\\(?:text|mathrm)\s*\{{\s*)?"
-            rf"\(?\s*([{label_class}])\s*\)?\s*\}}?\s*\}}",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            rf"(?i:(?:final\s+answer|correct\s+answer|answer)\s*"
-            rf"(?:(?:choice|option)\s*)?(?:is\s*|[:=]\s*)"
-            rf"(?:(?:choice|option)\s*)?\(?\s*)([{label_class}])"
-            rf"(?i:\s*\)?)"
-        ),
-        re.compile(
-            rf"(?i:(?:(?:choice|option)\s*)?\(?\s*)([{label_class}])"
-            rf"(?i:\s*\)?\s+is\s+(?:the\s+)?"
-            rf"(?:final\s+|correct\s+)?answer)"
-        ),
-    )
-    fallback_patterns = (
-        re.compile(
-            rf"(?i:\b(?:choose|select|pick)\s+"
-            rf"(?:(?:choice|option|answer)\s*)?[:=]?\s*\(?\s*)"
-            rf"([{label_class}])(?i:\s*\)?\b)"
-        ),
-        re.compile(
-            rf"(?i:\b(?:corresponds?|maps?)\s+to\s+"
-            rf"(?:(?:choice|option|answer)\s*)?\(?\s*)"
-            rf"([{label_class}])(?i:\s*\)?\b)"
-        ),
-        re.compile(
-            rf"(?i:\b(?:therefore|thus|hence|so|consequently)[,:]?\s+"
-            rf"(?:the\s+)?(?:(?:correct|final)\s+)?"
-            rf"(?:answer|choice|option)\s+(?:is|would\s+be)\s+\(?\s*)"
-            rf"([{label_class}])(?i:\s*\)?\b)"
-        ),
-        re.compile(
-            rf"(?i:\b\(?\s*)([{label_class}])"
-            rf"(?i:\s*\)?\s+(?:is|would\s+be)\s+(?:the\s+)?"
-            rf"(?:best|correct|final)\s+(?:answer|choice|option)\b)"
-        ),
-    )
-    think_final_pattern = re.compile(
-        rf"(?i:\b(?:final\s+answer|correct\s+(?:answer|choice|option))\s*"
-        rf"(?:is\s*|[:=]\s*)?(?:\\boxed\s*\{{\s*)?"
-        rf"(?:\\(?:text|mathrm)\s*\{{\s*)?\(?\s*)"
-        rf"([{label_class}])(?i:\s*\)?)"
-    )
 
-    before_think, think_closed, answer_text = text.rpartition("</think>")
-    answer_text = _ALBATROSS_ANSWER_MARKUP.sub(
-        "", answer_text if think_closed else text
-    )
-    answer = _albatross_last_answer(answer_text, answer_patterns)
-    if answer is None:
-        answer = _albatross_last_answer(answer_text, fallback_patterns)
-    if answer is not None:
-        return answer
-    for line in reversed(answer_text.splitlines()):
-        stripped = line.strip()
-        match = re.fullmatch(
-            rf"(?:final\s+answer\s*[:=]?\s*)?"
-            rf"[\[(]?([{label_class}])[\])]?[.!]?",
-            stripped,
-            re.IGNORECASE,
-        )
-        if match is None:
-            # The model may echo the chosen option's full text right after
-            # the label instead of stopping at a bare letter (e.g.
-            # "C. <full option text>") -- require an explicit label
-            # delimiter immediately after the letter (not just trailing
-            # whitespace) so this still rejects ordinary prose that happens
-            # to start with a capital letter (e.g. "A cat sat on the mat.").
-            match = re.match(
-                rf"(?:final\s+answer\s*[:=]?\s*)?"
-                rf"[\[(]?([{label_class}])[\])\].:]\s",
-                stripped,
-                re.IGNORECASE,
-            )
-        if match:
-            return match.group(1).upper()
-    if think_closed:
-        matches = list(
-            think_final_pattern.finditer(_ALBATROSS_ANSWER_MARKUP.sub("", before_think))
-        )
-        if matches:
-            return matches[-1].group(1).upper()
-    return None
+class _FinalAnswer(str):
+    def __new__(cls, text, thinking_closed=False):
+        value = super().__new__(cls, text)
+        value.thinking_closed = thinking_closed
+        return value
+
+
+class FinalAnswerFilter(Filter):
+    """Keep raw responses for evidence; grade only the completed final segment."""
+
+    def __init__(self, require_think_close=False):
+        self.require_think_close = require_think_close
+
+    def apply(self, resps, docs):
+        def final(value):
+            if not isinstance(value, str):
+                return value
+            _, closed, text = value.rpartition("</think>")
+            required = self.require_think_close or bool(getattr(value, "requires_think_close", False))
+            if not closed and (required or "<think" in value):
+                return _FinalAnswer("")
+            return _FinalAnswer(text.lstrip("\r\n") if closed else value, bool(closed))
+        return [[final(value) for value in row] for row in resps]
 
 
 @register_filter("albatross_mcq")
@@ -156,24 +120,18 @@ class AlbatrossMultiChoiceFilter(Filter):
     def apply(
         self, resps: Iterable[Sequence[str]], docs: Sequence[dict[str, Any]]
     ) -> list[list[str]]:
-        return [
-            [
-                (
-                    _albatross_last_answer(response, (self.regex_pattern,))
-                    if self.regex_pattern is not None
-                    and (not self.require_think_close or "</think>" in response)
-                    else None
-                )
-                or extract_albatross_mcq_answer(
-                    response,
-                    choice_labels=self.choice_labels,
-                    require_think_close=self.require_think_close,
-                )
-                or self.fallback
-                for response in response_set
-            ]
-            for response_set in resps
-        ]
+        def extract(response):
+            required = (self.require_think_close or bool(getattr(response, "requires_think_close", False))) and not bool(getattr(response, "thinking_closed", False))
+            if (required and "</think>" not in response) or ("<think" in response and "</think>" not in response):
+                return self.fallback
+            final = response.rpartition("</think>")[2] if "</think>" in response else response
+            localized = _albatross_last_answer(final, (self.regex_pattern,)) if self.regex_pattern is not None else None
+            return localized or extract_albatross_mcq_answer(
+                response, choice_labels=self.choice_labels, require_think_close=required
+            ) or self.fallback
+
+        return [[extract(response) for response in response_set] for response_set in resps]
+
 
 
 _YES_NO_EXPLICIT_RES = (
@@ -222,7 +180,8 @@ def extract_yes_no_answer(text: str, *, require_think_close: bool = False) -> st
     """
     if not isinstance(text, str):
         return None
-    if require_think_close and "</think>" not in text:
+    require_think_close = (require_think_close or bool(getattr(text, "requires_think_close", False))) and not bool(getattr(text, "thinking_closed", False))
+    if (require_think_close and "</think>" not in text) or ("<think" in text and "</think>" not in text):
         return None
 
     _before_think, think_closed, answer_text = text.rpartition("</think>")

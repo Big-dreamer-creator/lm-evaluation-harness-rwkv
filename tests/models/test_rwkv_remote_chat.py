@@ -16,6 +16,50 @@ def _build(**kwargs):
     return RWKV7RemoteChat(**kwargs)
 
 
+
+
+
+
+def test_chat_choice_scoring_preserves_roles_and_all_rollouts(monkeypatch):
+    model = _build()
+    history = [
+        {"role": "system", "content": "Be precise"},
+        {"role": "user", "content": "Example"},
+        {"role": "assistant", "content": "B"},
+        {"role": "user", "content": "Which pet?"},
+    ]
+    context = JsonChatStr(json.dumps(history))
+    requests = [
+        Instance(
+            request_type="loglikelihood",
+            doc={},
+            arguments=(context, choice),
+            idx=index,
+            metadata=("choice_task", 0, 2),
+        )
+        for index, choice in enumerate(["cats", "dogs"])
+        for _ in range(2)
+    ]
+    captured = []
+
+    def generate(instances):
+        captured.extend(instances)
+        return ["A", "B"]
+
+    monkeypatch.setattr(model, "generate_until", generate)
+    responses = model.loglikelihood(requests)
+    assert len(captured) == 2
+    sent = json.loads(captured[0].args[0].prompt)
+    assert sent[:3] == history[:3]
+    assert "A. cats" in sent[-1]["content"]
+    assert "B. dogs" in sent[-1]["content"]
+    assert json.loads(responses[0].prompt) == sent
+    assert len(responses[0].rollouts) == 2
+    assert responses[0].rollouts[1]["index"] == 1
+
+
+
+
 def test_rwkv7_remote_chat_construction_defaults(monkeypatch):
     monkeypatch.setenv("RWKV_API_KEY", "test-key")
     model = _build()
@@ -92,13 +136,10 @@ def test_rwkv7_remote_chat_create_payload_sends_chat_template_kwargs(monkeypatch
         "rwkv_prompt_template": "bot",
         "rwkv_generation_prompt": "open_think",
     }
-    # Sampling knobs are folded into the server-side generation_config blob
-    # (mirrors RWKV7Remote); they must not leak as top-level payload fields.
-    for name in ("top_p", "top_k", "presence_penalty", "frequency_penalty", "penalty_decay"):
-        assert name not in payload
-    generation_config = json.loads(payload["generation_config"])
-    assert generation_config["top_p"] == 0.76
-    assert generation_config["penalty_decay"] == 0.988
+    assert "generation_config" not in payload
+    assert payload["top_p"] == 0.76
+    assert payload["penalty_decay"] == 0.988
+
 
 
 def test_rwkv7_remote_chat_create_payload_passthrough_for_non_generate(monkeypatch):

@@ -223,7 +223,7 @@ def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str,
     raw_completion = _text(first_evidence.get("text") or row["resps"])
     score = row.get(metric_name)
     scalar_score = (
-        score if isinstance(score, (int, float)) and not isinstance(score, bool) else None
+        float(score) if isinstance(score, (int, float)) else None
     )
     extracted = _extracted_answer(row)
     # `extracted is None` means the task has no `filter_list` at all (not
@@ -234,11 +234,11 @@ def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str,
     has_usable_answer = (
         bool(raw_completion.strip()) if extracted is None else extracted != "[invalid]"
     )
-    if not raw_completion.strip():
+    if not raw_completion.strip() or first_evidence.get("unparsed") is True or extracted == "[invalid]":
         outcome = "failed"
     elif scalar_score == 1:
         outcome = "passed"
-    elif scalar_score == 0:
+    elif scalar_score is not None and 0 <= scalar_score < 1:
         outcome = "wrong"
     elif scalar_score is None:
         # Some tasks (e.g. discrim_eval's bias metrics) score each doc with
@@ -317,6 +317,7 @@ def _details(
     path: Path,
     metric_name: str,
     uploaded_counts: dict[str, int],
+    filter_key: str | None = None,
 ) -> _SampleEvidence:
     """Read one leaf's per-sample details, capped at `MAX_SAMPLES_PER_OUTCOME`.
 
@@ -341,6 +342,8 @@ def _details(
             if not line.strip():
                 continue
             row = json.loads(line)
+            if filter_key is not None and row.get("filter", filter_key) != filter_key:
+                continue
             doc_id = row.get("doc_id")
             if doc_id is not None:
                 if doc_id in seen:
@@ -421,11 +424,11 @@ def _rwkv_model(model_name: str, ctx_len: int) -> dict[str, Any]:
             f"model name {model_name!r} has unknown arch_version {arch_version!r}; "
             f"expected one of {sorted(ARCH_VERSIONS)}"
         )
-    data_version = "G1" + data_token[2:]
-    if re.fullmatch(r"G1[a-z0-9]*", data_version) is None:
+    if re.fullmatch(r"g1[a-z0-9]+", data_token) is None:
         raise ScoreboardError(
             f"model name {model_name!r} has unknown data_version {data_token!r}"
         )
+    data_version = "G1" + data_token[2:]
     if param_size not in PARAM_SIZES:
         raise ScoreboardError(
             f"model name {model_name!r} has unknown param_size {param_size!r}; "
@@ -439,6 +442,8 @@ def _rwkv_model(model_name: str, ctx_len: int) -> dict[str, Any]:
     }
 
 
+
+
 def _sampling_config(
     results: dict[str, Any],
     task_config: dict[str, Any],
@@ -448,11 +453,19 @@ def _sampling_config(
     run_config = results["config"]
     effective = {
         **model_args,
-        **(results.get("sampling_config") or {}),
-        **(run_config.get("sampling_config") or {}),
+        **task_metadata,
         **(run_config.get("gen_kwargs") or {}),
         **(task_config.get("generation_kwargs") or {}),
-        **task_metadata,
+        **{
+            key: value
+            for key, value in (results.get("sampling_config") or {}).items()
+            if key != "max_gen_toks"
+        },
+        **{
+            key: value
+            for key, value in (run_config.get("sampling_config") or {}).items()
+            if key != "max_gen_toks"
+        },
     }
     sampling: dict[str, Any] = {
         target: effective[source]
@@ -463,9 +476,13 @@ def _sampling_config(
         "max_generated_tokens",
         effective.get("max_gen_toks")
         or effective.get("max_tokens")
+        or (run_config.get("sampling_config") or {}).get("max_gen_toks")
         or DEFAULT_MAX_GENERATED_TOKENS,
     )
     sampling.setdefault("seed", DEFAULT_SEED)
+    if run_config.get("evaluation_protocol"):
+        sampling["seed_strategy"] = "base_plus_repeat_ord"
+        sampling["evaluation_protocol"] = run_config["evaluation_protocol"]
     missing = [field for field in REQUIRED_SAMPLING_FIELDS if field not in sampling]
     if missing:
         raise ScoreboardError(
@@ -829,6 +846,10 @@ def build_score(
     policy = _task_policy(config, benchmark_name, benchmark_name)
 
     run_config = results["config"]
+    if run_config.get("model") in {"rwkv7-remote", "rwkv7-remote-chat"}:
+        from lm_eval.api.checkpoint import EVALUATION_PROTOCOL_VERSION
+        if run_config.get("evaluation_protocol") != EVALUATION_PROTOCOL_VERSION:
+            raise ScoreboardError("Historical generative artifacts require a versioned raw-answer replay before publication")
     model_args = run_config["model_args"]
     model_name = str(
         model_args.get("model") or model_args.get("pretrained") or run_config["model"]
@@ -859,7 +880,7 @@ def build_score(
         )
         samples_path = paths.get("samples")
         evidence = (
-            _details(Path(samples_path), sample_metric, uploaded_counts)
+            _details(Path(samples_path), sample_metric, uploaded_counts, leaf_primary.partition(",")[2] or None)
             if samples_path
             else None
         )
@@ -879,7 +900,13 @@ def build_score(
             f"benchmark {benchmark_name!r} has no evaluated samples to publish"
         )
     headline = None
-    if all(upload.k == 1 for upload in uploads):
+    averaged = results.get("averaged_results") or {}
+    headline_key = _match_metric_key(averaged, policy.get("primary_metric") or results.get("primary_metric_hint"))
+    if headline_key is None and len({upload.metric_name for upload in uploads}) == 1:
+        headline_key = _match_metric_key(averaged, uploads[0].metric_name)
+    if headline_key is not None and isinstance(averaged[headline_key], (int, float)):
+        headline = float(averaged[headline_key])
+    if headline is None and all(upload.k == 1 for upload in uploads):
         # Nothing was averaged per doc, so the benchmark-level metric the run
         # already aggregated is the authoritative headline -- it is the only
         # source that honours a group's own aggregation (e.g. mmlu's macro
@@ -891,17 +918,16 @@ def build_score(
         if key is not None:
             headline = benchmark_metrics[key]
     if headline is None and len({upload.metric_name for upload in uploads}) == 1:
-        # Otherwise (avg@k, whose per-k averages never survive the group
-        # aggregation) blend the leaves by completions, exactly like the
-        # producer on the lighteval side.
+        # Legacy artifacts without an authoritative group average can only
+        # blend a shared metric by documents, preserving equal document weight.
         headline = (
-            sum(upload.score * upload.completions for upload in uploads) / completions
+            sum(upload.score * upload.docs for upload in uploads) / num_samples
         )
     if headline is None:
         # A benchmark whose leaves report different metrics (e.g. cruxeval /
         # infinitebench mixing task types) has no meaningful blended score;
-        # keep the per-leaf namespaced report and use the first one.
-        headline = namespaced_scores[min(namespaced_scores)]
+        # require a declared benchmark aggregation rather than choosing a leaf.
+        raise ScoreboardError("Benchmark leaves use different metrics; an explicit benchmark aggregation is required")
     truncation_rate = (
         sum(upload.truncation_rate * upload.completions for upload in uploads)
         / completions
@@ -918,14 +944,20 @@ def build_score(
     benchmark_info = _benchmark_info(
         benchmark_name, num_samples, completions / num_samples, policy
     )
+    revision = (run_config.get("metadata") or {}).get("weight_revision")
+    model = _rwkv_model(
+        model_name,
+        _weight_ctx_len(revision or model_name, *artifact_hint_paths),
+    )
     payload = {
         "benchmark_id": None,
-        "model": _rwkv_model(
-            model_name, _weight_ctx_len(model_name, *artifact_hint_paths)
-        ),
+        "model": model,
         "cot_mode": config.cot_mode,
         "sampling_config": _sampling_config(
-            results, sole_config, model_args, sole_config.get("metadata") or {}
+            results,
+            sole_config,
+            model_args,
+            sole_config.get("metadata") or {},
         ),
         "score": headline,
         "truncation_rate": truncation_rate,
@@ -988,48 +1020,67 @@ class ScoreboardPublisher:
             time.sleep(min(self.config.retry_delay * 2**attempt, 30))
         raise AssertionError("unreachable: loop always returns or raises")
 
-    def _upload(self, score: dict[str, Any]) -> dict[str, Any]:
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
+    def _upload(
+        self, score: dict[str, Any], *, allow_expire: bool = True
+    ) -> dict[str, Any]:
         request = Request(  # noqa: S310 - publication URL is configured.
             self.base_url + "/api/upload",
             data=_json(score),
             method="POST",
-            headers=headers,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            },
         )
-        try:
-            with urlopen(  # noqa: S310 - publication URL is configured.
-                request, timeout=self.config.timeout
-            ) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
-            body = json.loads(error.read().decode("utf-8") or "{}")
-            detail = body.get("detail")
-            code = detail.get("code") if isinstance(detail, dict) else None
-            if (
-                code in ("duplicate_score", "active_score_exists")
-                and self.config.rerun_reason is not None
-                and detail.get("score_id") is not None
-            ):
-                self._send(
-                    "/api/expire",
-                    body={"score_id": detail["score_id"]},
-                    timeout=self.config.control_timeout,
-                )
-                return self._upload(score)
-            if code == "duplicate_score":
-                return {
-                    "success": True,
-                    "message": "Score already uploaded (idempotent replay)",
-                    "replayed": True,
-                    "score_id": detail.get("score_id"),
-                    "benchmark_id": score["benchmark_id"],
-                }
-            raise ScoreboardError(
-                f"scoreboard POST /api/upload returned HTTP {error.code}: {detail}"
-            ) from error
+        for attempt in range(self.config.retries + 1):
+            try:
+                with urlopen(  # noqa: S310 - publication URL is configured.
+                    request, timeout=self.config.timeout
+                ) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as error:
+                raw = error.read().decode("utf-8", errors="replace")
+                try:
+                    body = json.loads(raw or "{}")
+                except ValueError:
+                    body = {}
+                detail = body.get("detail") if isinstance(body, dict) else None
+                code = detail.get("code") if isinstance(detail, dict) else None
+                if error.code == 409:
+                    if (
+                        allow_expire
+                        and self.config.rerun_reason is not None
+                        and code in ("duplicate_score", "active_score_exists")
+                        and detail.get("score_id") is not None
+                    ):
+                        self._send(
+                            "/api/expire",
+                            body={"score_id": detail["score_id"]},
+                            timeout=self.config.control_timeout,
+                        )
+                        return self._upload(score, allow_expire=False)
+                    if code == "duplicate_score" and self.config.rerun_reason is None:
+                        return {
+                            "success": True,
+                            "message": "Score already uploaded (idempotent replay)",
+                            "replayed": True,
+                            "score_id": detail.get("score_id"),
+                            "benchmark_id": score["benchmark_id"],
+                        }
+                if (
+                    error.code not in RETRYABLE_HTTP_STATUSES
+                    or attempt == self.config.retries
+                ):
+                    raise ScoreboardError(
+                        f"scoreboard POST /api/upload returned HTTP {error.code}: {detail or raw}"
+                    ) from error
+            except (TimeoutError, URLError) as error:
+                if attempt == self.config.retries:
+                    raise ScoreboardError(
+                        f"cannot reach scoreboard: {error}"
+                    ) from error
+            time.sleep(min(self.config.retry_delay * 2**attempt, 30))
+        raise AssertionError("unreachable: loop always returns or raises")
 
     def publish(
         self, benchmark_info: dict[str, Any], score: dict[str, Any]

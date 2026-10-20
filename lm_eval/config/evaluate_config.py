@@ -101,6 +101,7 @@ VERSIONED_CONFIG_FIELDS = {
     "log_samples",
     "max_length",
     "max_num_seqs",
+    "max_gen_toks",
     "max_retries",
     "models",
     "model_overrides",
@@ -118,6 +119,7 @@ VERSIONED_CONFIG_FIELDS = {
     "tokenizer_name",
     "trust_remote_code",
     "use_cache",
+    "weight_revision",
 }
 VERSIONED_REQUIRED_FIELDS = {
     "backend",
@@ -756,6 +758,9 @@ class EvaluatorConfig:
             if tokenizer_name is not None:
                 model_args["tokenizer"] = tokenizer_name
         model_args["base_url"] = base_url
+        if backend in {"rwkv7-remote", "rwkv7-remote-chat"}:
+            model_args["seed"] = seed[2]
+            model_args["max_gen_toks"] = cls._positive_int(config.get("max_gen_toks", 8192), "max_gen_toks")
         # HTTP robustness knobs. Like max_num_seqs they only change how
         # requests are retried, not prompts, sampling or model identity, so
         # they are excluded from the checkpoint fingerprint (see
@@ -786,6 +791,10 @@ class EvaluatorConfig:
             "publication": publication,
             "checkpoint": checkpoint_value,
         }
+        if "weight_revision" in config:
+            normalized["metadata"]["weight_revision"] = cls._non_empty_string(
+                config["weight_revision"], "weight_revision"
+            )
         if "limit" in config:
             limit = config["limit"]
             if (
@@ -948,6 +957,9 @@ class EvaluatorConfig:
         # predict_only implies log_samples
         if self.predict_only:
             self.log_samples = True
+
+        if self.publication.get("enabled") and not self.log_samples:
+            raise ValueError("Scoreboard publication requires log_samples = true")
 
         # log_samples or predict_only requires output_path
         if (self.log_samples or self.predict_only) and not self.output_path:

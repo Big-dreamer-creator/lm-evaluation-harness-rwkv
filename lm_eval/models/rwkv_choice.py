@@ -18,33 +18,6 @@ settles on at the end.
 import re
 from typing import Any, List, Optional, Tuple
 
-_CHOICE_BOXED_RES = (
-    re.compile(r"\\boxed\{\s*\(?([A-Za-z])\)?\s*\}"),
-    re.compile(r"\\boxed\{\s*\\(?:text|mathrm)\{\s*\(?([A-Za-z])\)?\s*\}\s*\}"),
-)
-_CHOICE_EXPLICIT_RES = (
-    re.compile(
-        r"(?:final\s+answer|correct\s+answer|the\s+answer|answer)\s*(?:is\s*[:\-]?\s*|[:\-]\s*)\(?([A-Za-z])\)?",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\(?([A-Za-z])\)?\s+is\s+(?:the\s+)?(?:final\s+|correct\s+)?answer",
-        re.IGNORECASE,
-    ),
-)
-_CHOICE_FALLBACK_RES = (
-    re.compile(r"\b(?:choose|select|pick)\s*[:\-]?\s*\(?([A-Za-z])\)?\b", re.IGNORECASE),
-    re.compile(r"\b(?:corresponds?|maps?)\s+to\s*\(?([A-Za-z])\)?\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:therefore|thus|hence|so|consequently)[,:]?\s+(?:the\s+)?(?:correct\s+|final\s+)?(?:answer|choice|option)\s+(?:is|would\s+be)\s*\(?([A-Za-z])\)?\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\(?([A-Za-z])\)?\s+(?:is|would\s+be)\s+(?:the\s+)?(?:best|correct|final)\s+(?:answer|choice|option)\b",
-        re.IGNORECASE,
-    ),
-)
-_CHOICE_BARE_LINE_RE = re.compile(r"^\s*\(?([A-Za-z])\)?[.\s]*$")
 
 
 class RWKVLoglikelihoodResponse(tuple):
@@ -164,6 +137,10 @@ def rollout_evidence(generations: List[Any], indices: List[int]) -> List[dict]:
     return [
         {
             "index": int(index),
+            "text": str(generation),
+            "seed": getattr(generation, "seed", None),
+            "finish_reason": getattr(generation, "finish_reason", None),
+            "raw_response": getattr(generation, "raw_response", None),
             "truncated": bool(getattr(generation, "truncated", False))
             or str(getattr(generation, "finish_reason", "") or "").lower()
             in TRUNCATED_FINISH_REASONS,
@@ -256,86 +233,27 @@ def choice_letters(choices: List[str]) -> List[str]:
     return [chr(ord("A") + i) for i in range(len(choices))]
 
 
-def _last_match(text: str, patterns) -> str:
-    """Pool every match from every pattern in ``patterns`` and return the
-    letter belonging to the one that starts latest in ``text`` (i.e. the
-    final thing the model said), or ``None`` if nothing matched."""
-    matches: List[Tuple[int, str]] = []
-    for pattern in patterns:
-        for match in pattern.finditer(text):
-            matches.append((match.start(), match.group(1).upper()))
-    if not matches:
-        return None
-    return max(matches, key=lambda item: item[0])[1]
+def parse_choice_index(
+    generated: str, letters: List[str], choices: List[str], *, require_think_close: bool = False
+) -> int:
+    """Use the same final-answer extractor as native generation tasks."""
+    from lm_eval.filters.extraction import extract_albatross_mcq_answer
 
-
-def _last_bare_line_letter(text: str) -> str:
-    """Scan lines from the end for one that is just a bare (optionally
-    parenthesized/dotted) letter, e.g. a trailing "B." on its own line."""
-    for line in reversed(text.splitlines()):
-        match = _CHOICE_BARE_LINE_RE.match(line)
-        if match:
-            return match.group(1).upper()
-    return None
-
-
-def _substring_fallback(text: str, choices: List[str]) -> int:
-    lowered = text.lower()
-    best_index, best_len = 0, -1
-    for index, choice in enumerate(choices):
-        choice_lower = choice.lower()
-        if choice_lower and choice_lower in lowered and len(choice_lower) > best_len:
-            best_index, best_len = index, len(choice_lower)
-    return best_index if best_len >= 0 else -1
-
-
-def parse_choice_index(generated: str, letters: List[str], choices: List[str]) -> int:
-    """Best-effort extraction of which lettered choice a generation names.
-
-    Returns the chosen index, or ``-1`` if no letter could be extracted with
-    any confidence -- callers decide how to treat an unparseable answer
-    (e.g. excluding it from a majority vote) rather than this function
-    silently guessing.
-    """
-    text = generated.strip()
-    # RWKV chat completions occasionally lead with a bare ">" before the
-    # actual answer (e.g. ">A" instead of "A") -- lighteval-rwkv's own
-    # generative-answer extractor strips this same artifact
-    # (rwkv_eval/answer_extract/free_response.py) before parsing, so mirror
-    # that here rather than letting every regex tier below miss a
-    # single-token answer like ">A".
-    if text.startswith(">"):
-        text = text[1:].lstrip()
-
-    # Chain-of-thought models may wrap their reasoning in <think>...</think>
-    # before stating a final answer; parse the concluding segment first so an
-    # earlier, since-corrected mention of a wrong letter can't shadow the
-    # letter the model actually settles on.
-    think_close = text.rfind("</think>")
-    if think_close >= 0:
-        think_text = text[:think_close]
-        answer_text = text[think_close + len("</think>") :]
-    else:
-        think_text = ""
-        answer_text = text
-
-    for tier in (_CHOICE_BOXED_RES, _CHOICE_EXPLICIT_RES, _CHOICE_FALLBACK_RES):
-        letter = _last_match(answer_text, tier)
-        if letter is not None and letter in letters:
-            return letters.index(letter)
-
-    letter = _last_bare_line_letter(answer_text)
-    if letter is not None and letter in letters:
-        return letters.index(letter)
-
-    # The concluding segment didn't contain a recognizable answer (e.g. the
-    # generation was truncated by max_gen_toks before it finished its final
-    # statement) -- fall back to the same tiers against the chain-of-thought
-    # itself, which may already state the intended answer.
-    if think_text:
-        for tier in (_CHOICE_BOXED_RES, _CHOICE_EXPLICIT_RES, _CHOICE_FALLBACK_RES):
-            letter = _last_match(think_text, tier)
-            if letter is not None and letter in letters:
-                return letters.index(letter)
-
-    return _substring_fallback(text, choices)
+    answer = extract_albatross_mcq_answer(
+        generated, choice_labels="".join(letters), require_think_close=require_think_close
+    )
+    if answer is not None:
+        return letters.index(answer)
+    # Text-answer fallback is only safe for substantive option texts, in the
+    # final segment, with exactly one option mentioned. Single-letter matches
+    # in words such as "final" must never turn an invalid answer into A.
+    _, closed, final = generated.rpartition("</think>")
+    if (require_think_close and not closed) or (not closed and "<think" in generated):
+        return -1
+    final = (final if closed else generated).strip().casefold()
+    if not final:
+        return -1
+    matches = [index for index, choice in enumerate(choices)
+               if len(choice.strip()) > 1 and re.search(
+                   r"(?<!\w)" + re.escape(choice.strip().casefold()) + r"(?!\w)", final)]
+    return matches[0] if len(matches) == 1 else -1

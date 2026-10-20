@@ -160,7 +160,9 @@ class LocalCompletionsAPI(TemplateAPI):
         for out in outputs:
             tmp = [None] * len(out["choices"])
             for choices in out["choices"]:
-                tmp[choices["index"]] = choices["text"]
+                tmp[choices["index"]] = _RWKVCompletion(
+                    choices["text"], choices.get("finish_reason"), raw_response=out
+                )
             res = res + tmp
         return res
 

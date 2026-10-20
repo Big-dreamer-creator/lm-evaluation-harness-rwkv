@@ -43,6 +43,9 @@ class RWKV7RemoteChat(LocalChatCompletion):
     """
 
     SUPPORTS_AVG_AT_K = True
+    INDEPENDENT_ROLLOUTS = True
+    PRESERVE_INPUT_CONTEXT = True
+    EVALUATION_PROTOCOL_VERSION = "rwkv-generative-v2"
 
     DEFAULT_BASE_URL = "https://api.rwkv.rs/v1/chat/completions"
     PROMPT_TEMPLATES = RWKV7Remote.PROMPT_TEMPLATES
@@ -64,6 +67,7 @@ class RWKV7RemoteChat(LocalChatCompletion):
         if rwkv_generation_prompt not in self.GENERATION_PROMPTS:
             raise ValueError("rwkv_generation_prompt must be open_think or fake_think.")
 
+        kwargs.setdefault("max_gen_toks", MAX_NEW_TOKENS)
         self.rwkv_prompt_template = rwkv_prompt_template
         self.rwkv_generation_prompt = rwkv_generation_prompt
         super().__init__(
@@ -73,6 +77,7 @@ class RWKV7RemoteChat(LocalChatCompletion):
             **kwargs,
         )
 
+        self.max_length = int(kwargs.get("max_length", 2048))
         self._generation_profile: dict = dict(
             self.SAMPLING_PARAMETERS[rwkv_generation_prompt]
         )
@@ -83,7 +88,7 @@ class RWKV7RemoteChat(LocalChatCompletion):
         self._avg_k_samples: Dict[Any, List[List[Tuple[float, bool]]]] = {}
         # Parallel to `_avg_k_samples[doc_id]`: whether each of the k samples
         # actually had a choice letter parsed out of it, so the avg@k patch
-        # can score unparseable generations at chance level instead of
+        # can score unparseable generations at zero instead of
         # whatever placeholder index they were encoded with.
         self._avg_k_parsed: Dict[Any, List[bool]] = {}
 
@@ -135,22 +140,8 @@ class RWKV7RemoteChat(LocalChatCompletion):
             positions = sorted(positions, key=lambda p: requests[p].idx)
             group = [requests[p] for p in positions]
             contexts = {req.args[0] for req in group}
-            if "" in contexts and len(contexts) > 1:
-                eval_logger.warning(
-                    "RWKV7RemoteChat's avg@k generative scoring does not support "
-                    "the unconditional likelihood acc_mutual_info needs; "
-                    "acc_mutual_info results for this task are not meaningful."
-                )
-                kept_positions, kept_group = [], []
-                for position, request in zip(positions, group):
-                    if request.args[0] == "":
-                        results[position] = (0.0, False)
-                    else:
-                        kept_positions.append(position)
-                        kept_group.append(request)
-                positions, group = kept_positions, kept_group
-                if not group:
-                    continue
+            if len(contexts) != 1:
+                raise NotImplementedError("Generative choice scoring requires one shared context and no unconditional likelihood requests")
 
             # `Instance.repeats` (avg@k's k) duplicates each *choice* Instance
             # k times consecutively (see evaluator.py's `cloned_reqs`), so this
@@ -169,13 +160,15 @@ class RWKV7RemoteChat(LocalChatCompletion):
 
             context = group[0].args[0]
             choices = choice_texts
+            if len({len(cg) for cg in choice_positions}) != 1 or len(choice_positions) < 2:
+                raise ValueError("Generative choice scoring requires complete, equally repeated option groups")
             k = min(len(cg) for cg in choice_positions)
             letters = choice_letters(choices)
             # Captured per-plan (never as an outer-scope loop variable) so
             # the second loop below can't leak one doc's prompt onto
             # another doc's evidence -- see RWKV7Remote.loglikelihood for
             # the same fix and its rationale.
-            prompt = build_choice_prompt(context, choices)
+            prompt = self._choice_prompt(context, choices)
 
             start = len(pending_instances)
             pending_instances.extend(self._rollout_instances(prompt, k))
@@ -200,7 +193,7 @@ class RWKV7RemoteChat(LocalChatCompletion):
             k = plan["k"]
             doc_generations = generations[plan["start"] : plan["start"] + k]
             raw_indices = [
-                parse_choice_index(str(generated), letters, choices)
+                parse_choice_index(str(generated), letters, choices, require_think_close=getattr(self, "rwkv_generation_prompt", None) == "open_think")
                 for generated in doc_generations
             ]
             parsed_flags = [index >= 0 for index in raw_indices]
@@ -256,14 +249,22 @@ class RWKV7RemoteChat(LocalChatCompletion):
                     outcome = RWKVLoglikelihoodResponse(
                         loglikelihood,
                         is_greedy,
-                        prompt=plan["prompt"],
+                        prompt=(
+                            plan["prompt"].prompt
+                            if isinstance(plan["prompt"], JsonChatStr)
+                            else plan["prompt"]
+                        ),
                         text=str(evidence_generation),
                         raw_response=getattr(evidence_generation, "raw_response", None),
-                        finish_reason=getattr(evidence_generation, "finish_reason", None),
+                        finish_reason=getattr(
+                            evidence_generation, "finish_reason", None
+                        ),
                         output_token_ids=getattr(
                             evidence_generation, "output_token_ids", None
                         ),
-                        truncated=bool(getattr(evidence_generation, "truncated", False)),
+                        truncated=bool(
+                            getattr(evidence_generation, "truncated", False)
+                        ),
                         unparsed=doc_unparsed,
                         parsed_answer=parsed_answer,
                         rollouts=rollouts,
@@ -291,7 +292,19 @@ class RWKV7RemoteChat(LocalChatCompletion):
         return results
 
     @staticmethod
-    def _rollout_instances(prompt: str, k: int) -> List[Instance]:
+    def _choice_prompt(context, choices):
+        if not isinstance(context, JsonChatStr):
+            return build_choice_prompt(context, choices)
+        messages = json.loads(context.prompt)
+        for message in reversed(messages):
+            if message["role"] == "user":
+                message["content"] = build_choice_prompt(message["content"], choices)
+                break
+        else:
+            raise ValueError("generative multiple choice requires a user message")
+        return JsonChatStr(json.dumps(messages, ensure_ascii=False))
+
+    def _rollout_instances(self, prompt: str | JsonChatStr, k: int) -> list[Instance]:
         """Build ``k`` independent generate_until instances for one doc's prompt.
 
         Every doc's rollouts share this same ``gen_kwargs`` literal, so
@@ -301,12 +314,16 @@ class RWKV7RemoteChat(LocalChatCompletion):
         semaphore parallelizes across docs, not just within one doc's k
         samples.
         """
-        gen_kwargs = {"until": [], "max_gen_toks": MAX_NEW_TOKENS}
+        gen_kwargs = {"until": [], "max_gen_toks": self._max_gen_toks}
         # `generate_until` unwraps a `JsonChatStr` into the [{"role","content"}, ...]
         # list this class's `_create_payload` requires; a bare string (fine for the
         # raw-completions `rwkv7-remote`) would fail LocalChatCompletion's assertion.
-        chat_prompt = JsonChatStr(
-            json.dumps([{"role": "user", "content": prompt}], ensure_ascii=False)
+        chat_prompt = (
+            prompt
+            if isinstance(prompt, JsonChatStr)
+            else JsonChatStr(
+                json.dumps([{"role": "user", "content": prompt}], ensure_ascii=False)
+            )
         )
         return [
             Instance(
@@ -332,7 +349,7 @@ class RWKV7RemoteChat(LocalChatCompletion):
         """
         generations = self.generate_until(self._rollout_instances(prompt, k))
         return [
-            parse_choice_index(str(generated), letters, choices) for generated in generations
+            parse_choice_index(str(generated), letters, choices, require_think_close=getattr(self, "rwkv_generation_prompt", None) == "open_think") for generated in generations
         ]
 
     def _create_payload(
@@ -357,23 +374,14 @@ class RWKV7RemoteChat(LocalChatCompletion):
         if not generate:
             return payload
 
-        profile = dict(self._generation_profile)
-        payload["temperature"] = profile.get("temperature", 1.0)
+        payload.update({key: self._generation_profile[key] for key in (
+            "temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "penalty_decay"
+        )})
         payload["chat_template_kwargs"] = {
             "rwkv_prompt_template": self.rwkv_prompt_template,
             "rwkv_generation_prompt": self.rwkv_generation_prompt,
         }
-        payload["generation_config"] = json.dumps(
-            profile, separators=(",", ":"), sort_keys=True
-        )
-        for name in (
-            "top_p",
-            "top_k",
-            "presence_penalty",
-            "frequency_penalty",
-            "penalty_decay",
-        ):
-            payload.pop(name, None)
+
         return payload
 
     @staticmethod
