@@ -546,3 +546,78 @@ enabled = true
 尚未实现 RWKV `no_think`。现有
 `rwkv7_g1j_campaign_ruler_xquad_nocot_full_scoreboard.toml` 仍会在配置校验时失败；
 不能静默换为 `fake_think` 并沿用相同实验身份。
+
+## 13. RWKV 本地 Coding 测评
+
+`lm-eval coding` 是 RWKV 专属入口：`rwkv7-remote` 或
+`rwkv7-remote-chat` 通过 HTTP 生成 Python，本机 Docker 执行本地题库中的测试。
+它与普通任务注册表分开，不下载或复制其他框架已有的 benchmark，不导入
+Helicopter/EvalScope 的运行时代码，也不自动上传成绩。
+
+先修改 [专属配置](configs/eval/rwkv7_coding_local.toml) 的完整模型版本、
+`weight_revision`、endpoint、tokenizer 和本地题库路径。相对路径均以配置文件
+所在目录为基准；模型名必须与服务的 served model name 一致。原生模板的
+assistant/bot/function_calling、open_think/fake_think 和固定采样 profile
+继续由 RWKV HTTP 后端处理。`seed[2] + repeat_ord` 决定每次作答的 seed。
+`max_gen_toks` 是输出上限，完整输入保留，实际可用额度受 `max_length` 约束。
+
+本地 JSONL 每行是一题。HumanEval 形式必须包含 `task_id`、`prompt`、
+`entry_point`、`test`、`canonical_solution`，例如：
+
+```json
+{"task_id":"local/add","prompt":"def add(a, b):\n    \"\"\"Add two numbers.\"\"\"\n","entry_point":"add","test":"def check(candidate):\n    assert candidate(2, 3) == 5\n    assert candidate(-1, 1) == 0\n","canonical_solution":"    return a + b\n"}
+```
+
+也支持 MBPP 形式：`task_id`、`text`、显式 `entry_point`、`test_list`、参考
+`code`，以及可选的 `test_setup_code`。其中 `test_list` 是题面中可见的断言；
+HumanEval 的隐藏 `test` 和参考实现不会发给模型。两种格式都要求测试中存在
+断言，并用正确参考实现和必定失败的实现验证测试确实执行了候选函数。
+支持 `.jsonl.gz`。若要使用扩展测试，必须在本地文件中提供完整测试；仅给题库
+冠以 HumanEval+/MBPP+ 名称不会自动补齐 EvalPlus 的扩展测试和专用判定逻辑。
+
+完整流程需要本机 Docker 和配置指定的 Python 镜像。运行器只使用已有镜像，
+会将镜像标签解析为不可变 image ID；准备镜像可执行：
+
+```bash
+docker pull python:3.11-slim
+uv run --no-sync python -m lm_eval coding -C configs/eval/rwkv7_coding_local.toml
+```
+
+容器关闭网络、不挂载宿主目录或 Docker socket，不传递 API key，以非 root
+用户运行，限制内存、CPU、进程数和执行时间。自定义依赖需预先安装在指定镜像中。
+完整流程在模型生成前验证所有正反控制；参考实现失败、容器不可用等基础设施问题
+会阻止出分。错误答案、死循环、未结束思考和无效代码保留为失败作答，不自动重采样。
+
+生成与判分可以分开运行：
+
+```bash
+# 只调用 RWKV 保存原始作答，不需要 Docker。
+uv run --no-sync python -m lm_eval coding -C configs/eval/rwkv7_coding_local.toml --phase generate
+
+# 从同一配置和题库恢复未完成的生成；已完成作答不再发送。
+uv run --no-sync python -m lm_eval coding -C configs/eval/rwkv7_coding_local.toml --phase generate --resume
+
+# 完全离线重判：不初始化模型、不读取 API key、不发送推理请求。
+# 必须使用独立的空输出目录，保留原有作答与判定。
+uv run --no-sync python -m lm_eval coding -C configs/eval/rwkv7_coding_local.toml \
+  --phase score --samples /absolute/path/to/run/samples.jsonl \
+  --output-dir /absolute/path/to/replay
+```
+
+协议为 `rwkv-coding-v1`，代码提取规则为 `rwkv-python-v1`。Open Think 必须有
+闭合 `</think>`；不从未结束的思考中提取代码。Fake Think 中代码里的字面
+`</think>` 字符串不会被误切。保留首个完整实现；若前面是示例或公式，则只接受
+唯一完整实现，并保留此前的纯 import 块。不根据测试成败选择围栏，不修补截断
+代码，也不重写缩进。这个规则专门覆盖已观测到的 G1k 输出格式。
+
+输出目录包含 `manifest.json`、完整题库快照、`run.sqlite3`、`samples.jsonl`、
+`controls.jsonl`、`reviews.jsonl` 和 `results.json`。记录原始回答、最终代码、
+每次 seed、结束原因、提取状态、容器镜像、判题结果及评分代码 SHA256。
+离线结果另存原始输入文件的路径与 SHA256。题库、权重、模板、模式、seed 或输出
+预算改变时不能续用旧生成；并发和超时重试参数可以调整。
+
+每题固定生成 n 次。平均通过率 `avg@n` 与
+[HumanEval 的 pass@k 估计](https://github.com/openai/human-eval/blob/master/human_eval/evaluation.py)
+分别记录，后者为 `1 - C(n-c,k) / C(n,k)`，要求每题至少有 k 次作答。
+截断率与未结束思考率也分别记录；闭合思考后达到长度上限且已生成完整代码的作答
+仍按同一套测试执行。运行产生的是此版本本地协议的结果，不能直接替代历史榜单成绩。
