@@ -112,7 +112,10 @@ def _load_tasks(
 def _standalone_benchmark_map(task_names: list) -> dict:
     return {
         task_name: BenchmarkSpec(
-            name=task_name, strategy="standalone", leaf_task_names=(task_name,)
+            name=task_name,
+            field="reasoning",
+            strategy="standalone",
+            leaf_task_names=(task_name,),
         )
         for task_name in task_names
     }

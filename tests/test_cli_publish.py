@@ -92,13 +92,19 @@ def _write_run_and_get_results_json(tmp_path: Path) -> Path:
                     "seed": 42,
                 },
                 "max_length": 4096,
-                "metadata": {"weight_revision": "rwkv7-g1j-1.5b-ctx4096"},
+                "metadata": {
+                    "model_name": "rwkv7-g1j-1.5b",
+                    "weight_revision": "rwkv7-g1j-1.5b-20260831-ctx16384",
+                },
             },
             "lm_eval_version": "test",
         },
         benchmark_map={
             "solo_leaf": BenchmarkSpec(
-                name="solo_leaf", strategy="standalone", leaf_task_names=("solo_leaf",)
+                name="solo_leaf",
+                field="reasoning",
+                strategy="standalone",
+                leaf_task_names=("solo_leaf",),
             )
         },
     )
@@ -156,6 +162,53 @@ def test_publish_dry_run_validates_real_artifact_without_uploading(tmp_path, cap
     assert "[dry-run] solo_leaf" in captured.out
 
 
+def test_publish_repairs_an_artifact_written_before_weight_revision_metadata(
+    tmp_path, capsys
+):
+    """Older artifacts only name the short API alias.
+
+    The publish config already carries the full weight revision (top-level for
+    a single-model file, per ``[[models]]`` entry for a campaign), so replaying
+    such an artifact must use it instead of failing on the missing ctx_len.
+    """
+    results_json_path = _write_run_and_get_results_json(tmp_path)
+    results_doc = json.loads(results_json_path.read_text("utf-8"))
+    results_doc["config"].pop("metadata", None)
+    results_json_path.write_text(json.dumps(results_doc), encoding="utf-8")
+
+    config_path = tmp_path / "publication.toml"
+    config_path.write_text(
+        """\
+[[models]]
+model_name = "rwkv7-g1j-1.5b"
+weight_revision = "rwkv7-g1j-1.5b-20260831-ctx16384"
+
+[publication]
+base_url = "https://scoreboard.example"
+token_env = "SCOREBOARD_PUBLICATION_TOKEN"
+cot_mode = "NoCoT"
+
+[publication.tasks.solo_leaf]
+field = "reasoning"
+avg_k = 1
+""",
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(
+        results=[str(results_json_path)],
+        config=str(config_path),
+        dry_run=True,
+        rerun_reason=None,
+        fail_fast=False,
+    )
+
+    Publish._execute(args)
+
+    captured = capsys.readouterr()
+    assert "[dry-run] solo_leaf" in captured.out
+
+
 def test_publish_reports_failure_and_exits_nonzero_on_bad_policy(tmp_path, capsys):
     results_json_path = _write_run_and_get_results_json(tmp_path)
     config_path = tmp_path / "publication.toml"
@@ -165,6 +218,9 @@ def test_publish_reports_failure_and_exits_nonzero_on_bad_policy(tmp_path, capsy
 base_url = "https://scoreboard.example"
 token_env = "SCOREBOARD_PUBLICATION_TOKEN"
 cot_mode = "NoCoT"
+
+[publication.tasks.solo_leaf]
+field = "coding"
 """,
         encoding="utf-8",
     )

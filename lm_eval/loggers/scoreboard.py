@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from lm_eval.api.benchmark import BENCHMARK_FIELDS
+
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -25,16 +27,8 @@ eval_logger = logging.getLogger(__name__)
 SOURCE = "lm-eval-harness"
 MAX_SAMPLES_PER_OUTCOME = 20
 RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+HTTP_STATUS_UNPROCESSABLE = 422
 COT_MODES = {"NoCoT", "FakeCoT", "CoT"}
-BENCHMARK_FIELDS = {
-    "knowledge",
-    "reasoning",
-    "maths",
-    "coding",
-    "instruction_following",
-    "agentic",
-    "vision",
-}
 ARCH_VERSIONS = {"rwkv7", "rwkv7a", "rwkv7b"}
 PARAM_SIZES = {"1.5b", "2.9b", "7.2b", "13.3b"}
 # lm-eval-rwkv model names encode arch/data/param version as
@@ -306,11 +300,30 @@ class _SampleEvidence:
     # Docs actually scored by this leaf -- the count the board reports as the
     # benchmark's `num_samples`, and the denominator of its avg_k.
     docs: int
+    # Completions the leaf actually sampled: one per sample the run took per
+    # doc, summed over the docs it scored. This is the numerator of the
+    # published avg_k, and the only honest source for it when an artifact
+    # records neither its own `n_completions` nor a `<metric>_avg@k` key.
+    completions: int
     # Doc-level truncation, i.e. the fraction of scored docs whose reported
     # completion hit the output cap. Only a fallback: a run that counted its
     # own completions records a per-completion `truncation_rate` in the
     # results instead (see `_leaf_upload`).
     truncation_rate: float
+
+
+def _completion_count(row: dict[str, Any]) -> int:
+    """How many completions one doc was scored with.
+
+    A sample row's ``resps`` is ``[filter][completion]``: the inner list holds
+    one entry per sample the run took for that doc (see
+    `EvaluationTracker.save_results_samples`), so its length is what the doc
+    contributes to the leaf's completion count.
+    """
+    resps = row.get("resps")
+    if isinstance(resps, list) and resps and isinstance(resps[0], list):
+        return len(resps[0]) or 1
+    return 1
 
 
 def _details(
@@ -335,7 +348,7 @@ def _details(
     trustworthy stand-in for artifacts that predate the recorded counts.
     """
     buckets: dict[str, list[dict[str, Any]]] = {"passed": [], "wrong": [], "failed": []}
-    docs = truncated = 0
+    docs = truncated = completions = 0
     seen: set[Any] = set()
     with path.open(encoding="utf-8") as sample_file:
         for line in sample_file:
@@ -351,6 +364,7 @@ def _details(
                 seen.add(doc_id)
             detail, outcome, is_truncated = _detail(row, metric_name)
             docs += 1
+            completions += _completion_count(row)
             truncated += is_truncated
             if uploaded_counts[outcome] >= MAX_SAMPLES_PER_OUTCOME:
                 continue
@@ -359,12 +373,115 @@ def _details(
     return _SampleEvidence(
         buckets=buckets,
         docs=docs,
+        completions=completions,
         truncation_rate=(truncated / docs if docs else 0.0),
     )
 
 
+def _leaf_dataset_identity(config: dict[str, Any]) -> tuple[Any, Any, Any]:
+    """The dataset slice a leaf reads.
+
+    Two leaves that draw on the same slice can be nested -- one may score a
+    filtered subset of the other's documents (winogender's `winogender_all`
+    task and its `winogender_female`/`_male`/`_neutral` filters). Leaves on
+    different slices can never overlap, so they are never compared.
+    """
+    return (
+        config.get("dataset_path"),
+        config.get("dataset_name"),
+        config.get("test_split"),
+    )
+
+
+def _sample_document_hashes(path: Path) -> frozenset[Any] | None:
+    """The documents one leaf scored, identified by content hash.
+
+    Read for nesting detection only, which is why it walks the whole samples
+    file instead of stopping like `_details` does: a leaf's documents are a
+    superset of a sibling's only if every one of the sibling's documents
+    appears here.
+
+    ``doc_hash`` is the document's content, so two leaves that read different
+    datasets can never share it. ``doc_id`` is *not* usable as a fallback --
+    it is a per-dataset index, and two unrelated tasks both numbering their
+    docs from 0 would look nested. Rows written before `doc_hash` existed
+    therefore yield ``None``: nesting is undecidable, not absent.
+    """
+    hashes: set[Any] = set()
+    with path.open(encoding="utf-8") as sample_file:
+        for line in sample_file:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            value = row.get("doc_hash")
+            if value is None:
+                return None
+            hashes.add(value)
+    return frozenset(hashes)
+
+
+def _parent_leaves(
+    leaf_docs: dict[str, dict[str, Any]],
+    leaf_artifact_paths: dict[str, dict[str, str]],
+) -> dict[str, tuple[str, ...]]:
+    """Leaves that only re-score documents a sibling leaf already covers.
+
+    A group may list a task together with filtered versions of itself (the
+    winogender group scores `winogender_all` and then re-scores its
+    `female`/`male`/`neutral` subsets; the `gotcha` task and its `_female` /
+    `_male` filters are another such pair). Publishing every leaf would count
+    those documents twice -- once in the parent, again in each child -- and
+    would weight the parent's own average by its full document count. The
+    producer on the lighteval side skips exactly this case (it drops the
+    `all` row before blending), so the parent is dropped here too and the
+    children carry the benchmark.
+
+    Returns a mapping of parent leaf -> the sibling leaves whose documents it
+    contains.
+    """
+    groups: dict[tuple[Any, Any, Any], list[str]] = {}
+    for leaf_name, leaf_doc in leaf_docs.items():
+        identity = _leaf_dataset_identity(leaf_doc["configs"][leaf_name])
+        groups.setdefault(identity, []).append(leaf_name)
+
+    parents: dict[str, tuple[str, ...]] = {}
+    undecidable: list[str] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        keys: dict[str, frozenset[Any]] = {}
+        for leaf_name in members:
+            samples_path = (leaf_artifact_paths.get(leaf_name) or {}).get("samples")
+            if samples_path and Path(samples_path).is_file():
+                leaf_hashes = _sample_document_hashes(Path(samples_path))
+                if leaf_hashes is None:
+                    undecidable.append(leaf_name)
+                else:
+                    keys[leaf_name] = leaf_hashes
+        for leaf_name, own_keys in keys.items():
+            children = tuple(
+                sorted(
+                    other
+                    for other, other_keys in keys.items()
+                    if other != leaf_name and own_keys > other_keys
+                )
+            )
+            if children:
+                parents[leaf_name] = children
+    if undecidable:
+        eval_logger.warning(
+            "leaves %s have samples without doc_hash, so whether they merely "
+            "re-score a sibling's documents could not be checked; they are "
+            "published as separate tasks.",
+            ", ".join(sorted(undecidable)),
+        )
+    return parents
+
+
 def _weight_ctx_len(
-    model_name: str, *artifact_paths: str | Path | None
+    model_name: str,
+    *artifact_paths: str | Path | None,
+    weight_revision: str | None = None,
 ) -> int:
     """Return the context window baked into the served weight release.
 
@@ -375,11 +492,17 @@ def _weight_ctx_len(
     budget, so evaluating one weight at a shorter ``max_length`` must not fork
     it into a second model on the board.
 
-    The revision is read from ``model_name`` when it carries one, otherwise
-    from the run's artifact paths, which live under a run directory named
-    after the weight that was served.
+    The revision is read from ``weight_revision`` (the config's explicit
+    full-release-name field) when given, then from ``model_name`` when it
+    carries one -- ``model_name`` doubles as the literal API ``model=``
+    value, so it often can't carry the revision stem -- otherwise from the
+    run's artifact paths, which live under a run directory named after the
+    weight that was served.
     """
-    sources: list[tuple[str, str]] = [(str(model_name), "model name")]
+    sources: list[tuple[str, str]] = []
+    if weight_revision is not None:
+        sources.append((str(weight_revision), "weight_revision"))
+    sources.append((str(model_name), "model name"))
     sources.extend(
         (str(path), "artifact path")
         for path in artifact_paths
@@ -394,10 +517,11 @@ def _weight_ctx_len(
         searched = ", ".join(f"{kind} {text!r}" for text, kind in sources)
         raise ScoreboardError(
             "cannot determine the served weight's context window (ctx_len): no "
-            f"'ctx<number>' token in {searched}. Name the weight revision in "
-            "model_name (e.g. 'rwkv7-g1k-13.3b-20260930-ctx25600'); the "
-            "evaluation's max_length is intentionally not used because ctx_len "
-            "identifies the weight."
+            f"'ctx<number>' token in {searched}. Set the config's top-level (or "
+            "[[models]] entry's) weight_revision to the full served weight name "
+            "(e.g. 'rwkv7-g1k-13.3b-20260930-ctx25600'); model_name stays the "
+            "short API alias. The evaluation's max_length is intentionally not "
+            "used because ctx_len identifies the weight."
         )
     ctx_len = found[0][1]
     if any(value != ctx_len for _, value in found[1:]):
@@ -479,8 +603,15 @@ def _sampling_config(
         or (run_config.get("sampling_config") or {}).get("max_gen_toks")
         or DEFAULT_MAX_GENERATED_TOKENS,
     )
-    sampling.setdefault("seed", DEFAULT_SEED)
-    if run_config.get("evaluation_protocol"):
+    if run_config.get("model") == "rwkv7-lightning-cuda":
+        sampling.setdefault("seed", -1)
+        sampling["seed_strategy"] = "unsupported"
+    else:
+        sampling.setdefault("seed", DEFAULT_SEED)
+    if (
+        run_config.get("evaluation_protocol")
+        and run_config.get("model") != "rwkv7-lightning-cuda"
+    ):
         sampling["seed_strategy"] = "base_plus_repeat_ord"
         sampling["evaluation_protocol"] = run_config["evaluation_protocol"]
     missing = [field for field in REQUIRED_SAMPLING_FIELDS if field not in sampling]
@@ -548,7 +679,11 @@ def _common(values: list[Any]) -> Any:
 
 
 def _benchmark_info(
-    benchmark_name: str, num_samples: int, avg_k: float, policy: dict[str, Any]
+    benchmark_name: str,
+    field: str,
+    num_samples: int,
+    avg_k: float,
+    policy: dict[str, Any],
 ) -> dict[str, Any]:
     """Register the benchmark together with how much was sampled for it.
 
@@ -559,12 +694,23 @@ def _benchmark_info(
     ``publication.tasks.<name>.avg_k`` is therefore only accepted when it
     agrees with the results; it can no longer disagree with the score that
     gets uploaded next to it.
+
+    The value it *publishes* is an integer: the board's ``avg_k`` is a label
+    (``avg@4``), so a benchmark whose leaves were sampled at different rates
+    publishes that rate rounded to whole samples per doc.
     """
-    field = policy.get("field")
     if field not in BENCHMARK_FIELDS:
         raise ScoreboardError(
-            f"publication.tasks.{benchmark_name}.field must be one of "
+            f"benchmark.field for {benchmark_name!r} must be one of "
             f"{sorted(BENCHMARK_FIELDS)}, got {field!r}"
+        )
+    declared_field = policy.get("field")
+    if declared_field is not None and declared_field != field:
+        raise ScoreboardError(
+            f"publication.tasks.{benchmark_name}.field is {declared_field!r}, "
+            f"but the saved benchmark.field is {field!r}; update the central "
+            "benchmark config and re-run instead of overriding a field at "
+            "upload time"
         )
     declared = policy.get("avg_k")
     if declared is not None:
@@ -579,11 +725,29 @@ def _benchmark_info(
                 "the results (completions per sample), so remove the field or set "
                 "it to the value the run actually used"
             )
+    # The board's avg_k is an integer label ("avg@4") and part of a cell's
+    # identity, so a benchmark whose leaves were sampled at different k cannot
+    # publish its fractional rate: wmdp's leaves run 4 / 8 / 2 samples per doc
+    # (the avg@k budget is planned per task), which averages to 3.36 and would
+    # otherwise render as "avg@3.361504907306434" in the board's Metric column.
+    # Publish the rate rounded to whole samples per doc instead. A benchmark
+    # whose leaves share one k -- every other benchmark in the campaign --
+    # publishes exactly that k, unchanged.
+    published_avg_k = float(math.floor(avg_k + 0.5))
+    if published_avg_k != float(avg_k):
+        eval_logger.warning(
+            "benchmark %s: its leaves were sampled at different k, averaging %g "
+            "completions per doc; publishing the integer label avg@%d, which is "
+            "the rate rounded to whole samples per doc.",
+            benchmark_name,
+            avg_k,
+            int(published_avg_k),
+        )
     return {
         "name": benchmark_name,
         "field": field,
         "num_samples": num_samples,
-        "avg_k": avg_k,
+        "avg_k": published_avg_k,
     }
 
 
@@ -622,8 +786,17 @@ def _leaf_metric_key(
     recorded_k: float | None,
     planned_k: int,
     leaf_name: str,
+    observed_k: int | None = None,
 ) -> tuple[str, int]:
-    """``(metric_key, k)`` for the average actually available for one leaf."""
+    """``(metric_key, k)`` for the average actually available for one leaf.
+
+    `observed_k` is how many completions per doc the leaf's samples actually
+    hold. It is the last resort when the artifact carries neither a recorded
+    completion count nor a ``<metric>_avg@k`` key: the samples are still
+    evidence of the sampling that happened, and reporting k=1 there would
+    understate it (`race`/`wmdp` artifacts from before the avg@k coverage
+    fix, whose leaves were sampled 2-8 times per doc).
+    """
     base, _, filter_key = primary.partition(",")
     averaged = {
         int(match.group("k")): name
@@ -633,7 +806,7 @@ def _leaf_metric_key(
         and name.partition(",")[2] == filter_key
     }
     if not averaged:
-        return primary, 1
+        return primary, observed_k or 1
     if recorded_k is not None and int(round(recorded_k)) in averaged:
         k = int(round(recorded_k))
         return averaged[k], k
@@ -724,12 +897,31 @@ def _leaf_upload(
         if isinstance(planned, (int, float)) and not isinstance(planned, bool)
         else 1
     )
+    # What the samples themselves show, for artifacts whose metrics carry no
+    # avg@k average to read k off (see `_leaf_metric_key`).
+    observed_k = (
+        max(1, round(samples.completions / samples.docs))
+        if samples is not None and samples.docs
+        else None
+    )
 
-    metric_key, k = _leaf_metric_key(metrics, primary, recorded_k, planned_k, leaf_name)
+    metric_key, k = _leaf_metric_key(
+        metrics, primary, recorded_k, planned_k, leaf_name, observed_k
+    )
+    if observed_k and observed_k > 1 and metric_key == primary:
+        eval_logger.info(
+            "leaf %s: results carry no <metric>_avg@k average, so avg_k is read "
+            "from the samples: %d completions over %d docs (k=%g).",
+            leaf_name,
+            samples.completions,
+            samples.docs,
+            samples.completions / samples.docs,
+        )
     if planned_k > 1 and k < planned_k:
         eval_logger.warning(
-            "leaf %s: the run planned k=%d but its results only carry %s (k=%d). "
-            "This artifact predates the avg@k coverage fix (or was resumed from a "
+            "leaf %s: the run planned k=%d, but the average being published is "
+            "%s (k=%d) and neither the results nor the samples carry more. This "
+            "artifact predates the avg@k coverage fix (or was resumed from a "
             "checkpoint that restored the doc's requests), so the published score "
             "and avg_k describe the average that is actually present.",
             leaf_name,
@@ -750,7 +942,17 @@ def _leaf_upload(
             leaf_name,
         )
         docs = int(leaf_doc["n-samples"][leaf_name]["effective"])
-    completions = recorded_completions or float(docs * k)
+    if recorded_completions:
+        completions = recorded_completions
+    elif metric_key != primary:
+        # The published score is the ``<metric>_avg@k`` average this key
+        # names, so it stands on `docs * k` completions even when the samples
+        # file kept fewer rows per doc than the run took.
+        completions = float(docs * k)
+    elif samples is not None and samples.completions:
+        completions = float(samples.completions)
+    else:
+        completions = float(docs * k)
 
     if "truncation_rate" in row:
         truncation_rate = float(row["truncation_rate"])
@@ -815,12 +1017,25 @@ def build_score(
     completions sampled are *read off the run* (``num_samples``,
     ``avg_k = n_completions / n_samples``), the headline score is the
     per-sample average the results actually carry, and a multi-leaf benchmark
-    blends its leaves by completions. The hand-written ``avg_k`` in the
-    publication policy is only an assertion from here on -- if it disagrees
-    with what was run, publication fails instead of labelling one number with
-    another's sampling.
+    blends its leaves by completions after dropping any leaf whose documents a
+    sibling leaf already covers (see `_parent_leaves`). The hand-written
+    ``avg_k`` in the publication policy is only an assertion from here on --
+    if it disagrees with what was run, publication fails instead of labelling
+    one number with another's sampling.
     """
     benchmark_name = next(iter(results["results"]))
+    benchmark = results.get("benchmark")
+    if not isinstance(benchmark, dict):
+        raise ScoreboardError(
+            f"benchmark {benchmark_name!r} has no saved benchmark.field; re-run "
+            "with the explicit benchmark configuration before publication"
+        )
+    if benchmark.get("name") != benchmark_name:
+        raise ScoreboardError(
+            f"saved benchmark.name {benchmark.get('name')!r} does not match "
+            f"results key {benchmark_name!r}"
+        )
+    benchmark_field = benchmark.get("field")
     leaf_artifact_paths: dict[str, dict[str, str]] = (
         results.get("leaf_artifact_paths") or {}
     )
@@ -843,10 +1058,41 @@ def build_score(
         leaf_name: json.loads(Path(paths["results"]).read_text("utf-8"))
         for leaf_name, paths in leaf_artifact_paths.items()
     }
+    # A group may score an unfiltered task and filtered subsets of it
+    # (winogender's `all` alongside its female/male/neutral filters). Those
+    # documents would otherwise be counted once per leaf that covers them, so
+    # the parent leaves are dropped and the children carry the benchmark.
+    parents = _parent_leaves(leaf_docs, leaf_artifact_paths)
+    publish_leaves = {
+        leaf_name: paths
+        for leaf_name, paths in leaf_artifact_paths.items()
+        if leaf_name not in parents
+    }
+    if parents and not publish_leaves:
+        eval_logger.warning(
+            "benchmark %s: every leaf covers another leaf's documents (%s); "
+            "publishing all of them rather than none.",
+            benchmark_name,
+            ", ".join(sorted(parents)),
+        )
+        publish_leaves = dict(leaf_artifact_paths)
+    else:
+        for parent_name, children in sorted(parents.items()):
+            eval_logger.warning(
+                "benchmark %s: leaf %s re-scores documents already covered by %s, "
+                "so it is excluded from the published score and sample count.",
+                benchmark_name,
+                parent_name,
+                ", ".join(children),
+            )
     policy = _task_policy(config, benchmark_name, benchmark_name)
 
     run_config = results["config"]
-    if run_config.get("model") in {"rwkv7-remote", "rwkv7-remote-chat"}:
+    if run_config.get("model") in {
+        "rwkv7-lightning-cuda",
+        "rwkv7-remote",
+        "rwkv7-remote-chat",
+    }:
         from lm_eval.api.checkpoint import EVALUATION_PROTOCOL_VERSION
         if run_config.get("evaluation_protocol") != EVALUATION_PROTOCOL_VERSION:
             raise ScoreboardError("Historical generative artifacts require a versioned raw-answer replay before publication")
@@ -854,6 +1100,13 @@ def build_score(
     model_name = str(
         model_args.get("model") or model_args.get("pretrained") or run_config["model"]
     )
+    # The served weight's revision (and thus its ctx_len) usually can't live in
+    # model_name: that string is also the literal API model= value, which must
+    # stay the backend's short serving alias (e.g. "rwkv7-g1j-1.5b") rather than
+    # a release filename stem. metadata.weight_revision carries the full
+    # revision string instead, so _weight_ctx_len can read ctx<N> from it
+    # without model_name needing to carry anything the API would reject.
+    weight_revision = (run_config.get("metadata") or {}).get("weight_revision")
 
     uploaded_counts = dict.fromkeys(("passed", "wrong", "failed"), 0)
     merged_buckets: dict[str, list[dict[str, Any]]] = {
@@ -866,7 +1119,7 @@ def build_score(
     # The benchmark's own headline metric (a group's first aggregated metric;
     # `primary_metric_hint` on the artifact) or an explicit policy override.
     metric_hint = policy.get("primary_metric") or results.get("primary_metric_hint")
-    for leaf_name, paths in leaf_artifact_paths.items():
+    for leaf_name, paths in publish_leaves.items():
         leaf_doc = leaf_docs[leaf_name]
         leaf_policy = _task_policy(config, leaf_name, benchmark_name)
         leaf_primary = _leaf_primary_metric(
@@ -942,12 +1195,17 @@ def build_score(
         else {}
     )
     benchmark_info = _benchmark_info(
-        benchmark_name, num_samples, completions / num_samples, policy
+        benchmark_name,
+        benchmark_field,
+        num_samples,
+        completions / num_samples,
+        policy,
     )
-    revision = (run_config.get("metadata") or {}).get("weight_revision")
     model = _rwkv_model(
         model_name,
-        _weight_ctx_len(revision or model_name, *artifact_hint_paths),
+        _weight_ctx_len(
+            model_name, *artifact_hint_paths, weight_revision=weight_revision
+        ),
     )
     payload = {
         "benchmark_id": None,
@@ -1021,7 +1279,11 @@ class ScoreboardPublisher:
         raise AssertionError("unreachable: loop always returns or raises")
 
     def _upload(
-        self, score: dict[str, Any], *, allow_expire: bool = True
+        self,
+        score: dict[str, Any],
+        *,
+        benchmark_name: str | None = None,
+        allow_expire: bool = True,
     ) -> dict[str, Any]:
         request = Request(  # noqa: S310 - publication URL is configured.
             self.base_url + "/api/upload",
@@ -1046,6 +1308,27 @@ class ScoreboardPublisher:
                     body = {}
                 detail = body.get("detail") if isinstance(body, dict) else None
                 code = detail.get("code") if isinstance(detail, dict) else None
+                if (
+                    error.code == HTTP_STATUS_UNPROCESSABLE
+                    and benchmark_name is not None
+                    and "benchmark_name" not in score
+                    and isinstance(detail, list)
+                    and any(
+                        isinstance(item, dict)
+                        and item.get("loc") == ["body", "benchmark_name"]
+                        for item in detail
+                    )
+                ):
+                    eval_logger.info(
+                        "scoreboard rejected the upload for a missing "
+                        "benchmark_name; retrying with the name (older server "
+                        "revision keyed by benchmark name)."
+                    )
+                    return self._upload(
+                        {**score, "benchmark_name": benchmark_name},
+                        benchmark_name=benchmark_name,
+                        allow_expire=allow_expire,
+                    )
                 if error.code == 409:
                     if (
                         allow_expire
@@ -1058,7 +1341,11 @@ class ScoreboardPublisher:
                             body={"score_id": detail["score_id"]},
                             timeout=self.config.control_timeout,
                         )
-                        return self._upload(score, allow_expire=False)
+                        return self._upload(
+                            score,
+                            benchmark_name=benchmark_name,
+                            allow_expire=False,
+                        )
                     if code == "duplicate_score" and self.config.rerun_reason is None:
                         return {
                             "success": True,
@@ -1099,7 +1386,9 @@ class ScoreboardPublisher:
         )
         benchmark_id = benchmark_receipt["benchmark_id"]
         score_with_id = {**score, "benchmark_id": benchmark_id}
-        upload_receipt = self._upload(score_with_id)
+        upload_receipt = self._upload(
+            score_with_id, benchmark_name=benchmark_info["name"]
+        )
         return {
             "benchmark_id": benchmark_id,
             "benchmark": benchmark_receipt,

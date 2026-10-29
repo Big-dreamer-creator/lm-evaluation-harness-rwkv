@@ -16,20 +16,24 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
+from lm_eval.api.benchmark import DEFAULT_BENCHMARK_CONFIG
 from lm_eval.utils import simple_parse_args_string
 
 
 if TYPE_CHECKING:
     from argparse import Namespace
 
-    from lm_eval.api.benchmark import BenchmarkSpec
+    from lm_eval.api.benchmark import BenchmarkField, BenchmarkSpec
     from lm_eval.tasks import TaskManager
 
 eval_logger = logging.getLogger(__name__)
 
 
 def _classify_benchmark(
-    task: str, matches: list[str], task_manager: TaskManager
+    task: str,
+    field: BenchmarkField,
+    matches: list[str],
+    task_manager: TaskManager,
 ) -> BenchmarkSpec:
     """Classify one requested ``benchmarks`` entry into a ``BenchmarkSpec``."""
     from lm_eval.api.benchmark import BenchmarkSpec
@@ -47,17 +51,22 @@ def _classify_benchmark(
                 has_formal_agg = bool((entry.cfg or {}).get("aggregate_metric_list"))
                 return BenchmarkSpec(
                     name=task,
+                    field=field,
                     strategy="group_aggregate" if has_formal_agg else "group_fallback",
                 )
             if entry.kind is Kind.TAG:
                 return BenchmarkSpec(
                     name=task,
+                    field=field,
                     strategy="tag_fallback",
                     leaf_task_names=tuple(sorted(entry.tags)),
                 )
             # Kind.TASK / Kind.PY_TASK
             return BenchmarkSpec(
-                name=task, strategy="standalone", leaf_task_names=(task,)
+                name=task,
+                field=field,
+                strategy="standalone",
+                leaf_task_names=(task,),
             )
 
     # Glob pattern (or unindexed exact match): only allow matching individual
@@ -74,7 +83,10 @@ def _classify_benchmark(
                 "`benchmarks` may only match individual leaf tasks."
             )
     return BenchmarkSpec(
-        name=task, strategy="tag_fallback", leaf_task_names=tuple(matches)
+        name=task,
+        field=field,
+        strategy="tag_fallback",
+        leaf_task_names=tuple(matches),
     )
 
 
@@ -91,6 +103,7 @@ VERSIONED_CONFIG_FIELDS = {
     "backend",
     "base_url",
     "batch_size",
+    "benchmark_config",
     "benchmarks",
     "checkpoint",
     "device",
@@ -109,6 +122,7 @@ VERSIONED_CONFIG_FIELDS = {
     "output_dir",
     "publication",
     "publish",
+    "request_concurrency",
     "scoreboard",
     "rwkv_profile",
     "samples",
@@ -138,9 +152,14 @@ RWKV_PROFILE_FIELDS = {
     "wkv_mode",
 }
 RWKV_PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
-RWKV_GENERATION_PROMPTS = {"fake_think", "open_think"}
+RWKV_GENERATION_PROMPTS = {"no_think", "fake_think", "open_think"}
 RWKV_WKV_MODES = {"fp16", "fp32io16"}
-RWKV_BACKENDS = {"rwkv7-http", "rwkv7-remote", "rwkv7-remote-chat"}
+RWKV_BACKENDS = {
+    "rwkv7-http",
+    "rwkv7-lightning-cuda",
+    "rwkv7-remote",
+    "rwkv7-remote-chat",
+}
 # The two campaign-container keys are consumed by `_expand_models` before a
 # model entry is validated, so a `[[models]]` entry may carry every field a
 # single-model config may carry except the containers themselves.
@@ -192,6 +211,10 @@ class EvaluatorConfig:
     tasks: str | list[str] = field(
         default_factory=list,
         metadata={"help": "Comma-separated list of task names to evaluate"},
+    )
+    benchmark_config: str | None = field(
+        default=None,
+        metadata={"help": "Explicit benchmark selector-to-field TOML mapping"},
     )
 
     # Few-shot and batching
@@ -444,6 +467,14 @@ class EvaluatorConfig:
         last -- the launch-time overlay hook.
         """
         config_data = cls._load_config_mapping(config_path, _seen=_seen)
+        benchmark_config = config_data.get("benchmark_config")
+        if isinstance(benchmark_config, str):
+            benchmark_path = Path(benchmark_config).expanduser()
+            if not benchmark_path.is_absolute():
+                benchmark_path = (
+                    Path(config_path).expanduser().resolve().parent / benchmark_path
+                )
+            config_data["benchmark_config"] = str(benchmark_path.resolve())
         return cls._expand_models(config_data, only_model=only_model)
 
     @classmethod
@@ -618,24 +649,55 @@ class EvaluatorConfig:
             tokenizer_name = cls._non_empty_string(tokenizer_name, "tokenizer_name")
             if backend in RWKV_BACKENDS_WITHOUT_TOKENIZER:
                 raise ValueError(
-                    "tokenizer_name is only supported for backend = rwkv7-remote"
+                    "tokenizer_name is only supported for backend = rwkv7-remote "
+                    "or rwkv7-lightning-cuda"
                 )
+        if backend == "rwkv7-lightning-cuda" and tokenizer_name is None:
+            raise ValueError(
+                "rwkv7-lightning-cuda requires the official tokenizer_name"
+            )
 
         model_name = cls._non_empty_string(config["model_name"], "model_name")
-        completion_path = (
-            "/v1/chat/completions" if backend == "rwkv7-remote-chat" else "/v1/completions"
-        )
+        weight_revision = config.get("weight_revision")
+        if weight_revision is not None:
+            weight_revision = cls._non_empty_string(
+                weight_revision, "weight_revision"
+            )
+        completion_path = {
+            "rwkv7-lightning-cuda": "/v1/batch/completions",
+            "rwkv7-remote-chat": "/v1/chat/completions",
+        }.get(backend, "/v1/completions")
         base_url = cls._completion_url(config["base_url"], completion_path)
         benchmarks = cls._string_list(config["benchmarks"], "benchmarks")
+        benchmark_config = cls._non_empty_string(
+            config.get("benchmark_config", str(DEFAULT_BENCHMARK_CONFIG)),
+            "benchmark_config",
+        )
         output_dir = cls._non_empty_string(config["output_dir"], "output_dir")
         max_length = cls._positive_int(config["max_length"], "max_length")
         batch_size = cls._positive_int(config.get("batch_size", 1), "batch_size")
-        # The evaluator never hand-tunes its own request concurrency: the
-        # config declares what the inference endpoint can hold at once (the
-        # server's own --max-num-seqs), and the request budget is that declared
-        # capacity -- mirroring lighteval-rwkv, where the model client is built
-        # with concurrent_requests = sum(max_num_seqs).
+        # The evaluator never hand-tunes its own request concurrency. vLLM
+        # endpoints use the declared sequence capacity directly; lightning's
+        # native batch transport converts it to an HTTP-request count and keeps
+        # one extra request waiting in the server's FIFO admission queue.
         max_num_seqs = cls._positive_int(config["max_num_seqs"], "max_num_seqs")
+        if backend == "rwkv7-lightning-cuda" and batch_size > max_num_seqs:
+            raise ValueError(
+                "rwkv7-lightning-cuda batch_size cannot exceed max_num_seqs"
+            )
+        num_concurrent = max_num_seqs
+        if backend == "rwkv7-lightning-cuda":
+            if "request_concurrency" in config:
+                num_concurrent = cls._positive_int(
+                    config["request_concurrency"], "request_concurrency"
+                )
+            else:
+                num_concurrent = (max_num_seqs + batch_size - 1) // batch_size + 1
+        elif "request_concurrency" in config:
+            raise ValueError(
+                "request_concurrency is only supported for backend = "
+                "rwkv7-lightning-cuda"
+            )
         request_timeout = (
             cls._positive_int(config["timeout"], "timeout")
             if "timeout" in config
@@ -744,13 +806,13 @@ class EvaluatorConfig:
                 "rwkv_prompt_template": prompt_template,
                 "rwkv_generation_prompt": generation_prompt,
                 # Derived, not user-facing: see the max_num_seqs comment above.
-                "num_concurrent": max_num_seqs,
+                "num_concurrent": num_concurrent,
                 "max_length": max_length,
             }
         else:
             model_args = {
                 "model": model_name,
-                "num_concurrent": max_num_seqs,
+                "num_concurrent": num_concurrent,
                 "max_length": max_length,
                 "rwkv_prompt_template": prompt_template,
                 "rwkv_generation_prompt": generation_prompt,
@@ -760,6 +822,11 @@ class EvaluatorConfig:
         model_args["base_url"] = base_url
         if backend in {"rwkv7-remote", "rwkv7-remote-chat"}:
             model_args["seed"] = seed[2]
+        if backend in {
+            "rwkv7-lightning-cuda",
+            "rwkv7-remote",
+            "rwkv7-remote-chat",
+        }:
             model_args["max_gen_toks"] = cls._positive_int(config.get("max_gen_toks", 8192), "max_gen_toks")
         # HTTP robustness knobs. Like max_num_seqs they only change how
         # requests are retried, not prompts, sampling or model identity, so
@@ -773,6 +840,7 @@ class EvaluatorConfig:
         normalized: dict[str, Any] = {
             "model": backend,
             "tasks": benchmarks,
+            "benchmark_config": benchmark_config,
             "batch_size": batch_size,
             "device": device,
             "apply_chat_template": apply_chat_template,
@@ -784,6 +852,7 @@ class EvaluatorConfig:
             "model_args": model_args,
             "metadata": {
                 "model_name": model_name,
+                "weight_revision": weight_revision,
                 "wkv_mode": wkv_mode,
                 "cot_mode": generation_prompt,
                 "prompt_template": prompt_template,
@@ -1026,7 +1095,7 @@ class EvaluatorConfig:
         import glob
         import itertools
 
-        from lm_eval.api.benchmark import BenchmarkSpec
+        from lm_eval.api.benchmark import BenchmarkSpec, read_benchmark_fields
         from lm_eval.tasks import TaskManager
         from lm_eval.tasks._yaml_loader import load_yaml
 
@@ -1037,6 +1106,11 @@ class EvaluatorConfig:
             include_path=self.include_path,
             include_defaults=self.include_defaults,
             metadata=self.metadata or {},
+        )
+        benchmark_fields = (
+            read_benchmark_fields(self.benchmark_config)
+            if self.benchmark_config is not None
+            else None
         )
 
         # Normalize tasks to a list
@@ -1068,11 +1142,16 @@ class EvaluatorConfig:
         benchmark_map: dict[str, BenchmarkSpec] = {}
         for task in match_dict:
             if not task.endswith(".yaml"):
+                if benchmark_fields is not None and task not in benchmark_fields:
+                    raise ValueError(
+                        f"benchmark selector {task!r} has no explicit field in "
+                        f"{Path(self.benchmark_config).expanduser().resolve()}"
+                    )
                 # Standard task name - match via task manager
                 matches = task_manager.match_tasks([task])
-                if matches:
+                if matches and benchmark_fields is not None:
                     benchmark_map[task] = _classify_benchmark(
-                        task, matches, task_manager
+                        task, benchmark_fields[task], matches, task_manager
                     )
             else:
                 # Custom config file(s) - support glob patterns

@@ -6,7 +6,7 @@ from urllib.error import HTTPError
 import pytest
 
 from lm_eval import evaluator
-from lm_eval.api.benchmark import BenchmarkSpec
+from lm_eval.api.benchmark import AvgAtKPlan, BenchmarkSpec
 from lm_eval.loggers.evaluation_tracker import EvaluationTracker
 from lm_eval.loggers.scoreboard import (
     MAX_SAMPLES_PER_OUTCOME,
@@ -145,6 +145,7 @@ def _run_benchmark(
         benchmark_map={
             benchmark_name: BenchmarkSpec(
                 name=benchmark_name,
+                field="reasoning",
                 strategy=strategy,
                 leaf_task_names=(benchmark_name,) if strategy == "standalone" else None,
             )
@@ -206,7 +207,7 @@ def test_group_fallback_merges_leaves_into_one_score(tmp_path):
     assert len(score["wrong_details"]) == 6
 
 
-def test_field_missing_from_policy_raises(tmp_path):
+def test_saved_benchmark_field_does_not_require_upload_policy_field(tmp_path):
     fixtures_dir = tmp_path / "fixtures_missing_field"
     _write_data_and_leaves(fixtures_dir, [("no_field_leaf", "exact_match")])
     group_yaml = "group: unused\ntask:\n  - no_field_leaf\n"
@@ -215,8 +216,32 @@ def test_field_missing_from_policy_raises(tmp_path):
     )
 
     config = _publish_config({"no_field_leaf": {"avg_k": 1}})
-    with pytest.raises(ScoreboardError, match="field"):
+    benchmark_info, _score = build_score(results_doc, config)
+
+    assert benchmark_info["field"] == "reasoning"
+
+
+def test_upload_policy_cannot_override_saved_benchmark_field(tmp_path):
+    fixtures_dir = tmp_path / "fixtures_mismatched_field"
+    _write_data_and_leaves(fixtures_dir, [("mismatched_field_leaf", "exact_match")])
+    group_yaml = "group: unused\ntask:\n  - mismatched_field_leaf\n"
+    results_doc = _run_benchmark(
+        fixtures_dir, group_yaml, "mismatched_field_leaf", "standalone", tmp_path
+    )
+
+    config = _publish_config({"mismatched_field_leaf": {"field": "coding"}})
+    with pytest.raises(ScoreboardError, match="saved benchmark.field"):
         build_score(results_doc, config)
+
+
+def test_upload_requires_field_saved_by_evaluation(tmp_path):
+    run_dir = tmp_path / _RUN_DIR_NAME
+    leaves = {"leaf": _leaf_artifacts(run_dir, "leaf", docs=1, k=1)}
+    results_doc = _benchmark_doc(run_dir, leaves)
+    results_doc.pop("benchmark")
+
+    with pytest.raises(ScoreboardError, match="no saved benchmark.field"):
+        build_score(results_doc, _publish_config())
 
 
 def test_avg_k_missing_from_policy_raises(tmp_path):
@@ -300,6 +325,61 @@ def test_weight_ctx_len_reads_the_weight_revision_not_the_eval_budget():
 def test_weight_ctx_len_refuses_unidentifiable_weight():
     with pytest.raises(ScoreboardError, match="ctx<number>"):
         _weight_ctx_len("rwkv7-g1j-1.5b", "output/a/results.json")
+
+
+def test_weight_ctx_len_prefers_weight_revision_over_model_name_and_paths():
+    """weight_revision exists because model_name doubles as the literal API
+    model= value -- a serving alias like "rwkv7-g1j-1.5b" that the backend
+    must recognize, so it can't carry a release filename stem. weight_revision
+    carries that stem instead, and must win over both model_name and the
+    artifact-path fallback when all three disagree.
+    """
+    assert (
+        _weight_ctx_len(
+            "rwkv7-g1j-1.5b",
+            "results/rwkv7-g1j-1.5b-remote-x/task_artifacts/a/results.json",
+            weight_revision="rwkv7-g1j-1.5b-20260831-ctx16384",
+        )
+        == 16384
+    )
+    # No weight_revision given: falls back to today's model_name/path search.
+    assert (
+        _weight_ctx_len(
+            "rwkv7-g1j-1.5b",
+            "results/rwkv7-g1j-1.5b-20260831-ctx16384-remote-x/task_artifacts/a/results.json",
+            weight_revision=None,
+        )
+        == 16384
+    )
+
+
+def test_build_score_reads_ctx_from_metadata_weight_revision(tmp_path):
+    """A run whose model_name is a bare serving alias still publishes.
+
+    model_name is the literal API ``model=`` value the inference backend must
+    recognize, so it cannot carry a release filename stem, and a run directory
+    need not be named after the weight either. ``metadata.weight_revision`` is
+    then the only source of the weight's ctx_len; without it, build_score used
+    to raise ScoreboardError and the live callback downgraded that to a
+    warning, silently publishing nothing.
+    """
+    run_dir = tmp_path / "rwkv7-g1j-1.5b-remote-unit"
+    leaves = {"leaf_a": _leaf_artifacts(run_dir, "leaf_a", docs=10, k=1, plain=0.5)}
+    doc = _benchmark_doc(run_dir, leaves)
+    doc["config"] = {
+        "model": _MODEL_NAME,
+        "model_args": dict(_MODEL_ARGS),
+        "metadata": {"weight_revision": "rwkv7-g1j-1.5b-20260831-ctx16384"},
+    }
+
+    _, score = build_score(doc, _publish_config({"bench": {"field": "reasoning"}}))
+
+    assert score["model"] == {
+        "arch_version": "rwkv7",
+        "data_version": "G1j",
+        "param_size": "1.5b",
+        "ctx_len": 16384,
+    }
 
 
 def test_rwkv_model_rejects_unknown_shape():
@@ -488,14 +568,17 @@ def test_samples_cap_is_shared_across_leaves_of_one_benchmark(tmp_path):
     assert shared_uploaded_counts["passed"] == MAX_SAMPLES_PER_OUTCOME
 
 
-def _http_error(code: str, score_id: int = 4) -> HTTPError:
+def _http_error(
+    code: str, score_id: int = 4, *, status: int = 409, detail: list | None = None
+) -> HTTPError:
     import io
 
-    body = json.dumps({"detail": {"code": code, "score_id": score_id}}).encode()
+    payload = {"detail": detail if detail is not None else {"code": code, "score_id": score_id}}
+    body = json.dumps(payload).encode()
     error = HTTPError(
         url="https://scoreboard.example/api/upload",
-        code=409,
-        msg="Conflict",
+        code=status,
+        msg="Conflict" if status == 409 else "Unprocessable Entity",
         hdrs=None,
         fp=io.BytesIO(body),
     )
@@ -560,6 +643,43 @@ def test_upload_duplicate_score_with_rerun_reason_expires_and_reuploads(
     ]
     assert receipt.get("replayed") is not True
     assert receipt["score_id"] == 99
+
+
+def test_upload_retries_with_benchmark_name_for_an_older_server(monkeypatch):
+    """A scoreboard revision that predates `Score.benchmark_id` keys an upload
+    by the benchmark's name and rejects a payload without one.
+
+    The publisher registers the benchmark by id, so it has to notice that
+    rejection and re-send the same score with the name attached -- otherwise
+    every run against such a deployment fails to publish.
+    """
+    publisher = _publisher(monkeypatch, rerun_reason=None)
+    payloads = []
+
+    def fake_urlopen(request, timeout=None):
+        payloads.append(json.loads(request.data.decode()))
+        if len(payloads) == 1:
+            raise _http_error(
+                "missing",
+                status=422,
+                detail=[
+                    {
+                        "type": "missing",
+                        "loc": ["body", "benchmark_name"],
+                        "msg": "Field required",
+                    }
+                ],
+            )
+        return _fake_response({"success": True, "score_id": 77})
+
+    monkeypatch.setattr("lm_eval.loggers.scoreboard.urlopen", fake_urlopen)
+
+    receipt = publisher._upload({"benchmark_id": 1}, benchmark_name="mmlu")
+
+    assert receipt["score_id"] == 77
+    assert "benchmark_name" not in payloads[0]
+    assert payloads[1]["benchmark_name"] == "mmlu"
+    assert payloads[1]["benchmark_id"] == 1
 
 
 def _fake_response(payload: dict):
@@ -663,6 +783,7 @@ def _leaf_artifacts(
 
 def _benchmark_doc(run_dir: Path, leaves: dict[str, dict[str, str]], **extra) -> dict:
     return {
+        "benchmark": {"name": "bench", "field": "reasoning"},
         "results": {"bench": {"name": "bench", "alias": "bench", "sample_len": 1}},
         "config": {"model": _MODEL_NAME, "model_args": dict(_MODEL_ARGS)},
         "n-samples": {"bench": {"original": 1, "effective": 1}},
@@ -700,7 +821,10 @@ def test_published_counts_and_score_match_what_the_run_actually_did(tmp_path):
         "name": "bench",
         "field": "reasoning",
         "num_samples": 400,
-        "avg_k": pytest.approx((100 * 2 + 300 * 8) / 400),
+        # The leaves ran at different k (2 and 8), averaging 6.5 completions
+        # per doc; the board's avg_k is an integer label, so it publishes the
+        # rate rounded to whole samples per doc.
+        "avg_k": pytest.approx(7),
     }
     # Completion-weighted blend of the two leaves' avg@k averages -- never
     # the plain, single-sample `acc` they also report.
@@ -736,8 +860,6 @@ def test_pre_fix_artifact_reports_docs_from_its_sample_evidence(tmp_path):
     assert benchmark_info["num_samples"] == 720
     assert benchmark_info["avg_k"] == 8
     assert score["score"] == pytest.approx(0.47)
-
-
 
 
 def test_publication_uses_actual_profile_over_task_sampling_metadata():
@@ -859,7 +981,20 @@ def test_rwkv_remote_wire_to_scoreboard_with_open_thinking(tmp_path, monkeypatch
         path.write_text(path.read_text().replace("output_type: generate_until", "output_type: multiple_choice\ndoc_to_choice: choices").replace("metric: exact_match", "metric: acc"))
     monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *a, **k: Tokenizer())
     monkeypatch.setenv("RWKV_API_KEY", "unit-test")
-    monkeypatch.setattr(evaluator, "avg_at_k_plan", lambda *a, **k: (2, "avg@2"))
+    def two_rollouts(tasks, _groups, _benchmark_map, *, limited=False):
+        assert not limited
+        return {
+            name: AvgAtKPlan(
+                benchmark=name,
+                leaves=(name,),
+                num_docs=len(task.eval_docs),
+                k=2,
+                metric_name="avg@2",
+            )
+            for name, task in tasks.items()
+        }
+
+    monkeypatch.setattr(evaluator, "plan_avg_at_k", two_rollouts)
     sent = []
 
     def post(url, *, json, **kwargs):
@@ -895,9 +1030,140 @@ def test_rwkv_remote_wire_to_scoreboard_with_open_thinking(tmp_path, monkeypatch
         apply_chat_template=True, log_samples=True, bootstrap_iters=0,
         metadata={"weight_revision": "rwkv7-g1j-1.5b-ctx4096"},
         evaluation_tracker=EvaluationTracker(output_path=str(tmp_path / "run")), task_callback=callback,
-        benchmark_map={"remote_leaf": BenchmarkSpec(name="remote_leaf", strategy="standalone", leaf_task_names=("remote_leaf",))},
+        benchmark_map={
+            "remote_leaf": BenchmarkSpec(
+                name="remote_leaf",
+                field="reasoning",
+                strategy="standalone",
+                leaf_task_names=("remote_leaf",),
+            )
+        },
     )
     info, score = captured["publication"]
     assert info["avg_k"] == 2
     assert score["score"] == (0.5 if output_type == "multiple_choice" else 0.25)
     assert sorted({payload["seed"] for payload in sent}) == [40, 41]
+
+
+def _write_sample_rows(path: Path, rows: list[dict]) -> None:
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+
+def _hashed_row(index: int, completions: int = 1, answer: str = "4") -> dict:
+    """One samples row for a document that carries a content hash.
+
+    `doc_hash` is the document's identity (it is what nesting detection
+    compares); `resps[0]` holds one entry per sample the run took for the
+    document.
+    """
+    return _generative_row(answer=answer, target=answer, evidence_text=answer) | {
+        "doc_id": index,
+        "doc_hash": f"doc-{index}",
+        "resps": [[answer] * completions],
+    }
+
+
+def test_parent_leaf_documents_are_not_counted_twice(tmp_path):
+    """A group that also scores its own subsets publishes the subsets only.
+
+    `winogender_all` scores the same documents as its female/male/neutral
+    filters, and `winogender_gotcha` the same documents as its `_female` /
+    `_male` filters. Counting the parent as well would double every shared
+    document and would weight the parent's own average by its full document
+    count -- the lighteval producer skips exactly this case (`all` rows are
+    dropped before it blends a benchmark's subtasks).
+    """
+    run_dir = tmp_path / _RUN_DIR_NAME
+    leaves = {
+        "bench_all": _leaf_artifacts(
+            run_dir, "bench_all", docs=4, k=1, plain=0.0, recorded_counts=False
+        ),
+        "bench_left": _leaf_artifacts(
+            run_dir, "bench_left", docs=2, k=1, plain=0.5, recorded_counts=False
+        ),
+        "bench_right": _leaf_artifacts(
+            run_dir, "bench_right", docs=2, k=1, plain=1.0, recorded_counts=False
+        ),
+    }
+    # One document pool: the parent scores all four documents, each child one
+    # disjoint half of them.
+    for leaf_name, doc_indices in (
+        ("bench_all", range(4)),
+        ("bench_left", range(2)),
+        ("bench_right", range(2, 4)),
+    ):
+        _write_sample_rows(
+            Path(leaves[leaf_name]["samples"]),
+            [_hashed_row(index) for index in doc_indices],
+        )
+
+    benchmark_info, score = build_score(
+        _benchmark_doc(run_dir, leaves),
+        _publish_config({"bench": {"field": "reasoning"}}),
+    )
+
+    assert benchmark_info["num_samples"] == 4
+    assert benchmark_info["avg_k"] == 1
+    assert score["score"] == pytest.approx((2 * 0.5 + 2 * 1.0) / 4)
+
+
+def test_avg_k_falls_back_to_the_completions_the_samples_hold(tmp_path):
+    """An artifact that records neither its own completion count nor a
+    ``<metric>_avg@k`` average (race and wmdp_chem before the avg@k coverage
+    fix) still shows how many samples per doc it took: the published avg_k is
+    read off the samples instead of defaulting to a single sample.
+    """
+    run_dir = tmp_path / _RUN_DIR_NAME
+    leaves = {
+        "leaf_sampled": _leaf_artifacts(
+            run_dir,
+            "leaf_sampled",
+            docs=3,
+            k=4,
+            avg_at_k=None,
+            plain=0.5,
+            recorded_counts=False,
+        )
+    }
+    _write_sample_rows(
+        Path(leaves["leaf_sampled"]["samples"]),
+        [_hashed_row(index, completions=4) for index in range(3)],
+    )
+
+    benchmark_info, score = build_score(
+        _benchmark_doc(run_dir, leaves),
+        _publish_config({"bench": {"field": "reasoning"}}),
+    )
+
+    assert benchmark_info["num_samples"] == 3
+    assert benchmark_info["avg_k"] == 4
+    assert score["score"] == pytest.approx(0.5)
+
+
+def test_mixed_leaf_k_publishes_an_integer_avg_k(tmp_path):
+    """A benchmark whose leaves were sized by the avg@k budget individually
+    has a fractional rate -- wmdp's leaves run 4 / 8 / 2 samples per doc, i.e.
+    3.36 on average -- but the board's avg_k is an integer label it renders as
+    ``avg@<k>``. Publish that rate rounded to whole samples per doc, not the
+    fraction.
+    """
+    run_dir = tmp_path / _RUN_DIR_NAME
+    leaves = {
+        "leaf_two": _leaf_artifacts(
+            run_dir, "leaf_two", docs=100, k=2, avg_at_k=0.5, plain=0.5
+        ),
+        "leaf_eight": _leaf_artifacts(
+            run_dir, "leaf_eight", docs=30, k=8, avg_at_k=0.5, plain=0.5
+        ),
+    }
+
+    benchmark_info, _score = build_score(
+        _benchmark_doc(run_dir, leaves),
+        _publish_config({"bench": {"field": "reasoning"}}),
+    )
+
+    assert benchmark_info["num_samples"] == 130
+    # (100 * 2 + 30 * 8) / 130 = 3.38 completions per doc
+    assert benchmark_info["avg_k"] == 3

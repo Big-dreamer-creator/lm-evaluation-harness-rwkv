@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from collections import defaultdict
 from functools import partial
@@ -14,7 +15,7 @@ import numpy as np
 
 import lm_eval.api.model
 import lm_eval.api.registry
-from lm_eval.api.benchmark import avg_at_k_plan
+from lm_eval.api.benchmark import AvgAtKPlan, plan_avg_at_k
 from lm_eval.api.benchmark_scheduler import (
     order_benchmarks,
 )
@@ -77,6 +78,27 @@ if TYPE_CHECKING:
     _NestedDict = dict[Group, dict[str, Task] | Group] | dict[str, Task]
 
 eval_logger = logging.getLogger(__name__)
+
+
+def _apply_avg_at_k(metrics: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Replace each leaf's original metric with its avg@k average.
+
+    The ``_stderr`` suffix must survive: ``acc_avg@2_stderr`` is the standard
+    error of ``acc_avg@2``, not an average for ``acc``. Removing only the
+    ``_avg@<k>`` token keeps score and stderr on separate keys.
+    """
+    averaged_leaves: dict[str, dict[str, Any]] = {}
+    for leaf, leaf_metrics in metrics.items():
+        averaged_leaf = dict(leaf_metrics)
+        for key, value in leaf_metrics.items():
+            base, separator, filt = key.partition(",")
+            if "_avg@" not in base:
+                continue
+            original_base = re.sub(r"_avg@\d+", "", base)
+            original = original_base + (separator + filt if separator else "")
+            averaged_leaf[original] = value
+        averaged_leaves[leaf] = averaged_leaf
+    return averaged_leaves
 
 
 def _build_checkpointed_dispatch(
@@ -187,6 +209,28 @@ def _record_rollout_stats(
 
 class _RepeatedMetricValues(list):
     """Aggregation inputs from every rollout of one document."""
+
+
+def _log_avg_k_plans(plans: dict[str, AvgAtKPlan]) -> None:
+    """Log what each benchmark's avg@k budget bought, once per benchmark.
+
+    The run sizes `k` from a benchmark's whole question count, so the log has
+    to make that visible: which leaves were counted, what the total was, and
+    how many rollouts the benchmark is about to take.
+    """
+    seen: dict[str, AvgAtKPlan] = {}
+    for plan in plans.values():
+        seen.setdefault(plan.benchmark, plan)
+    for benchmark in sorted(seen):
+        plan = seen[benchmark]
+        eval_logger.info(
+            "avg@k: benchmark=%s docs=%d leaves=%d -> k=%d (%d completions)",
+            benchmark,
+            plan.num_docs,
+            len(plan.leaves),
+            plan.k,
+            plan.num_docs * plan.k,
+        )
 
 
 def _install_avg_at_k_patch(
@@ -582,16 +626,29 @@ def simple_evaluate(
     # Log selected tasks with hierarchy
     _log_selected_tasks(loaded["tasks"], loaded["groups"], task_manager)
 
-    # Size one sampling budget per requested benchmark, across all its leaves.
-    budget_docs = {}
-    for benchmark_name, spec in (benchmark_map or {}).items():
-        if spec.leaf_task_names is not None:
-            leaves = list(spec.leaf_task_names)
-        else:
-            group = loaded["groups"].get(benchmark_name)
-            leaves = [task.task_name for task in group.get_all_tasks(recursive=True)] if group else []
-        total = sum(len(loaded["tasks"][leaf].eval_docs) for leaf in leaves if leaf in loaded["tasks"])
-        budget_docs.update({leaf: total for leaf in leaves})
+    # avg@k rollout budget: one `k` per benchmark, sized off the documents all
+    # of that benchmark's leaves add up to (not off a single leaf, which
+    # multiplied a many-subtask benchmark's own question count by its
+    # per-leaf `k`). Computed up front so every leaf of a benchmark samples
+    # the same `k` times per doc.
+    supports_avg_at_k = getattr(lm, "SUPPORTS_AVG_AT_K", False)
+    avg_k_plans = (
+        plan_avg_at_k(
+            loaded["tasks"],
+            loaded["groups"],
+            benchmark_map,
+            limited=limit is not None or samples is not None,
+        )
+        if supports_avg_at_k
+        else {}
+    )
+    if avg_k_plans:
+        if limit is not None or samples is not None:
+            eval_logger.info(
+                "avg@k: --limit or --samples is set, every benchmark runs at "
+                "k=1 (a partial run is a smoke test, not an avg@k measurement)"
+            )
+        _log_avg_k_plans(avg_k_plans)
 
     # Apply config overrides to tasks
     for task_name, task_obj in loaded["tasks"].items():
@@ -648,11 +705,10 @@ def simple_evaluate(
         # for tasks that haven't already opted into their own repeated-sampling
         # scoring (e.g. cruxeval's native repeats=10 pass@k) -- clobbering those
         # would break their bespoke process_results.
-        if getattr(lm, "SUPPORTS_AVG_AT_K", False) and task_obj.get_config(
-            "repeats"
-        ) in (None, 1):
-            num_docs = budget_docs.get(task_name, len(task_obj.eval_docs))
-            k, metric_name = avg_at_k_plan(num_docs, limited=limit is not None or samples is not None)
+        if supports_avg_at_k and task_obj.get_config("repeats") in (None, 1):
+            plan = avg_k_plans.get(task_name)
+            k = plan.k if plan is not None else 1
+            metric_name = plan.metric_name if plan is not None else "avg@1"
             task_obj.set_config(key="repeats", value=k, update=False)
             _install_avg_at_k_patch(task_obj, lm, k, metric_name)
 
@@ -685,7 +741,7 @@ def simple_evaluate(
             "limit": limit,
             "samples": samples,
             "max_length": _callback_model_args.get("max_length"),
-            "metadata": metadata or {},
+            "metadata": dict(metadata or {}),
             "evaluation_protocol": getattr(lm, "EVALUATION_PROTOCOL_VERSION", None),
         },
         "lm_eval_version": lm_eval.__version__,
@@ -733,7 +789,7 @@ def simple_evaluate(
         results["config"] = {
             "model": model_name,
             "model_args": model_args,
-            "metadata": metadata or {},
+            "metadata": dict(metadata or {}),
         }
         # add more detailed model info if available
         if hasattr(lm, "get_model_info"):
@@ -1257,14 +1313,7 @@ def evaluate(
 
         # Apply the benchmark's own aggregation to the per-leaf avg@k
         # values. This retains macro averages and declared subgroup weights.
-        averaged_leaves = {}
-        for leaf in leaves:
-            averaged_leaves[leaf] = dict(metrics[leaf])
-            for key, value in metrics[leaf].items():
-                base, separator, filt = key.partition(",")
-                if "_avg@" in base:
-                    original = base.rsplit("_avg@", 1)[0] + (separator + filt if separator else "")
-                    averaged_leaves[leaf][original] = value
+        averaged_leaves = _apply_avg_at_k(metrics)
         if spec.strategy == "standalone":
             averaged_benchmark = averaged_leaves[leaves[0]]
         elif spec.strategy == "group_aggregate":
@@ -1280,7 +1329,11 @@ def evaluate(
         )
 
         fingerprint = compute_task_fingerprint(
-            {"leaves": sorted(leaves), "strategy": spec.strategy}
+            {
+                "field": spec.field,
+                "leaves": sorted(leaves),
+                "strategy": spec.strategy,
+            }
         )
         skip_publish = False
         if checkpoint_store is not None:
@@ -1292,6 +1345,7 @@ def evaluate(
 
         results_doc = {
             **(task_callback_context or {}),
+            "benchmark": {"name": bname, "field": spec.field},
             "results": {bname: aggregated},
             "configs": (
                 {bname: eval_tasks[leaves[0]].dump_config()}

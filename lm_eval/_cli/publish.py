@@ -41,6 +41,11 @@ class Publish(SubCommand):
                   • --config must point at a TOML/YAML file containing a [publication]
                     table -- the same table used by `lm-eval run`'s live publication
                     path (base_url, token_env, cot_mode, [publication.tasks.<name>]).
+                    The benchmark field is read from the saved artifact's
+                    benchmark.field, not inferred from its name or supplied here.
+                  • If an older artifact does not record weight_revision in its
+                    run metadata, the config's top-level weight_revision (or the
+                    matching [[models]] entry's) is used to resolve ctx_len.
                   • Directory arguments are searched recursively for results.json
                     files that carry benchmark-level artifact metadata
                     (leaf_artifact_paths); plain per-leaf artifacts are skipped.
@@ -135,6 +140,55 @@ class Publish(SubCommand):
                     paths[key] = Publish._resolve_artifact_path(recorded, results_path)
 
     @staticmethod
+    def _apply_weight_revision(config_mapping: dict, results_doc: dict) -> None:
+        """Fill a missing run-metadata weight revision from the publish config.
+
+        Artifacts written before ``weight_revision`` became run metadata only
+        carry the short API alias (e.g. ``rwkv7-g1j-1.5b``), which does not
+        identify the served weight's ctx_len. The config that produced the run
+        still knows it: a single-model file carries it at the top level, and a
+        campaign carries it on the matching ``[[models]]`` entry. Inject it
+        into the in-memory results document so an existing artifact can be
+        republished without rewriting it or re-running the benchmark.
+        """
+        run_config = results_doc.get("config") or {}
+        metadata = run_config.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("weight_revision"):
+            return
+
+        model_args = run_config.get("model_args") or {}
+        if isinstance(model_args, str):
+            from lm_eval.utils import simple_parse_args_string
+
+            model_args = simple_parse_args_string(model_args)
+        if not isinstance(model_args, dict):
+            model_args = {}
+        model_name = (
+            model_args.get("model")
+            or model_args.get("pretrained")
+            or run_config.get("model")
+        )
+
+        revision = None
+        for entry in config_mapping.get("models") or []:
+            if (
+                isinstance(entry, dict)
+                and entry.get("model_name") == model_name
+                and entry.get("weight_revision")
+            ):
+                revision = entry["weight_revision"]
+                break
+        if revision is None:
+            revision = config_mapping.get("weight_revision")
+        if not isinstance(revision, str) or not revision:
+            return
+
+        if not isinstance(metadata, dict):
+            metadata = {}
+            run_config["metadata"] = metadata
+        metadata["weight_revision"] = revision
+
+    @staticmethod
     def _execute(args: argparse.Namespace) -> None:
         """Publish previously saved benchmark results to the scoreboard."""
         import json
@@ -166,6 +220,7 @@ class Publish(SubCommand):
             try:
                 results_doc = json.loads(results_path.read_text(encoding="utf-8"))
                 Publish._localize_artifact_paths(results_doc, results_path)
+                Publish._apply_weight_revision(config_mapping, results_doc)
                 benchmark_info, score = build_score(results_doc, config)
                 if config.dry_run:
                     print(

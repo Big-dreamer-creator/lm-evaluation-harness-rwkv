@@ -411,6 +411,9 @@ class EvaluationTracker:
             or "fp32io16",
             "backend": run_config.get("model"),
         }
+        benchmark = results.get("benchmark")
+        if isinstance(benchmark, dict):
+            metadata["benchmark"] = dict(benchmark)
         for name, value in (("results", results), ("metadata", metadata)):
             temporary = paths[name].with_suffix(paths[name].suffix + ".tmp")
             temporary.write_text(
