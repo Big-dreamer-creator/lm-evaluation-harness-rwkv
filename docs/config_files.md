@@ -80,18 +80,17 @@ arguments. Unknown fields fail before model or dataset initialization.
 | Versioned RWKV field | Type | Default | Description |
 |----------------------|------|---------|-------------|
 | `schema_version` | int | required | Must be `1` |
-| `backend` | string | required | `rwkv7-http`, `rwkv7-remote`, `rwkv7-remote-chat`, or `rwkv7-lightning-cuda` |
+| `backend` | string | required | `rwkv7-http`, `rwkv7-remote`, or `rwkv7-remote-chat` |
 | `model_name` | string | required | Model id sent to the inference service as the literal API `model=` value (top level for a single-model file, per `[[models]]` entry for a campaign); normally the short serving alias, and may carry the full release stem for older configs |
 | `weight_revision` | string | unset | Full served weight filename stem, including the release date and `ctx<N>` (e.g. `rwkv7-g1j-1.5b-20260831-ctx16384`); recorded in run metadata and used by scoreboard publication to derive `ctx_len` without putting it in the API-facing `model_name` |
-| `base_url` | string | required | HTTP(S) endpoint: `/v1/completions`, `/v1/chat/completions`, or lightning CUDA `/v1/batch/completions`, according to `backend` |
+| `base_url` | string | required | HTTP(S) endpoint: `/v1/completions` or `/v1/chat/completions`, according to `backend` |
 | `benchmarks` | list | required | Unique public benchmark names; configured order is the stable tie-break for the runtime ascending-pending-rollout order |
 | `benchmark_config` | string | `configs/benchmarks.toml` | Explicit top-level field-to-selector mapping; relative paths are resolved from the run config |
 | `output_dir` | string | required | Result directory (top level for a single-model file, per `[[models]]` entry for a campaign) |
 | `max_length` | int | required | Positive service context limit |
 | `max_gen_toks` | int | `8192` | Remote RWKV choice-generation output budget; preserve the full input and reduce output to the remaining context window |
-| `batch_size` | int | `1` | lm-eval request batch size; for `rwkv7-lightning-cuda`, this is the number of prompts in each native `contents` request |
-| `max_num_seqs` | int | required | Served endpoint's sequence capacity; lightning CUDA derives `ceil(max_num_seqs / batch_size) + 1` HTTP requests so one batch may wait in its admission queue |
-| `request_concurrency` | int | derived | Lightning CUDA only: explicit number of simultaneous HTTP requests; when omitted, it is derived from `max_num_seqs` and `batch_size` |
+| `batch_size` | int | `1` | lm-eval request batch size |
+| `max_num_seqs` | int | required | Served endpoint's own `--max-num-seqs`; the evaluator's request concurrency is derived from it |
 | `device` | string | `"cpu"` | Evaluation-side device |
 | `rwkv_profile` | table | required | Complete RWKV execution profile |
 | `rwkv_profile.prompt_template` | string | required | Official RWKV template mode |
@@ -139,21 +138,6 @@ open-thinking prefix ends in `<think` intentionally. A completed `</think>`
 is required before final-answer grading; raw responses remain in the artifacts.
 Without a tokenizer, this backend only passes raw text through and cannot apply
 a chat template. `rwkv7-remote-chat` delegates template rendering to the server.
-
-`rwkv7-lightning-cuda` also requires the official local `tokenizer_name`, but
-sends the rendered prompt strings through rwkv-lightning-cuda's native
-`/v1/batch/completions` `contents` field. It maps the fixed RWKV sampling preset
-to `alpha_presence`, `alpha_frequency`, and `alpha_decay`, preserves the full
-input, and reduces the shared batch output budget to the space remaining for its
-longest prompt. The endpoint currently exposes no request seed, so avg@k
-rollouts are stochastic but cannot be replayed from lm-eval's seed alone.
-Lightning rejects `temperature = 0`; this adapter sends `0.01` for `no_think`.
-Cloudflare Access deployments read `CF_ACCESS_CLIENT_ID` and
-`CF_ACCESS_CLIENT_SECRET` from the environment and add the corresponding HTTP
-headers without storing credentials in the evaluation config.
-`rwkv_profile.wkv_mode = "fp32io16"` requires starting the CUDA service with
-`--wkv32`; its current status response does not expose this flag, so verify it
-from the server startup log before publishing scores.
 
 RWKV sampling presets are sent as top-level vLLM fields. The custom server must
 support `penalty_decay` and its required sampler. Each document's repeats use

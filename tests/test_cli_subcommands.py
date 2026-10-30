@@ -1032,47 +1032,6 @@ wkv_mode = "fp32io16"
         assert cfg.metadata["wkv_mode"] == "fp32io16"
         assert cfg.metadata["cot_mode"] == "fake_think"
 
-    def test_toml_config_rwkv7_lightning_cuda_backend(self, tmp_path):
-        from lm_eval.config.evaluate_config import EvaluatorConfig
-
-        config = tmp_path / "config.toml"
-        config.write_text(
-            """
-schema_version = 1
-backend = "rwkv7-lightning-cuda"
-model_name = "rwkv7-g1k-1.5b"
-base_url = "http://127.0.0.1:8000/v1/batch/completions"
-tokenizer_name = "/weights/rwkv7-g1k-1.5b-tokenizer"
-benchmarks = ["race"]
-output_dir = "results/rwkv7-g1k-1.5b-lightning"
-max_length = 16384
-max_num_seqs = 32
-batch_size = 8
-request_concurrency = 30
-
-[rwkv_profile]
-prompt_template = "assistant"
-generation_prompt = "open_think"
-wkv_mode = "fp32io16"
-""",
-            encoding="utf-8",
-        )
-
-        cfg = EvaluatorConfig.from_config(config)
-
-        assert cfg.model == "rwkv7-lightning-cuda"
-        assert cfg.batch_size == 8
-        assert cfg.model_args == {
-            "model": "rwkv7-g1k-1.5b",
-            "base_url": "http://127.0.0.1:8000/v1/batch/completions",
-            "tokenizer": "/weights/rwkv7-g1k-1.5b-tokenizer",
-            "num_concurrent": 30,
-            "max_length": 16384,
-            "max_gen_toks": 8192,
-            "rwkv_prompt_template": "assistant",
-            "rwkv_generation_prompt": "open_think",
-        }
-
     def test_weight_revision_is_metadata_not_the_api_model_id(self, tmp_path):
         """The API alias stays short; the full release name is run metadata.
 
@@ -1317,7 +1276,7 @@ wkv_mode = "fp32io16"
         with pytest.raises(
             ValueError,
             match=(
-                "backend must be one of: rwkv7-http, rwkv7-lightning-cuda, "
+                "backend must be one of: rwkv7-http, "
                 "rwkv7-remote, rwkv7-remote-chat"
             ),
         ):

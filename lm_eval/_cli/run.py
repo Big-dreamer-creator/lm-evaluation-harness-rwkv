@@ -612,11 +612,7 @@ class Run(SubCommand):
             db_path = os.path.join(checkpoint_dir, "run.sqlite3")
 
             fingerprint_payload = _asdict(cfg)
-            if cfg.model in {
-                "rwkv7-lightning-cuda",
-                "rwkv7-remote",
-                "rwkv7-remote-chat",
-            }:
+            if cfg.model in {"rwkv7-remote", "rwkv7-remote-chat"}:
                 from lm_eval.api.checkpoint import EVALUATION_PROTOCOL_VERSION
                 fingerprint_payload["evaluation_protocol"] = EVALUATION_PROTOCOL_VERSION
             # HTTP request concurrency and the client-side timeout/retry policy

@@ -603,15 +603,8 @@ def _sampling_config(
         or (run_config.get("sampling_config") or {}).get("max_gen_toks")
         or DEFAULT_MAX_GENERATED_TOKENS,
     )
-    if run_config.get("model") == "rwkv7-lightning-cuda":
-        sampling.setdefault("seed", -1)
-        sampling["seed_strategy"] = "unsupported"
-    else:
-        sampling.setdefault("seed", DEFAULT_SEED)
-    if (
-        run_config.get("evaluation_protocol")
-        and run_config.get("model") != "rwkv7-lightning-cuda"
-    ):
+    sampling.setdefault("seed", DEFAULT_SEED)
+    if run_config.get("evaluation_protocol"):
         sampling["seed_strategy"] = "base_plus_repeat_ord"
         sampling["evaluation_protocol"] = run_config["evaluation_protocol"]
     missing = [field for field in REQUIRED_SAMPLING_FIELDS if field not in sampling]
@@ -1088,11 +1081,7 @@ def build_score(
     policy = _task_policy(config, benchmark_name, benchmark_name)
 
     run_config = results["config"]
-    if run_config.get("model") in {
-        "rwkv7-lightning-cuda",
-        "rwkv7-remote",
-        "rwkv7-remote-chat",
-    }:
+    if run_config.get("model") in {"rwkv7-remote", "rwkv7-remote-chat"}:
         from lm_eval.api.checkpoint import EVALUATION_PROTOCOL_VERSION
         if run_config.get("evaluation_protocol") != EVALUATION_PROTOCOL_VERSION:
             raise ScoreboardError("Historical generative artifacts require a versioned raw-answer replay before publication")

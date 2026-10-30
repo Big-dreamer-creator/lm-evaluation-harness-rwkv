@@ -122,7 +122,6 @@ VERSIONED_CONFIG_FIELDS = {
     "output_dir",
     "publication",
     "publish",
-    "request_concurrency",
     "scoreboard",
     "rwkv_profile",
     "samples",
@@ -156,7 +155,6 @@ RWKV_GENERATION_PROMPTS = {"no_think", "fake_think", "open_think"}
 RWKV_WKV_MODES = {"fp16", "fp32io16"}
 RWKV_BACKENDS = {
     "rwkv7-http",
-    "rwkv7-lightning-cuda",
     "rwkv7-remote",
     "rwkv7-remote-chat",
 }
@@ -649,13 +647,8 @@ class EvaluatorConfig:
             tokenizer_name = cls._non_empty_string(tokenizer_name, "tokenizer_name")
             if backend in RWKV_BACKENDS_WITHOUT_TOKENIZER:
                 raise ValueError(
-                    "tokenizer_name is only supported for backend = rwkv7-remote "
-                    "or rwkv7-lightning-cuda"
+                    "tokenizer_name is only supported for backend = rwkv7-remote"
                 )
-        if backend == "rwkv7-lightning-cuda" and tokenizer_name is None:
-            raise ValueError(
-                "rwkv7-lightning-cuda requires the official tokenizer_name"
-            )
 
         model_name = cls._non_empty_string(config["model_name"], "model_name")
         weight_revision = config.get("weight_revision")
@@ -664,7 +657,6 @@ class EvaluatorConfig:
                 weight_revision, "weight_revision"
             )
         completion_path = {
-            "rwkv7-lightning-cuda": "/v1/batch/completions",
             "rwkv7-remote-chat": "/v1/chat/completions",
         }.get(backend, "/v1/completions")
         base_url = cls._completion_url(config["base_url"], completion_path)
@@ -676,28 +668,10 @@ class EvaluatorConfig:
         output_dir = cls._non_empty_string(config["output_dir"], "output_dir")
         max_length = cls._positive_int(config["max_length"], "max_length")
         batch_size = cls._positive_int(config.get("batch_size", 1), "batch_size")
-        # The evaluator never hand-tunes its own request concurrency. vLLM
-        # endpoints use the declared sequence capacity directly; lightning's
-        # native batch transport converts it to an HTTP-request count and keeps
-        # one extra request waiting in the server's FIFO admission queue.
+        # The evaluator derives its request concurrency directly from the
+        # served endpoint's declared sequence capacity.
         max_num_seqs = cls._positive_int(config["max_num_seqs"], "max_num_seqs")
-        if backend == "rwkv7-lightning-cuda" and batch_size > max_num_seqs:
-            raise ValueError(
-                "rwkv7-lightning-cuda batch_size cannot exceed max_num_seqs"
-            )
         num_concurrent = max_num_seqs
-        if backend == "rwkv7-lightning-cuda":
-            if "request_concurrency" in config:
-                num_concurrent = cls._positive_int(
-                    config["request_concurrency"], "request_concurrency"
-                )
-            else:
-                num_concurrent = (max_num_seqs + batch_size - 1) // batch_size + 1
-        elif "request_concurrency" in config:
-            raise ValueError(
-                "request_concurrency is only supported for backend = "
-                "rwkv7-lightning-cuda"
-            )
         request_timeout = (
             cls._positive_int(config["timeout"], "timeout")
             if "timeout" in config
@@ -822,11 +796,7 @@ class EvaluatorConfig:
         model_args["base_url"] = base_url
         if backend in {"rwkv7-remote", "rwkv7-remote-chat"}:
             model_args["seed"] = seed[2]
-        if backend in {
-            "rwkv7-lightning-cuda",
-            "rwkv7-remote",
-            "rwkv7-remote-chat",
-        }:
+        if backend in {"rwkv7-remote", "rwkv7-remote-chat"}:
             model_args["max_gen_toks"] = cls._positive_int(config.get("max_gen_toks", 8192), "max_gen_toks")
         # HTTP robustness knobs. Like max_num_seqs they only change how
         # requests are retried, not prompts, sampling or model identity, so
