@@ -1,6 +1,6 @@
 ## 核心目标
-lm-eval-harness 是 LLM 社区的标准评估库, 很早成为最主流的评估框架, 本仓库需要通过 LightEval 原生的评测流水线（Pipeline）、模型适配器（Model Adapter）和任务接口（Task Interfaces），完成 RWKV 模型的集成。
-本仓库只需要用于完成 lighteval 和 evalscope **未能收录** 的 benchmark 的评估.
+本仓库基于 EleutherAI/lm-evaluation-harness，通过原生的 `simple_evaluate()` / `evaluate()` 评测流水线、`LM` / `TemplateLM` 模型接口和 `Task` / `ConfigurableTask` 任务接口，完成 RWKV HTTP 模型的集成。
+本仓库的 RWKV 评测范围限于 LightEval 和 EvalScope **未能收录**、且能够通过本仓库任务接口执行的 Benchmark。新增或调整评测范围前，必须核对这两个框架当前可运行的任务注册表；保留上游原生任务不代表将其全部纳入 RWKV 生产评测。
 
 
 ## 代码原则：
@@ -33,12 +33,15 @@ lm-eval-harness 是 LLM 社区的标准评估库, 很早成为最主流的评估
 
 所有 NoCoT（无思维链）选择题任务，都必须通过 /v1/completions 接口，使用原生的 LOGPROBS / loglikelihood（对数似然）评分。
 
-绝不能仅仅将生成式精确匹配（Generative Exact-Match）标记为 NoCoT。
+对于 NoCoT 选择题，绝不能用生成式精确匹配（Generative Exact-Match）代替原生 loglikelihood 评分。
 
-lm-eval-harness任务必须正确接入原生选择题求解器与评分器，包括适用情况下的：
-- multiple_choice(cache=True)
-- choice()
-generation_size 或元数据字段不能决定实际请求类型。
+选择题必须正确接入 lm-eval-harness 原生任务和判分接口：
+- `output_type: multiple_choice`；
+- `doc_to_text`、`doc_to_choice` 和 `doc_to_target`；
+- `Task.construct_requests()` / `ConfigurableTask.construct_requests()` 生成的 `Instance(request_type="loglikelihood")`；
+- 模型的 `LM.loglikelihood()`，以及任务的 `process_results()`、`metric_list` 和 `aggregation`。
+原生生成任务使用 `output_type: generate_until` 和 `LM.generate_until()`；是否使用思考模式，应单独记录。
+`generation_kwargs.max_gen_toks`、模式标签或元数据字段不能代替实际的 `Instance.request_type` 和 HTTP 请求证据。
 3. Benchmark 原生任务配置具有最高权威性
 Benchmark 自身的原生任务配置是最终依据。
 
@@ -46,20 +49,22 @@ Benchmark 自身的原生任务配置是最终依据。
 - NoCoT
 - FakeCoT
 - CoT
-但在发布结果之前，必须根据实际流水线日志，验证请求真正使用的是 LOGPROBS 还是 GENERATIVE。
+但在发布结果之前，必须根据实际流水线日志及 HTTP 请求、响应证据，验证执行的是 `loglikelihood`（真实 LOGPROBS）还是 `generate_until`（GENERATIVE）。仅记录适配器入口方法名不能证明内部实际执行的请求类型。
 
 即使上传的模式标签看起来正确，只要实际评测模式不匹配，该分数就无效。
 4. 评测明细中的 Prompt 必须与实际输入一致
 NoCoT 的评测明细必须反映实际发送给 Completion 接口的输入，并且不能包含 CoT Prompt。
 
-CoT / FakeCoT 的评测明细必须使用服务器在应用已配置的 RWKV Prompt Template 之后，实际渲染得到的 Prompt。
+CoT / FakeCoT 的评测明细必须保存应用已配置的 RWKV Prompt Template 后，模型实际接收的 Prompt：
+- `/v1/completions` 由客户端渲染时，记录实际发送的完整 Prompt；发送 Token ID 时，还须保留对应 Token ID 与准确的文本输入证据；
+- `/v1/chat/completions` 由服务器渲染时，必须捕获服务器实际渲染的 Prompt。
 
 严禁：
-- 手动追加选择题选项；
+- 在上传或展示层手动追加选择题选项；
 - 重复添加 Answer:；
 - 将内部候选请求的 JSON 封装暴露为用户消息；
 - 为展示用途重新构造一个与实际输入不同的 Prompt。
-如果生成式响应没有捕获到服务器实际渲染的 Prompt，则该结果不能发布。
+如果生成式评测未捕获上述对应路径的实际输入证据，则该结果不能发布。
 
 不得在这种情况下悄悄上传原始消息列表来代替实际 Prompt。
 5. CoT / FakeCoT 的停止条件和答案抽取
@@ -74,10 +79,11 @@ CoT / FakeCoT 生成不能继承原生任务中用于单个答案的换行停止
 - 任何 Assistant 消息包装内容。
 未正常闭合的 <think> 推理轨迹必须判定为失败或截断，而不能被当作有效答案。
 
-对于 Math / MATH-500，还必须使用 Albatross 风格的简洁数学答案抽取器：
+对于本仓库评测范围内需要数学答案抽取的 RWKV 任务，必须使用 Albatross 风格的简洁数学答案抽取器：
 - 优先提取括号平衡的 \\boxed{...}；
 - 如果无法提取，则回退到最终的数学表达式。
-对于 LiveCodeBench，必须在上传评测明细之前，提取最终的代码围栏（Fenced Code Block）中的程序。
+对于本仓库评测范围内以代码围栏（Fenced Code Block）输出程序的 RWKV 任务，必须按经批准的任务抽取规则提取最终程序，再上传评测明细。
+上述要求不构成新增 Math、MATH-500 或 LiveCodeBench 的授权；任务是否纳入本仓库，仍须满足评测范围与接入审查要求。
 
 Scoreboard 评测明细中的 answer 和 ground_truth 必须保存这些简洁的答案值，而不是完整的 Assistant 消息或完整的解题过程。
 6. 答案抽取失败的表示方式
@@ -120,17 +126,15 @@ Scoreboard 评测明细中的 answer 和 ground_truth 必须保存这些简洁�
 
 对于单 Token 选择题，在服务器能够提供可靠的指定 Token Prompt Logprobs 之前，也可以继续使用相同的原生评分路径。
 
-所有被归类为 NoCoT 的 Benchmark，包括 MMLU-Pro 和 MathQA，都必须配置 LightEval 原生的：
-- multiple_choice(cache=True)
-- choice()
-其 Prompt 只能包含题目和候选选项，不能包含推理指令，也不能附带生成式答案包装内容。
+本仓库评测范围内的所有 NoCoT 选择题，必须使用原生 `output_type: multiple_choice`，由 `doc_to_text`、`doc_to_choice`、`doc_to_target` 和 `construct_requests()` 构建真实的 loglikelihood 请求，再由原生 `process_results()` 及配置的指标判分。
+其 Prompt 应遵循任务原生配置及已批准的 RWKV 格式要求，不能加入推理指令，也不能附带生成式答案包装内容。
 
 所有 RWKV NoCoT + LOGPROBS Prompt 都必须以独立换行的 \nAnswer: 提示符结束。
 
 如果已有该提示符，必须保留其原有内容及空白字符。
 
-如果不存在，则应在 RWKV 私有 Formatter 中追加：
-\nAnswer: 
+如果不存在，则应在 RWKV 私有 Prompt 格式化逻辑中追加：
+`\nAnswer: `
 
 
 不能因此修改候选选项、标准答案或评测指标。
@@ -182,7 +186,7 @@ Scoreboard 评测明细中的 answer 和 ground_truth 必须保存这些简洁�
 修正流程如下：
 1. 获取最新的生产环境 Manifest。
 2. 使用临时迁移脚本，仅将精确识别出的受影响 Score ID 标记为过期。
-3. 重新获取任务。
+3. 从本仓库配置重新解析受影响的 task / group / tag，并核对展开后的叶子任务与 checkpoint 身份。
 4. 将重跑范围限制在受影响的模型与 Benchmark 组合。
 5. 上传之后验证替换结果的 ID、模式、请求类型、Token 预算和截断率。
 严禁为了修正结果而截断或清空 Scoreboard 数据库。
@@ -198,7 +202,7 @@ Scoreboard 评测明细中的 answer 和 ground_truth 必须保存这些简洁�
 不得将凭据保存在源码、日志或命令行参数（argv）中。
 13. 严格划分职责边界
 本仓库负责：
--lm-eval-harness 评测生产流水线；
+- lm-eval-harness 评测生产流水线；
 - RWKV HTTP 适配器；
 - Scoreboard 结果发布。
 外部系统负责：
@@ -215,41 +219,41 @@ Scoreboard 评测明细中的 answer 和 ground_truth 必须保存这些简洁�
 
 ## 强制 Benchmark 接入审查
 在新增 Benchmark，或者修改已有 Benchmark 的以下内容之前：
-- Prompt；
-- Solver；
-- Scorer；
-- Metric Category；
-- CoT Mode；
-- Answer Format；
-- Extractor；
-- Upload Contract；
-必须完整阅读：
+- Prompt（`doc_to_text`、few-shot、`gen_prefix`、chat template）；
+- 请求构建（`output_type`、`construct_requests()`、`Instance.request_type`）；
+- 判分与聚合（`process_results()`、`metric_list`、`aggregation`、group 聚合）；
+- Benchmark 分类（`configs/benchmarks.toml` 中的 field）；
+- CoT 模式、答案格式、`filter_list` / 答案抽取器；
+- Scoreboard 上传契约；
+必须完整阅读本仓库现有文档：
 
-docs/source/adding-a-custom-task.mdx
+- [新增任务指南](docs/new_task_guide.md)；
+- [任务、过滤器与指标配置指南](docs/task_guide.md)；
+- [模型接口指南](docs/model_guide.md)；
+- 涉及生产配置、恢复或发布时，还须阅读 [配置指南](docs/config_files.md) 和 [RWKV 评测指南](RWKV_EVALUATION_GUIDE.md) 的相关章节。
 
-尤其是其中的：
+还必须阅读本文件中的“评测生产端契约”“正确性检查”以及本节的端到端验收要求。仓库指南中的历史说明与本文件不一致时，必须指出差异，不能以旧说明豁免本文件的评测契约。
 
-Mandatory RWKV Benchmark Audit
+固定 Benchmark 接入工作流程：
 
-并遵循该文档规定的固定 Benchmark 接入工作流程。
+1. 核对 Benchmark 官方协议、lm-eval-harness 原生任务，以及 LightEval / EvalScope 的收录情况，确认本仓库负责的范围。
+2. 找到已有 task YAML、模型适配器、过滤器、判分器及测试作为原型，记录原型路径、复用方式与修改边界。
+3. 记录数据集版本、split、预处理、Prompt、候选项、标准答案、请求类型、采样、停止、Token 预算、抽取、指标、聚合及上传契约；任何可能影响分数的修改须先获得用户明确批准。
+4. 沿 `TaskManager` → 原生 Task → `construct_requests()` / `Instance` → HTTP 模型适配器 → `filter_list` → `process_results()` / 聚合 → 结果工件与 Scoreboard 的实际链路实现，RWKV 专属行为必须隔离。
+5. 完成隔离测试和下述端到端验收，核对实际 HTTP 请求、结果工件与测试榜单记录，随后才能审查生产配置准入。
 
-还必须阅读本文件中的：
-- Evaluation Producer Contract
-- Correctness Checks
-- End-to-End Testing
-随后记录该 Benchmark 的评测契约，以及实现时采用的代码原型。
-Benchmark 修改的最低审查条件
+Benchmark 修改的最低审查条件：
 一项 Benchmark 修改，必须至少证明以下内容，才具备可审查性：
-1. 数据集字段、Doc.query、Doc.choices、Doc.gold_index、标准答案格式，以及展开后的任务选择器。
-2. Benchmark 原生的 NoCoT / FakeCoT / CoT 模式选择，以及实际采用的 SamplingMethod。
+1. 数据集字段、版本与 split，`process_docs`、`doc_to_text`、`doc_to_choice`、`doc_to_target` 的实际输出、标准答案格式，以及 `TaskManager` 展开 task / group / tag 后的叶子任务清单。
+2. Benchmark 原生任务协议与实际 NoCoT / FakeCoT / CoT 模式，`output_type`、`Instance.request_type`、`Instance.args`、生成采样参数和 `repeats` / k；这些字段必须与实际执行一致。
 3. 通过日志验证实际使用的请求路径是 /v1/completions 还是 /v1/chat/completions。
 4. Prompt Template、停止行为、生成 Token 预算、答案抽取器、抽取失败值和截断语义。
-5. 原生 Metric / Scorer 的接线方式、评测明细中使用的实际 Completion 输入，以及 answer、ground_truth、is_passed 行为的一致性。
+5. 原生 `filter_list`、`process_results()`、`metric_list`、任务与 group 聚合的接线方式，评测明细中使用的实际模型输入，以及 answer、ground_truth、is_passed 行为的一致性。
 6. Hermetic Tests（隔离且可复现的测试），以及发布前必须进行的 1.5B 和 2.9B 模型各 10 道题冒烟评测。
 7. 测试数据库中必须存在受影响 Benchmark 的实际分数与明细记录，并且此前报告的答案抽取、判分、Prompt 和模式异常均已消除。
 仅仅启动 Producer、通过单元测试，或者查询得到一个空结果集，均不能视为验收通过。
 
-不能仅根据 cot_mode 标签、generation_size 或任务名称判断真实的评测执行行为。
+不能仅根据 cot_mode 标签、`generation_kwargs.max_gen_toks` 或任务名称判断真实的评测执行行为。
 
 不得在上传层手动重构 NoCoT 选项或已经渲染的 CoT Prompt。
 
@@ -393,7 +397,7 @@ User: ... Assistant: <think
 
 ## 职责边界
 本仓库独立负责：
-1. 当前已注册 Benchmark 的lm-eval-harness原生评测流水线；
+1. 本仓库评测范围内已注册 Benchmark 的 lm-eval-harness 原生评测流水线；
 2. RWKV HTTP 模型适配器；
 3. 标准评测结果和明细输出；
 4. Scoreboard 分数发布。
@@ -402,11 +406,12 @@ User: ... Assistant: <think
 2. 模型权重切换；
 3. wkv_mode 切换；
 4. Endpoint Pool Manifest。
-尚未在 LightEval 中注册的 Benchmark，由其他评测框架负责。
+尚未接入本仓库任务接口的 Benchmark，须先完成本文件规定的接入审查；已由 LightEval 或 EvalScope 收录的 Benchmark，由对应框架负责。
 本仓库不承担跨框架调度，也不管理外部评测任务的生命周期。
 
 ## 同步上游
-本仓库需要定期与上游 LightEval 仓库同步。
+本仓库需要定期同步 lm-evaluation-harness 上游。框架上游为 https://github.com/EleutherAI/lm-evaluation-harness；若使用 RWKV fork 作为协作上游，必须明确记录同步仓库、分支与提交。
+同步前必须核对 Git remote 的实际 URL 和目标分支，不能仅凭 remote 名称判断上游身份。LightEval 和 EvalScope 的代码不作为本仓库的框架同步来源。
 
 同步之前，必须先根据以下原则重构代码：
 - 对应原则（Correspondence Principle）；
@@ -420,7 +425,7 @@ User: ... Assistant: <think
 ahead x, behind 0
 
 
-即本地分支可以领先上游若干提交，但不能落后于上游
+即本地分支可以领先本次明确选定的上游目标分支若干提交，但不能落后；必须基于最新获取的目标引用核对，并报告比较的仓库、分支及提交。
 
 ## 分数上传
  scoreboard-rwkv 仓库承担，在配置了url和token之后，即可发布
