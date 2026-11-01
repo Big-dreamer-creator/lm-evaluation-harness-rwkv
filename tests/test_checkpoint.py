@@ -21,6 +21,19 @@ def _make_store(tmp_path, config=("model", "a")):
     return CheckpointStore(db_path, fingerprint)
 
 
+def test_completion_resume_retains_seed_and_thinking_contract():
+    from lm_eval.filters.extraction import AlbatrossMultiChoiceFilter
+    from lm_eval.models.openai_completions import _RWKVCompletion
+
+    answer = _RWKVCompletion(">The answer is B", "length")
+    answer.requires_think_close = True
+    answer.seed = 104
+    restored = deserialize_response(serialize_response(answer))
+    assert restored.seed == 104
+    assert restored.requires_think_close is True
+    assert AlbatrossMultiChoiceFilter().apply([[restored]], [{}]) == [["[invalid]"]]
+
+
 def _item_key(task_name="task", item_id="item-1", repeat_ord=0):
     return ItemKey(
         item_id=item_id,
@@ -215,6 +228,65 @@ def test_serialize_deserialize_tuple_roundtrip():
 def test_serialize_deserialize_plain_string_roundtrip():
     data = serialize_response("plain text")
     assert deserialize_response(data) == "plain text"
+
+
+def test_serialize_deserialize_rwkv_completion_roundtrip():
+    from lm_eval.models.openai_completions import _RWKVCompletion
+
+    response = _RWKVCompletion(
+        "generated text", "stop", raw_response={"choices": [{"text": "generated text"}]}
+    )
+    data = serialize_response(response)
+    restored = deserialize_response(data)
+    assert restored == "generated text"
+    assert restored.finish_reason == "stop"
+    assert restored.raw_response == {"choices": [{"text": "generated text"}]}
+
+
+def test_serialize_deserialize_rwkv_loglikelihood_roundtrip():
+    from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
+
+    response = RWKVLoglikelihoodResponse(
+        0.0,
+        True,
+        prompt="ctx\n\nA. one\nB. two\n\nAnswer with only the letter of the correct option.",
+        raw_response={"choices": [{"text": "The answer is B."}]},
+        finish_reason="stop",
+        output_token_ids=[1, 2, 3],
+        truncated=False,
+    )
+    data = serialize_response(response)
+    restored = deserialize_response(data)
+
+    # Resuming from a checkpoint must not silently fall back to the fake,
+    # reconstructed-from-score prompt/completion: the real evidence has to
+    # survive the round trip exactly like a fresh run would produce it.
+    assert restored == (0.0, True)
+    assert isinstance(restored, tuple)
+    assert restored.prompt == response.prompt
+    assert restored.raw_response == {"choices": [{"text": "The answer is B."}]}
+    assert restored.finish_reason == "stop"
+    assert restored.output_token_ids == [1, 2, 3]
+    assert restored.truncated is False
+
+
+def test_serialize_deserialize_keeps_the_per_rollout_record():
+    """The per-rollout record is what lets a restored doc still be scored at
+    avg@k (and counted in the truncation rate), so it has to survive the
+    round trip even when the response carries no other evidence.
+    """
+    from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
+
+    rollouts = [
+        {"index": 0, "truncated": False},
+        {"index": -1, "truncated": True},
+    ]
+    response = RWKVLoglikelihoodResponse(0.0, True, rollouts=rollouts)
+
+    restored = deserialize_response(serialize_response(response))
+
+    assert restored == (0.0, True)
+    assert restored.rollouts == rollouts
 
 
 def test_responses_without_a_rollout_record_round_trip_as_plain_tuples():
