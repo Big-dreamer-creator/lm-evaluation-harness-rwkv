@@ -131,6 +131,22 @@ saved field and cannot override it.
 
 ### Remote RWKV evaluation protocol
 
+For `rwkv_profile.generation_prompt = "no_think"`, multiple-choice tasks use
+native `multiple_choice` requests and real sequence loglikelihoods from
+`/v1/completions`. The matching `tokenizer_name` is mandatory and requests
+send Token IDs. Native task prompts take precedence over the global chat
+template for these tasks; a missing standalone `\nAnswer: ` is appended in
+the RWKV adapter. Candidate strings, targets and metrics are preserved.
+NoCoT likelihood tasks do not use generative avg@k planning. Missing prompt
+logprobs abort evaluation, and the chat and transformers-only backends reject
+this workload. Protocol `rwkv-loglikelihood-v1` separates checkpoints and
+response caches from historical generative NoCoT scores. Old scores require
+real likelihood requests; generated letters cannot be converted to logprobs.
+See the current [NoCoT review](../RWKV_EVALUATION_GUIDE.md#nocot-似然修复审查2026-11-01).
+
+The following generation-specific description applies to generation tasks and
+the historical CoT / FakeCoT choice path:
+
 `rwkv7-remote` renders the official local tokenizer's template and sends token
 IDs to `/v1/completions`. Set `tokenizer_name` to the same official tokenizer
 used by the server and keep `apply_chat_template = true`. The native

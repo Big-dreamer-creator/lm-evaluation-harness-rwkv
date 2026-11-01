@@ -1019,7 +1019,10 @@ def test_rwkv_remote_wire_to_scoreboard_with_open_thinking(tmp_path, monkeypatch
 
     def callback(task_name, artifact_paths):
         document = json.loads(Path(artifact_paths["results"]).read_text())
-        captured["publication"] = build_score(document, _publish_config({"remote_leaf": {"field": "reasoning"}}))
+        from dataclasses import replace
+        captured["publication"] = build_score(document, replace(
+            _publish_config({"remote_leaf": {"field": "reasoning"}}), cot_mode="CoT"
+        ))
         return {"publication": "validated", "uploaded": False}
 
     evaluator.simple_evaluate(
@@ -1043,6 +1046,121 @@ def test_rwkv_remote_wire_to_scoreboard_with_open_thinking(tmp_path, monkeypatch
     assert info["avg_k"] == 2
     assert score["score"] == (0.5 if output_type == "multiple_choice" else 0.25)
     assert sorted({payload["seed"] for payload in sent}) == [40, 41]
+
+
+@pytest.mark.parametrize("metric", ["acc", "acc_norm", "acc_mutual_info", "brier_score"])
+def test_no_think_native_task_to_scoreboard_and_partial_resume(tmp_path, monkeypatch, metric):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from lm_eval.api.checkpoint import CheckpointStore
+
+    class Tokenizer:
+        eos_token_id = bos_token_id = pad_token_id = 0
+        eos_token = "<eos>"
+        chat_template = "Assistant: <think"
+
+        def __call__(self, values, **kwargs):
+            encode = lambda value: [ord(char) for char in value]
+            return SimpleNamespace(input_ids=encode(values) if isinstance(values, str)
+                                   else [encode(value) for value in values])
+
+        def batch_decode(self, values, **kwargs):
+            return ["".join(chr(token) for token in value) for value in values]
+
+    fixtures = tmp_path / "fixtures"
+    data = _write_data_and_leaves(fixtures, [("native_leaf", metric)])
+    data.write_text(json.dumps([{"question": "Which pet?", "choices": ["cats", "multi token dogs"], "answer": 1}]))
+    path = fixtures / "native_leaf.yaml"
+    path.write_text(path.read_text().replace(
+        "output_type: generate_until", "output_type: multiple_choice\ndoc_to_choice: choices"
+    ).replace("aggregation: mean", "aggregation: brier_score" if metric == "brier_score" else "aggregation: mean"))
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *a, **k: Tokenizer())
+    monkeypatch.setenv("RWKV_API_KEY", "unit-test")
+    from lm_eval.models.rwkv_remote import RWKV7Remote
+    monkeypatch.setattr(RWKV7Remote, "generate_until", lambda *a, **k: pytest.fail("NoCoT must not generate"))
+    sent = []
+    interrupt = [True]
+
+    def post(url, *, json, **kwargs):
+        assert url == "http://localhost:8000/v1/completions"
+        if len(sent) == 1 and interrupt[0]:
+            raise RuntimeError("interrupted after one candidate")
+        sent.append(json)
+        assert json["echo"] is True and json["logprobs"] == 1
+        assert "generation_config" not in json and "top_p" not in json
+        tokens = json["prompt"][0]
+        prompt = "".join(chr(token) for token in tokens)
+        assert "<think" not in prompt
+        assert "Answer with only" not in prompt
+        assert "A. cats" not in prompt
+        value = -0.01 if prompt.endswith("multi token dogs") else -1.0
+        response = Mock(ok=True)
+        response.json.return_value = {"choices": [{"index": 0, "text": "", "finish_reason": "length",
+            "logprobs": {"token_logprobs": [None] + [value] * (len(tokens) - 1) + [-999],
+                         "top_logprobs": [None] + [{"top": -0.01}] * len(tokens)}}]}
+        return response
+
+    monkeypatch.setattr("lm_eval.models.api_models.requests.post", post)
+    captured = {}
+
+    def callback(task_name, artifact_paths):
+        captured["document"] = json.loads(Path(artifact_paths["results"]).read_text())
+        captured["paths"] = artifact_paths
+        if metric != "brier_score":
+            captured["publication"] = build_score(
+                captured["document"], _publish_config({"native_leaf": {"field": "reasoning"}})
+            )
+        return {"uploaded": False}
+
+    store = CheckpointStore(str(tmp_path / "checkpoint.sqlite3"), "native-test")
+
+    def run():
+        return evaluator.simple_evaluate(
+            model="rwkv7-remote", model_args={"model": "rwkv7-g1j-1.5b", "tokenizer": "unit-tokenizer",
+                "base_url": "http://localhost:8000/v1/completions", "rwkv_generation_prompt": "no_think",
+                "max_length": 4096, "max_retries": 1},
+            tasks=["native_leaf"], task_manager=TaskManager(include_path=str(fixtures), include_defaults=False),
+            apply_chat_template=True, fewshot_as_multiturn=True, log_samples=True, bootstrap_iters=0,
+            metadata={"weight_revision": "rwkv7-g1j-1.5b-ctx4096"},
+            evaluation_tracker=EvaluationTracker(output_path=str(tmp_path / "run")), task_callback=callback,
+            checkpoint_store=store,
+            benchmark_map={"native_leaf": BenchmarkSpec(name="native_leaf", field="reasoning",
+                strategy="standalone", leaf_task_names=("native_leaf",))},
+        )
+
+    try:
+        with pytest.raises(RuntimeError, match="interrupted after one candidate"):
+            run()
+        assert len(sent) == 1
+        interrupt[0] = False
+        run()
+        assert len(sent) == (4 if metric == "acc_mutual_info" else 2)
+        assert captured["document"]["configs"]["native_leaf"]["repeats"] == 1
+        assert not any("avg@" in key for key in captured["document"]["results"]["native_leaf"])
+        rows = [json.loads(line) for line in Path(captured["paths"]["samples"]).read_text().splitlines()]
+        assert float(rows[0]["resps"][1][0][0]) == pytest.approx(-0.18)
+        assert all(entry["request_type"] == "loglikelihood" for entry in rows[0]["response_evidence"])
+        assert all(not entry["truncated"] for entry in rows[0]["response_evidence"])
+        if metric not in {"acc_mutual_info", "brier_score"}:
+            info, score = captured["publication"]
+            assert info["avg_k"] == 1
+            assert score["score"] == 1.0
+            assert score["truncation_rate"] == 0.0
+            assert score["sampling_config"]["max_generated_tokens"] == 1
+            assert score["sampling_config"]["request_type"] == "loglikelihood"
+            detail = score["passed_details"][0]
+            assert detail["answer"] == detail["ground_truth"] == "multi token dogs"
+            assert detail["messages"][0]["content"] == "Which pet?\nAnswer:  multi token dogs"
+            # A correct protocol label cannot make historical response
+            # encodings publishable without actual HTTP input evidence.
+            rows[0]["response_evidence"] = []
+            Path(captured["document"]["leaf_artifact_paths"]["native_leaf"]["samples"]).write_text(
+                json.dumps(rows[0]) + "\n"
+            )
+            with pytest.raises(ScoreboardError, match="actual native loglikelihood evidence"):
+                build_score(captured["document"], _publish_config({"native_leaf": {"field": "reasoning"}}))
+    finally:
+        store.close()
 
 
 def _write_sample_rows(path: Path, rows: list[dict]) -> None:

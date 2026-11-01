@@ -287,11 +287,15 @@ Linux 本地文件系统；WSL 下将 SQLite 缓存放在 `/mnt/c` 或 `/mnt/e` 
 直接对接标准 OpenAI 格式的托管 RWKV 服务（例如 `https://api.rwkv.rs`）。两者
 互不影响：`rwkv7-remote` 是独立新增的 backend，不改动 `rwkv7-http` 的行为。
 
-`rwkv7-remote` 使用 `/v1/completions`。生成题直接生成答案；选择题虽然在
-lm-eval 内部表现为 `loglikelihood` 请求，实际执行的是带字母选项的生成与
-答案抽取，返回的数值仅供选择题判分，不能解释为真实 log probability。
-需要真实似然的任务或指标会在启动时拒绝。聊天消息也可通过
-`rwkv7-remote-chat` 交给服务端渲染。
+`rwkv7-remote` 使用 `/v1/completions`。NoCoT 选择题走原生
+`multiple_choice → construct_requests() → loglikelihood`，以
+`echo=true, logprobs=1, max_tokens=1` 请求候选序列的真实条件 logprob。
+多 Token 候选累加全部候选 Token 的 logprob，排除额外生成的探测 Token。
+缺失、无效或不完整的 prompt logprobs 会报错；禁止生成式回退或伪造概率。
+此路径不使用 CoT 模板或 avg@k 生成补丁，候选、标准答案、任务指标及聚合
+仍由原生任务负责。聊天端点和不支持 echo 的 `rwkv7-http` 后端明确拒绝
+NoCoT 似然任务；应使用支持 prompt logprobs 的 completions 服务。
+CoT / FakeCoT 的历史生成式选择题路径保持独立。
 
 ### 10.1 仅生成类任务（`generate_until`，如 DROP）
 
@@ -332,9 +336,11 @@ wkv_mode = "fp32io16"
 
 ### 10.2 loglikelihood/多选任务（如 RACE）：`tokenizer_name`
 
-`race` 等选择题通过生成作答。正式使用 `rwkv7-remote` 时应设置
-`tokenizer_name` 并启用 `apply_chat_template = true`，由本地官方模板构造
-原生提示词并计算完整输入长度。分词器可为本地目录或 HF Hub repo id：
+NoCoT 选择题必须设置与服务端完全一致的 `tokenizer_name`，原生任务负责
+构建 context 和 continuation，模型私有格式化仅补齐缺失的 `\nAnswer: `。
+已有独立换行的 `Answer:` 及其空白原样保留，不重建选项。
+即使全局启用聊天模板，NoCoT `multiple_choice` 也使用原生文本请求；
+同一运行中的生成任务继续使用其配置的模板。分词器可为本地目录或 HF Hub repo id：
 
 ```toml
 schema_version = 1
@@ -350,12 +356,12 @@ benchmarks = ["race"]
 output_dir = "results/rwkv7-g1j-1.5b-remote-race"
 
 max_length = 16384
-apply_chat_template = true
+apply_chat_template = false
 fewshot_as_multiturn = false
 
 [rwkv_profile]
 prompt_template = "assistant"
-generation_prompt = "fake_think"
+generation_prompt = "no_think"
 wkv_mode = "fp32io16"
 ```
 
@@ -511,6 +517,11 @@ enabled = true
 
 ## 12. rwkv7-remote 测评协议审查（2026-10-20）
 
+以下是历史 `rwkv-generative-v2` 审查记录，不能作为 NoCoT 选择题的现行协议。
+现行 NoCoT 运行标识为 `rwkv-loglikelihood-v1`，checkpoint 和响应缓存均与
+旧生成式结果隔离。旧生成答案没有候选的条件 logprob，不能重标记或仅重判为
+LOGPROBS 成绩，必须使用真实似然请求重跑受影响模型与任务。
+
 审查基线为 `feature/scoreboard-upload-rewrite` 的
 `01926a51cf950a5995b582c9c71ec4fc2ec0516c`。范围覆盖远程请求、原生提示词、
 最终答案判分、avg@k、结果证据、checkpoint 和 Scoreboard 发布。
@@ -546,6 +557,43 @@ enabled = true
 尚未实现 RWKV `no_think`。现有
 `rwkv7_g1j_campaign_ruler_xquad_nocot_full_scoreboard.toml` 仍会在配置校验时失败；
 不能静默换为 `fake_think` 并沿用相同实验身份。
+
+### NoCoT 似然修复审查（2026-11-01）
+
+原型为 `lm_eval/api/model.py:TemplateLM.loglikelihood`、
+`lm_eval/models/api_models.py:TemplateAPI._loglikelihood_tokens` 和
+`lm_eval/models/openai_completions.py:LocalCompletionsAPI.parse_logprobs`。
+复用原生分词边界、HTTP 并发、每候选 checkpoint 和原生 `process_results`。
+RWKV 私有解析严格检查真实 Token logprob，不改其他 HTTP 模型的解析行为。
+上下文错误及超长似然输入直接报错，不截断输入或返回占位得分。
+
+任务配置复用提交 `ea9a2ec2^` 的原生 MuTual、MC-TACO 和 Discrim-Eval
+候选定义，仅在 RWKV NoCoT 加载时启用；保留当前配置的 metric 和 aggregation。
+MuTual 保留当前 `acc`，不恢复已经删除的 `r@2` / `mrr`。
+InfiniteBench 的 `longbook_choice_en`、`code_debug` 在同一私有分支使用
+A/B/C/D 候选、原有标准答案映射和 `score` 聚合；NoCoT code_debug 移除推理指令。
+原生 `multiple_choice` 任务（含 Inverse Scaling 和 Model-Written Evals）
+保持其原始数据版本、split、few-shot、候选、标准答案和指标。
+所有这些似然请求不采样，保留 task 的 repeats；不套用生成式 avg@k 预算。
+
+本次未扩展生产 Benchmark 清单。核对本机 LightEval `c5475e2` 的
+`src/lighteval/tasks/registry.py` / `tasks/race_high.py`，以及 EvalScope
+`4f1154f5` 的 `evalscope/benchmarks/race/race_adapter.py`，发现两者已收录 RACE；
+保留上游 RACE 任务不能解释为允许其进入本仓库 RWKV 生产范围。
+MuTual、MC-TACO、Discrim-Eval、Inverse Scaling、Model-Written Evals 和
+InfiniteBench 在这两份本机注册源码中未检出；生产范围准入仍须核对部署时的
+最新可运行注册表，不能将本机快照等同于最新线上状态。
+
+明细保留每个候选实际发送的完整文本、Token ID、请求 URL、request_type、
+原始响应和真实序列 loglikelihood；标准答案保留原生索引及对应候选值。
+发布根据所选原生指标（含 acc_norm / acc_bytes）选择相应候选，显示实际发送的
+输入，不追加选项或 Answer:。探测 Token 的 length 结束不算答案截断。
+NoCoT 发布拒绝旧生成协议、缺失 HTTP 输入证据或空明细文件。
+
+隔离测试复用现有测试文件，覆盖真实本地 HTTP、序列求和、错误响应、并发、
+逐候选恢复、原生指标、任务模式隔离和 Scoreboard payload。
+这些测试不构成生产准入：实际 1.5B / 2.9B 各 10 题 LOGPROBS / GENERATIVE
+冒烟及测试榜单数据库记录仍须在具备 Manifest 和凭据的部署环境完成。
 
 ## 13. RWKV 本地 Coding 测评
 

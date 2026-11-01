@@ -549,3 +549,151 @@ def test_rwkv7_remote_loglikelihood_attaches_real_generation_as_evidence(monkeyp
         assert "Answer with only the letter" in outcome.prompt
         assert "A. one" in outcome.prompt
         assert "B. two" in outcome.prompt
+
+
+def _build_no_think(monkeypatch, **kwargs):
+    from types import SimpleNamespace
+
+    class Tokenizer:
+        eos_token_id = bos_token_id = pad_token_id = 0
+        eos_token = "<eos>"
+        chat_template = _ASSISTANT_STYLE_TEMPLATE
+
+        def __call__(self, values, **kwargs):
+            encode = lambda value: [ord(char) for char in value]
+            return SimpleNamespace(input_ids=encode(values) if isinstance(values, str)
+                                   else [encode(value) for value in values])
+
+        def batch_decode(self, values, **kwargs):
+            return ["".join(chr(token) for token in value) for value in values]
+
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *a, **k: Tokenizer())
+    monkeypatch.setenv("RWKV_API_KEY", "unit-test")
+    model = _build(tokenizer="unit-tokenizer", rwkv_generation_prompt="no_think", **kwargs)
+    monkeypatch.setattr(model, "generate_until", lambda *a, **k: pytest.fail("NoCoT must not generate"))
+    return model
+
+
+@pytest.mark.parametrize("num_concurrent", [1, 3])
+@pytest.mark.parametrize("context", ["Question?", "Question?\nAnswer:\t "])
+def test_no_think_native_likelihood_over_http(monkeypatch, num_concurrent, context):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    sent = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            sent.append((self.path, payload))
+            prompt = payload["prompt"][0]
+            # The last logprob is for the generated probe token. It must never
+            # be scored as part of the candidate sequence.
+            body = json.dumps({"choices": [{"index": 0, "text": "", "finish_reason": "length",
+                "logprobs": {"token_logprobs": [None] + [-0.5] * (len(prompt) - 1) + [-999.0],
+                             "top_logprobs": [None] + [{"best": -0.25}] * len(prompt)}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        model = _build_no_think(monkeypatch, num_concurrent=num_concurrent,
+                               base_url=f"http://127.0.0.1:{server.server_port}/v1/completions")
+        choices = [" short", " multi token option", " x"]
+        requests = _mc_requests(context, choices)
+        results = model.loglikelihood(requests)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    formatted = context if "\nAnswer:" in context else context + "\nAnswer: "
+    suffix_spaces = len(formatted) - len(formatted.rstrip())
+    assert results == [(-0.5 * (len(choice) + suffix_spaces), False) for choice in choices]
+    assert len(sent) == len(choices)
+    assert {path for path, _ in sent} == {"/v1/completions"}
+    for _, payload in sent:
+        assert payload["echo"] is True and payload["logprobs"] == 1
+        assert payload["max_tokens"] == 1 and payload["temperature"] == 0
+        assert "top_p" not in payload and "generation_config" not in payload
+    for result, choice in zip(results, choices, strict=True):
+        assert result.prompt == formatted + choice
+        assert result.prompt_token_ids == [ord(char) for char in result.prompt]
+        assert result.request_type == "loglikelihood"
+        assert "<think" not in result.prompt and "A. " not in result.prompt
+    assert [request.args[0] for request in requests] == [context] * len(choices)
+    assert model._avg_k_samples == {}
+
+
+@pytest.mark.parametrize("invalid", [None, float("nan"), float("inf"), 0.1, True])
+def test_no_think_rejects_invalid_token_logprobs(monkeypatch, invalid):
+    model = _build_no_think(monkeypatch)
+    output = {"choices": [{"index": 0, "logprobs": {
+        "token_logprobs": [None, -0.2, invalid, -999],
+        "top_logprobs": [None, {"a": -0.2}, {"b": -0.1}, {"probe": -999}],
+    }}]}
+    with pytest.raises(ValueError, match="invalid conditional"):
+        model.parse_logprobs(output, tokens=[[65, 66, 67]], ctxlens=[1])
+
+
+@pytest.mark.parametrize("logprobs", [None, {}, {"token_logprobs": [None, -0.2]},
+    {"token_logprobs": [None, -0.2, -0.3], "top_logprobs": [None, {}, {}]}])
+def test_no_think_requires_complete_prompt_logprobs(monkeypatch, logprobs):
+    model = _build_no_think(monkeypatch)
+    with pytest.raises(ValueError, match="logprobs"):
+        model.parse_logprobs({"choices": [{"index": 0, "logprobs": logprobs}]},
+                             tokens=[[65, 66, 67]], ctxlens=[1])
+
+
+def test_no_think_does_not_fabricate_likelihood_on_context_error(monkeypatch):
+    from lm_eval.models.api_models import ContextLengthExhausted
+
+    model = _build_no_think(monkeypatch)
+
+    def fail(**kwargs):
+        raise ContextLengthExhausted("server context exhausted")
+
+    monkeypatch.setattr(model, "model_call", fail)
+    with pytest.raises(ContextLengthExhausted):
+        model.loglikelihood(_mc_requests("question", ["yes"]))
+    with pytest.raises(ContextLengthExhausted, match="must not be truncated"):
+        model.loglikelihood(_mc_requests("q" * (model.max_length + 1), ["yes"]))
+
+
+def test_no_think_requires_matching_tokenizer_and_completions_endpoint(monkeypatch):
+    model = _build(rwkv_generation_prompt="no_think")
+    with pytest.raises(ValueError, match="matching tokenizer"):
+        model.loglikelihood(_mc_requests("question", ["yes", "no"]))
+    model.base_url = "https://example.com/v1/chat/completions"
+    with pytest.raises(ValueError, match="requires /v1/completions"):
+        model.loglikelihood(_mc_requests("question", ["yes", "no"]))
+
+
+def test_no_think_checkpoint_identity_and_transport_evidence(monkeypatch):
+    from lm_eval.api.checkpoint import model_fingerprint, serialize_response, deserialize_response
+
+    model = _build_no_think(monkeypatch)
+    current = model_fingerprint(model)
+    model.EVALUATION_PROTOCOL_VERSION = "rwkv-generative-v2"
+    assert model_fingerprint(model) != current
+    output = {"choices": [{"index": 0, "logprobs": {
+        "token_logprobs": [None, -0.2, -0.3, -999],
+        "top_logprobs": [None, {"B": -0.2}, {"C": -0.3}, {"probe": -999}],
+    }}]}
+    (response,) = model.parse_logprobs(output, tokens=[[65, 66, 67]], ctxlens=[1])
+    restored = deserialize_response(serialize_response(response))
+    assert restored == (-0.5, True)
+    assert restored.prompt == "ABC"
+    assert restored.text == "BC"
+    assert restored.raw_response == output
+    assert restored.request_type == "loglikelihood"
+    assert restored.prompt_token_ids == [65, 66, 67]

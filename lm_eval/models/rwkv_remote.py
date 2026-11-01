@@ -1,14 +1,22 @@
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 from collections import Counter, defaultdict
+from dataclasses import replace
 from functools import cached_property
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlsplit
 
 from jinja2 import TemplateError
 
-from lm_eval.api.checkpoint import ItemKey, serialize_response
+from lm_eval.api.checkpoint import (
+    LOGLIKELIHOOD_PROTOCOL_VERSION,
+    ItemKey,
+    serialize_response,
+)
 from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
 from lm_eval.models.openai_completions import (
@@ -49,9 +57,9 @@ class _RWKVPrompt(str):
 class RWKV7Remote(LocalCompletionsAPI):
     """RWKV generation through vLLM's completions API.
 
-    Multiple-choice tasks generate lettered answers; their returned likelihood
-    tuples are scoring encodings, not real log probabilities. The official
-    local tokenizer renders the chat template and budgets the complete prompt.
+    NoCoT multiple-choice tasks use native sequence loglikelihoods. Thinking
+    modes retain their separate generative choice scoring. The official
+    local tokenizer renders generation prompts and encodes likelihood inputs.
     Sampling parameters are sent explicitly as vLLM request fields.
 
     ``rwkv_generation_prompt`` (``no_think``/``fake_think``/``open_think``) always
@@ -142,6 +150,9 @@ class RWKV7Remote(LocalCompletionsAPI):
 
         self.rwkv_prompt_template = rwkv_prompt_template
         self.rwkv_generation_prompt = rwkv_generation_prompt
+        self.SUPPORTS_LOGLIKELIHOOD = rwkv_generation_prompt == "no_think"
+        if self.SUPPORTS_LOGLIKELIHOOD:
+            self.EVALUATION_PROTOCOL_VERSION = LOGLIKELIHOOD_PROTOCOL_VERSION
         kwargs.setdefault(
             "max_gen_toks", 256 if rwkv_generation_prompt == "no_think" else MAX_NEW_TOKENS
         )
@@ -234,7 +245,7 @@ class RWKV7Remote(LocalCompletionsAPI):
         disable_tqdm: bool = False,
         item_keys: Optional[List[Optional[ItemKey]]] = None,
     ) -> List[Tuple[float, bool]]:
-        """Score ``multiple_choice`` docs via avg@k generation instead of echo/logprobs.
+        """Use native likelihoods for NoCoT, and generation for thinking modes.
 
         Unlike the echo-based loglikelihood this class inherits from
         ``LocalCompletionsAPI``/``TemplateAPI`` (which never issues a
@@ -256,6 +267,26 @@ class RWKV7Remote(LocalCompletionsAPI):
         class's echo-based ``_loglikelihood_tokens`` entirely, completion is
         marked directly against ``self.checkpoint_store`` instead.
         """
+        if self.SUPPORTS_LOGLIKELIHOOD:
+            if urlsplit(self.base_url).path.rstrip("/") != "/v1/completions":
+                raise ValueError("NoCoT loglikelihood requires /v1/completions")
+            if self.tokenizer is None or not self.tokenized_requests:
+                raise ValueError(
+                    "NoCoT loglikelihood requires the server's matching tokenizer "
+                    "and tokenized_requests=True"
+                )
+            requests = [
+                replace(request, arguments=(
+                    context if not context or re.search(r"\nAnswer:\s*\Z", context)
+                    else context + "\nAnswer: ",
+                    continuation,
+                ))
+                for request in requests
+                for context, continuation in [request.args]
+            ]
+            return super().loglikelihood(
+                requests, disable_tqdm=disable_tqdm, item_keys=item_keys
+            )
         results: List[Optional[Tuple[float, bool]]] = [None] * len(requests)
         groups: Dict[Any, List[int]] = defaultdict(list)
         for position, request in enumerate(requests):
@@ -443,6 +474,57 @@ class RWKV7Remote(LocalCompletionsAPI):
             if completed:
                 self.checkpoint_store.mark_items_completed(completed)
 
+        return results
+
+    def parse_logprobs(self, outputs, tokens=None, ctxlens=None, **kwargs):
+        """Sum the echoed continuation token logprobs, excluding generated tokens."""
+        if not self.SUPPORTS_LOGLIKELIHOOD:
+            return super().parse_logprobs(outputs, tokens=tokens, ctxlens=ctxlens, **kwargs)
+        if tokens is None or ctxlens is None or len(tokens) != len(ctxlens):
+            raise ValueError("NoCoT loglikelihood requires token boundaries")
+        outputs = outputs if isinstance(outputs, list) else [outputs]
+        choices = [
+            (output, choice)
+            for output in outputs
+            for choice in sorted(output["choices"], key=lambda choice: choice["index"])
+        ]
+        if len(choices) != len(tokens):
+            raise ValueError("NoCoT loglikelihood response count does not match requests")
+        results = []
+        for (output, choice), prompt_tokens, ctxlen in zip(choices, tokens, ctxlens, strict=True):
+            if not 0 < ctxlen < len(prompt_tokens):
+                raise ValueError("NoCoT loglikelihood requires a nonempty context and continuation")
+            logprobs = choice.get("logprobs") or {}
+            token_logprobs = logprobs.get("token_logprobs") or []
+            top_logprobs = logprobs.get("top_logprobs") or []
+            if len(token_logprobs) < len(prompt_tokens) or len(top_logprobs) < len(prompt_tokens):
+                raise ValueError("NoCoT requires complete echo prompt logprobs; generation fallback is forbidden")
+            continuation_logprobs = token_logprobs[ctxlen:len(prompt_tokens)]
+            continuation_top = top_logprobs[ctxlen:len(prompt_tokens)]
+            for value, top in zip(continuation_logprobs, continuation_top, strict=True):
+                if (
+                    type(value) not in (int, float) or not math.isfinite(value) or value > 0
+                    or not isinstance(top, dict) or not top
+                    or any(type(prob) not in (int, float) or not math.isfinite(prob) or prob > 0
+                           for prob in top.values())
+                    or value > max(top.values())
+                ):
+                    raise ValueError("NoCoT received invalid conditional token logprobs")
+            prompt, continuation = self.tokenizer.batch_decode(
+                [prompt_tokens, prompt_tokens[ctxlen:]],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            results.append(RWKVLoglikelihoodResponse(
+                sum(continuation_logprobs),
+                all(value == max(top.values())
+                    for value, top in zip(continuation_logprobs, continuation_top, strict=True)),
+                prompt=prompt,
+                text=continuation,
+                raw_response=output,
+                request_type="loglikelihood",
+                prompt_token_ids=list(prompt_tokens),
+            ))
         return results
 
     def _rollout_instances(self, prompt: str, k: int) -> List[Instance]:

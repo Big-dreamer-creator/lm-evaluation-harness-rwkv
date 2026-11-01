@@ -32,6 +32,13 @@ def test_process_results_returns_none_for_unparsed_generation():
     assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", None)
 
 
+def test_process_results_ranks_native_likelihoods_instead_of_greedy_flags():
+    doc = _make_doc("white", "male", 30.0, 0)
+    # More than one candidate can be greedy; select the sequence by logprob.
+    out = process_results(doc, [(-2.0, True), (-3.0, True), (-0.5, False), (-1.0, False)])
+    assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", 0)
+
+
 def test_agg_demographic_bias_diff_recovers_injected_bias():
     # Scenario 0: black always chosen "yes", white always chosen "no" ->
     # a clean +1.0 bias favoring black over the white reference.

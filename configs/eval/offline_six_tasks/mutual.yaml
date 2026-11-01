@@ -30,3 +30,11 @@ metric_list:
     higher_is_better: true
 metadata:
   version: 3.0
+  rwkv_no_think:
+    output_type: multiple_choice
+    doc_to_text: "{{article}}"
+    doc_to_choice: "{{options}}"
+    doc_to_target: "{{['A', 'B', 'C', 'D'].index(answers)}}"
+    process_results: null
+    generation_kwargs: null
+    filter_list: null

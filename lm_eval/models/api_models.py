@@ -755,6 +755,8 @@ class TemplateAPI(TemplateLM):
                 # max_length - 1 as we always have 1 token for generation
                 inp = (context_enc + continuation_enc)[-self.max_length :]
                 if len(inp) < len(context_enc + continuation_enc):
+                    if getattr(self, "SUPPORTS_LOGLIKELIHOOD", False):
+                        raise ContextLengthExhausted("NoCoT likelihood input must not be truncated")
                     eval_logger.warning(
                         f"Context length ({len(context_enc)}) + continuation length ({len(continuation_enc)}) > max_length ({self.max_length}). Left truncating context."
                     )
@@ -922,6 +924,8 @@ class TemplateAPI(TemplateLM):
                         retry=retry_if_not_exception_type(ContextLengthExhausted),
                     )(self.model_call)(messages=inputs, generate=False)
                 except ContextLengthExhausted as e:
+                    if getattr(self, "SUPPORTS_LOGLIKELIHOOD", False):
+                        raise
                     eval_logger.warning(
                         f"Context length exhausted for loglikelihood request; "
                         f"recording as (0.0, False) instead of failing the run: {e}"

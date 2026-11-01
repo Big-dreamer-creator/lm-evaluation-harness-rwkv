@@ -589,6 +589,8 @@ def simple_evaluate(
     # performs final result aggregation / I/O.
     cache_rank = lm.rank or int(os.environ.get("LOCAL_RANK", "0"))
     if use_cache is not None:
+        if getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False):
+            use_cache += "_" + lm.EVALUATION_PROTOCOL_VERSION
         eval_logger.info(
             f"Using cache at {use_cache + '_rank' + str(cache_rank) + '.db'}"
         )
@@ -621,7 +623,18 @@ def simple_evaluate(
         task_manager = TaskManager(metadata=metadata)
 
     # Load tasks - returns {"tasks":.., "groups":..}
-    loaded = task_manager.load(tasks)
+    if getattr(lm, "rwkv_generation_prompt", None) == "no_think":
+        task_metadata = task_manager._factory._meta
+        task_manager._factory._meta = {
+            **task_metadata,
+            "rwkv_native_loglikelihood": True,
+        }
+        try:
+            loaded = task_manager.load(tasks)
+        finally:
+            task_manager._factory._meta = task_metadata
+    else:
+        loaded = task_manager.load(tasks)
 
     # Log selected tasks with hierarchy
     _log_selected_tasks(loaded["tasks"], loaded["groups"], task_manager)
@@ -632,9 +645,11 @@ def simple_evaluate(
     # per-leaf `k`). Computed up front so every leaf of a benchmark samples
     # the same `k` times per doc.
     supports_avg_at_k = getattr(lm, "SUPPORTS_AVG_AT_K", False)
+    native_likelihood = getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
     avg_k_plans = (
         plan_avg_at_k(
-            loaded["tasks"],
+            {name: task for name, task in loaded["tasks"].items()
+             if not (native_likelihood and task.OUTPUT_TYPE == "multiple_choice")},
             loaded["groups"],
             benchmark_map,
             limited=limit is not None or samples is not None,
@@ -687,7 +702,7 @@ def simple_evaluate(
         # fewshot_random_seed set for tasks, even with a default num_fewshot (e.g. in the YAML file)
         task_obj.set_fewshot_seed(seed=fewshot_random_seed)
 
-        if getattr(lm, "EVALUATION_PROTOCOL_VERSION", None):
+        if getattr(lm, "EVALUATION_PROTOCOL_VERSION", None) and not native_likelihood:
             if task_obj.OUTPUT_TYPE not in {"generate_until", "multiple_choice"} or task_obj.multiple_input:
                 raise NotImplementedError(f"{task_name}: generative remote scoring requires generation or single-context multiple choice")
             if set(task_obj._metric_fn_list) & {"acc_mutual_info", "brier_score", "perplexity", "likelihood"}:
@@ -705,7 +720,8 @@ def simple_evaluate(
         # for tasks that haven't already opted into their own repeated-sampling
         # scoring (e.g. cruxeval's native repeats=10 pass@k) -- clobbering those
         # would break their bespoke process_results.
-        if supports_avg_at_k and task_obj.get_config("repeats") in (None, 1):
+        if (supports_avg_at_k and task_obj.get_config("repeats") in (None, 1)
+                and not (native_likelihood and task_obj.OUTPUT_TYPE == "multiple_choice")):
             plan = avg_k_plans.get(task_name)
             k = plan.k if plan is not None else 1
             metric_name = plan.metric_name if plan is not None else "avg@1"
@@ -949,6 +965,21 @@ def evaluate(
     # 2.are we running multimodal task <-> non-multimodal model class, or vice-versa.
     incompatible_tasks = []
     for task_name, task in eval_tasks.items():
+        if (getattr(lm, "rwkv_generation_prompt", None) == "no_think"
+                and not getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
+                and (task.OUTPUT_TYPE == "multiple_choice"
+                     or (task.config.metadata or {}).get("rwkv_no_think"))):
+            raise NotImplementedError(
+                f"{task_name}: NoCoT choices require rwkv7-remote with native "
+                "prompt logprobs on /v1/completions"
+            )
+        if (getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
+                and (task.config.metadata or {}).get("rwkv_no_think")
+                and task.OUTPUT_TYPE != "multiple_choice"):
+            raise ValueError(
+                f"{task_name}: load the RWKV NoCoT task variant with simple_evaluate() "
+                "or TaskManager(metadata={'rwkv_native_loglikelihood': True})"
+            )
         if getattr(task, "UNSAFE_CODE", False) and not confirm_run_unsafe_code:
             raise ValueError(
                 f"Attempted to run task: {task_name} which is marked as unsafe. Set confirm_run_unsafe_code=True to run this task."
@@ -968,6 +999,10 @@ def evaluate(
     for task_name, task in eval_tasks.items():
         limit = get_sample_size(task, limit_arg)
         limits.append(limit)
+        native_likelihood = (
+            getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
+            and task.OUTPUT_TYPE == "multiple_choice"
+        )
         task.build_all_requests(
             limit=limit,
             samples=samples.get(task_name, None) if samples is not None else samples,
@@ -976,13 +1011,13 @@ def evaluate(
             cache_requests=cache_requests,
             rewrite_requests_cache=rewrite_requests_cache,
             system_instruction=system_instruction,
-            apply_chat_template=bool(apply_chat_template),
-            fewshot_as_multiturn=fewshot_as_multiturn,
+            apply_chat_template=bool(apply_chat_template) and not native_likelihood,
+            fewshot_as_multiturn=fewshot_as_multiturn and not native_likelihood,
             chat_template=getattr(lm, "apply_chat_template", None)
-            if apply_chat_template
+            if apply_chat_template and not native_likelihood
             else None,
             tokenizer_name=getattr(lm, "tokenizer_name", "")
-            if apply_chat_template
+            if apply_chat_template and not native_likelihood
             else "",
         )
         eval_logger.debug(
@@ -1039,7 +1074,9 @@ def evaluate(
             else:
                 cloned_reqs = [req for req in reqs for _ in range(req.repeats)]
                 item_keys = None
-            if item_keys is not None and reqtype == "loglikelihood" and getattr(lm, "SUPPORTS_AVG_AT_K", False):
+            if (item_keys is not None and reqtype == "loglikelihood"
+                    and getattr(lm, "SUPPORTS_AVG_AT_K", False)
+                    and not getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)):
                 docs = defaultdict(list)
                 for request in reqs:
                     docs[request.doc_id].extend(request.resps)
@@ -1103,12 +1140,24 @@ def evaluate(
                 "truncated": bool(getattr(response, "truncated", False)),
                 "output_token_ids": getattr(response, "output_token_ids", None) or [],
             }
+            if getattr(response, "request_type", None) == "loglikelihood":
+                entry.update({
+                    "request_type": "loglikelihood",
+                    "request_url": lm.base_url,
+                    "prompt_token_ids": response.prompt_token_ids,
+                    "finish_reason": None,
+                    "loglikelihood": response[0],
+                    "raw_response": raw_response,
+                    "max_tokens": 1,
+                    "declared_context_length": lm.max_length,
+                    "prompt_template": "native",
+                })
             # Only `RWKVLoglikelihoodResponse` (the avg@k generative
             # multiple_choice path) sets `unparsed`/`parsed_answer` at all --
             # a plain generate_until completion (`_RWKVCompletion`, a bare
             # `str`) never does, so `hasattr` (not `getattr(..., default)`)
             # is what actually tells the two cases apart.
-            if hasattr(response, "unparsed"):
+            elif hasattr(response, "unparsed"):
                 entry["parsed_answer"] = getattr(response, "parsed_answer", None)
                 entry["unparsed"] = bool(response.unparsed)
             evidence.append(entry)
@@ -1154,6 +1203,9 @@ def evaluate(
                     doc,
                     [req.filtered_resps[filter_key] for req in document_requests],
                 )
+                if (getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
+                        and task.OUTPUT_TYPE == "multiple_choice"):
+                    _record_rollout_stats(task, doc_id, 1, 0)
                 if log_samples:
                     target = task.doc_to_target(doc)
                     example = {
@@ -1186,6 +1238,12 @@ def evaluate(
                         "target_hash": hash_string(str(target)),
                     }
                     example.update(metrics)
+                    if (getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
+                            and task.OUTPUT_TYPE == "multiple_choice"):
+                        example["choices"] = task.doc_to_choice(doc)
+                        example["choice_target"] = target
+                        if task.multiple_input:
+                            example["choice_target"] = task.doc_to_text(doc)
                     acc["logged_samples"].append(example)
                 for metric, value in metrics.items():
                     if isinstance(value, _RepeatedMetricValues):

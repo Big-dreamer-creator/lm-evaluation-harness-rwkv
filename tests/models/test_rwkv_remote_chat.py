@@ -16,6 +16,13 @@ def _build(**kwargs):
     return RWKV7RemoteChat(**kwargs)
 
 
+def test_no_think_chat_rejects_generative_likelihood(monkeypatch):
+    model = _build(rwkv_generation_prompt="no_think")
+    monkeypatch.setattr(model, "generate_until", lambda *a, **k: pytest.fail("NoCoT must not generate"))
+    with pytest.raises(NotImplementedError, match="native loglikelihood on /v1/completions"):
+        model.loglikelihood([])
+
+
 
 
 

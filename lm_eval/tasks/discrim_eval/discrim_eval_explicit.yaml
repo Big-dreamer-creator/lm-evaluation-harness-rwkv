@@ -44,3 +44,8 @@ metric_list:
     higher_is_better: false
 metadata:
   version: 3.0
+  rwkv_no_think:
+    output_type: multiple_choice
+    doc_to_choice: ["yes", "Yes", "no", "No"]
+    generation_kwargs: null
+    filter_list: null

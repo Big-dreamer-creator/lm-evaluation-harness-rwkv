@@ -278,6 +278,13 @@ def test_rwkv7_http_parse_generations(monkeypatch):
     assert model.prefix_token_id == 0
 
 
+def test_rwkv7_http_no_think_rejects_generative_likelihood(monkeypatch):
+    model, _ = _build_rwkv7_http(monkeypatch, rwkv_generation_prompt="no_think")
+    monkeypatch.setattr(model, "generate_until", lambda *a, **k: pytest.fail("NoCoT must not generate"))
+    with pytest.raises(NotImplementedError, match="native echo prompt logprobs"):
+        model.loglikelihood([])
+
+
 def test_rwkv7_http_loglikelihood_groups_by_doc_and_scores_argmax(monkeypatch):
     model, _ = _build_rwkv7_http(monkeypatch)
 

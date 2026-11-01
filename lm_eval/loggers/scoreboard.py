@@ -214,6 +214,48 @@ def _extracted_answer(row: dict[str, Any]) -> str | None:
 def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str, bool]:
     evidence = row.get("response_evidence") or []
     first_evidence = evidence[0] if evidence else {}
+    if first_evidence.get("request_type") == "loglikelihood":
+        # Use native candidates and filtered likelihoods, exactly as the task
+        # does. The prompt below is captured from the selected HTTP input.
+        choices = row.get("choices") or []
+        responses = row.get("filtered_resps") or []
+        if not choices or len(responses) not in (len(choices), 2 * len(choices)):
+            raise ScoreboardError("Native multiple_choice detail lacks candidate scores")
+        scores = [float(response[0]) for response in responses]
+        if metric_name == "acc_mutual_info":
+            if len(scores) != 2 * len(choices):
+                raise ScoreboardError("Native mutual information lacks unconditional scores")
+            scores = [value - baseline for value, baseline in
+                      zip(scores[:len(choices)], scores[len(choices):], strict=True)]
+        else:
+            scores = scores[:len(choices)]
+        if metric_name in {"acc_norm", "acc_bytes"}:
+            scores = [score / len(choice.encode("utf-8") if metric_name == "acc_bytes" else choice)
+                      for score, choice in zip(scores, choices, strict=True)]
+        index = max(range(len(choices)), key=scores.__getitem__)
+        repeats = len(row["resps"][index])
+        selected = evidence[index * repeats]
+        if (selected.get("request_type") != "loglikelihood"
+                or not selected.get("prompt") or not selected.get("prompt_token_ids")
+                or not str(selected.get("request_url", "")).endswith("/v1/completions")):
+            raise ScoreboardError("Native multiple_choice detail lacks actual /v1/completions input evidence")
+        target = row.get("choice_target", row.get("target"))
+        ground_truth = (
+            _text(choices[target]) if isinstance(target, int) and 0 <= target < len(choices)
+            else _text([choices[value] for value in target]) if isinstance(target, list)
+            else _text(target)
+        )
+        score = row.get(metric_name)
+        outcome = "passed" if score == 1 or not isinstance(score, (int, float)) else "wrong"
+        return {
+            "messages": [
+                {"role": "user", "content": selected["prompt"]},
+                {"role": "assistant", "content": selected["text"]},
+            ],
+            "answer": _text(choices[index]),
+            "ground_truth": ground_truth,
+            "is_passed": outcome == "passed",
+        }, outcome, False
     raw_completion = _text(first_evidence.get("text") or row["resps"])
     score = row.get(metric_name)
     scalar_score = (
@@ -331,6 +373,7 @@ def _details(
     metric_name: str,
     uploaded_counts: dict[str, int],
     filter_key: str | None = None,
+    native_likelihood: bool = False,
 ) -> _SampleEvidence:
     """Read one leaf's per-sample details, capped at `MAX_SAMPLES_PER_OUTCOME`.
 
@@ -357,6 +400,10 @@ def _details(
             row = json.loads(line)
             if filter_key is not None and row.get("filter", filter_key) != filter_key:
                 continue
+            if native_likelihood:
+                evidence = row.get("response_evidence") or []
+                if not evidence or any(entry.get("request_type") != "loglikelihood" for entry in evidence):
+                    raise ScoreboardError("NoCoT multiple_choice requires actual native loglikelihood evidence")
             doc_id = row.get("doc_id")
             if doc_id is not None:
                 if doc_id in seen:
@@ -607,6 +654,15 @@ def _sampling_config(
     if run_config.get("evaluation_protocol"):
         sampling["seed_strategy"] = "base_plus_repeat_ord"
         sampling["evaluation_protocol"] = run_config["evaluation_protocol"]
+    if (run_config.get("evaluation_protocol") == "rwkv-loglikelihood-v1"
+            and task_config.get("output_type") == "multiple_choice"):
+        sampling.update({
+            "max_generated_tokens": 1,
+            "request_type": "loglikelihood",
+            "prompt_template": "native",
+            "seed_strategy": "fixed",
+            "declared_context_length": run_config.get("model_args", {}).get("max_length"),
+        })
     missing = [field for field in REQUIRED_SAMPLING_FIELDS if field not in sampling]
     if missing:
         raise ScoreboardError(
@@ -1081,9 +1137,25 @@ def build_score(
     policy = _task_policy(config, benchmark_name, benchmark_name)
 
     run_config = results["config"]
+    if config.cot_mode == "NoCoT" and run_config.get("model") in {"rwkv7-http", "rwkv7-remote", "rwkv7-remote-chat"}:
+        from lm_eval.api.checkpoint import LOGLIKELIHOOD_PROTOCOL_VERSION
+        if (any(doc["configs"][name].get("output_type") == "multiple_choice"
+                for name, doc in leaf_docs.items())
+                and run_config.get("evaluation_protocol") != LOGLIKELIHOOD_PROTOCOL_VERSION):
+            raise ScoreboardError("NoCoT multiple_choice publication requires actual native loglikelihood evidence")
     if run_config.get("model") in {"rwkv7-remote", "rwkv7-remote-chat"}:
-        from lm_eval.api.checkpoint import EVALUATION_PROTOCOL_VERSION
-        if run_config.get("evaluation_protocol") != EVALUATION_PROTOCOL_VERSION:
+        from lm_eval.api.checkpoint import (
+            EVALUATION_PROTOCOL_VERSION,
+            LOGLIKELIHOOD_PROTOCOL_VERSION,
+        )
+        model_args = run_config["model_args"]
+        expected_protocol = (
+            LOGLIKELIHOOD_PROTOCOL_VERSION
+            if run_config["model"] == "rwkv7-remote"
+            and (model_args.get("cot_mode") or model_args.get("rwkv_generation_prompt")) == "no_think"
+            else EVALUATION_PROTOCOL_VERSION
+        )
+        if run_config.get("evaluation_protocol") != expected_protocol:
             raise ScoreboardError("Historical generative artifacts require a versioned raw-answer replay before publication")
     model_args = run_config["model_args"]
     model_name = str(
@@ -1121,11 +1193,20 @@ def build_score(
             leaf_policy.get("outcome_metric") or leaf_primary.split(",", 1)[0]
         )
         samples_path = paths.get("samples")
+        native_likelihood = (
+            run_config.get("evaluation_protocol") == "rwkv-loglikelihood-v1"
+            and leaf_doc["configs"][leaf_name].get("output_type") == "multiple_choice"
+        )
+        if native_likelihood and not samples_path:
+            raise ScoreboardError("NoCoT multiple_choice requires native loglikelihood samples")
         evidence = (
-            _details(Path(samples_path), sample_metric, uploaded_counts, leaf_primary.partition(",")[2] or None)
+            _details(Path(samples_path), sample_metric, uploaded_counts, leaf_primary.partition(",")[2] or None,
+                     native_likelihood=native_likelihood)
             if samples_path
             else None
         )
+        if native_likelihood and evidence.docs == 0:
+            raise ScoreboardError("NoCoT multiple_choice has no native loglikelihood samples")
         upload = _leaf_upload(
             leaf_name, leaf_doc, leaf_policy, evidence, metric_hint
         )

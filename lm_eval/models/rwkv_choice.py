@@ -46,6 +46,11 @@ class RWKVLoglikelihoodResponse(tuple):
     change. The evidence lives in extra instance attributes, mirroring how
     ``_RWKVCompletion`` carries ``raw_response`` alongside its ``str``
     payload for ``generate_until``.
+
+    For native NoCoT, the tuple contains the real sequence loglikelihood and
+    token greedy agreement. ``request_type="loglikelihood"`` distinguishes
+    this path; ``text`` is the scored continuation, and ``prompt`` plus
+    ``prompt_token_ids`` retain the full echoed input used for scoring.
     """
 
     def __new__(
@@ -62,6 +67,8 @@ class RWKVLoglikelihoodResponse(tuple):
         unparsed: bool = False,
         parsed_answer: Optional[str] = None,
         rollouts: Optional[List[dict]] = None,
+        request_type: Optional[str] = None,
+        prompt_token_ids: Optional[List[int]] = None,
     ) -> "RWKVLoglikelihoodResponse":
         self = super().__new__(cls, (loglikelihood, is_greedy))
         self.prompt = prompt
@@ -106,6 +113,8 @@ class RWKVLoglikelihoodResponse(tuple):
         # Kept out of the (ll, is_greedy) tuple payload so every existing
         # consumer keeps unpacking/zipping it unchanged.
         self.rollouts = rollouts
+        self.request_type = request_type
+        self.prompt_token_ids = prompt_token_ids
         return self
 
 

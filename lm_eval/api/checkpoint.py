@@ -43,6 +43,7 @@ eval_logger = logging.getLogger(__name__)
 # request fingerprint drop them. Without that, "raise the concurrency and
 # resume" silently invalidates every stored answer and re-runs the benchmark.
 EVALUATION_PROTOCOL_VERSION = "rwkv-generative-v2"
+LOGLIKELIHOOD_PROTOCOL_VERSION = "rwkv-loglikelihood-v1"
 
 OPERATIONAL_MODEL_ARGS: tuple[str, ...] = (
     "num_concurrent",
@@ -175,6 +176,8 @@ def serialize_response(response: Any) -> str:
                 # ones re-generated after the resume -- see
                 # `RWKVLoglikelihoodResponse.rollouts`.
                 "rollouts": getattr(response, "rollouts", None),
+                "request_type": getattr(response, "request_type", None),
+                "prompt_token_ids": getattr(response, "prompt_token_ids", None),
             },
             default=str,
             ensure_ascii=False,
@@ -222,6 +225,8 @@ def deserialize_response(data: str) -> Any:
             unparsed=bool(payload.get("unparsed", False)),
             parsed_answer=payload.get("parsed_answer"),
             rollouts=payload.get("rollouts"),
+            request_type=payload.get("request_type"),
+            prompt_token_ids=payload.get("prompt_token_ids"),
         )
     if kind == "rwkv_completion":
         from lm_eval.models.openai_completions import _RWKVCompletion

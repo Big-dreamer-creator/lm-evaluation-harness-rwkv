@@ -613,8 +613,16 @@ class Run(SubCommand):
 
             fingerprint_payload = _asdict(cfg)
             if cfg.model in {"rwkv7-remote", "rwkv7-remote-chat"}:
-                from lm_eval.api.checkpoint import EVALUATION_PROTOCOL_VERSION
-                fingerprint_payload["evaluation_protocol"] = EVALUATION_PROTOCOL_VERSION
+                from lm_eval.api.checkpoint import (
+                    EVALUATION_PROTOCOL_VERSION,
+                    LOGLIKELIHOOD_PROTOCOL_VERSION,
+                )
+                fingerprint_payload["evaluation_protocol"] = (
+                    LOGLIKELIHOOD_PROTOCOL_VERSION
+                    if cfg.model == "rwkv7-remote"
+                    and (cfg.model_args.get("cot_mode") or cfg.model_args.get("rwkv_generation_prompt")) == "no_think"
+                    else EVALUATION_PROTOCOL_VERSION
+                )
             # HTTP request concurrency and the client-side timeout/retry policy
             # are scheduling/resource knobs. They do not change prompts,
             # sampling, or model identity, so changing them must remain

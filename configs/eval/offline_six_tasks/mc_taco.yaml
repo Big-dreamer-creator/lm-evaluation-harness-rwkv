@@ -25,3 +25,10 @@ metric_list:
   - metric: f1
 metadata:
   version: 2.0
+  rwkv_no_think:
+    output_type: multiple_choice
+    doc_to_choice: ["no", "yes"]
+    doc_to_target: label
+    process_results: null
+    generation_kwargs: null
+    filter_list: null

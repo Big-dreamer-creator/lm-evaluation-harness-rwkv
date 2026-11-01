@@ -123,6 +123,11 @@ class RWKV7RemoteChat(LocalChatCompletion):
         so every loglikelihood request is resolved by generating a lettered answer
         ``Instance.repeats`` times per doc and averaging correctness over them.
         """
+        if self.rwkv_generation_prompt == "no_think":
+            raise NotImplementedError(
+                "NoCoT multiple_choice requires native loglikelihood on /v1/completions; "
+                "use rwkv7-remote with the matching tokenizer, not rwkv7-remote-chat"
+            )
         results: List[Optional[Tuple[float, bool]]] = [None] * len(requests)
         groups: Dict[Any, List[int]] = defaultdict(list)
         for position, request in enumerate(requests):

@@ -432,6 +432,11 @@ class RWKV7HTTP(LocalCompletionsAPI):
         encode the parsed answer back into (loglik, is_greedy) pairs so the
         harness's existing argmax-based acc/acc_norm scoring is unaffected.
         """
+        if self.rwkv_generation_prompt == "no_think":
+            raise NotImplementedError(
+                "NoCoT multiple_choice requires native echo prompt logprobs on "
+                "/v1/completions; use rwkv7-remote with a server that supports them"
+            )
         results: List[Optional[Tuple[float, bool]]] = [None] * len(requests)
         groups: Dict[Any, List[int]] = defaultdict(list)
         for position, request in enumerate(requests):
