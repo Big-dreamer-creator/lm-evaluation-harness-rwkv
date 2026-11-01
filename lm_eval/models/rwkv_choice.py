@@ -2,7 +2,7 @@
 native echo/logprob support (or, for avg@k, that deliberately route
 ``multiple_choice`` scoring through generation to exercise real sampling).
 
-Extracted from the original ``RWKV7HTTP.loglikelihood``/``_resolve_choice``
+Extracted from the original RWKV HTTP loglikelihood/``_resolve_choice``
 implementation so ``RWKV7Remote`` can reuse the same lettered-choice prompt
 and answer-parsing logic for its avg@k mode.
 
@@ -24,8 +24,8 @@ class RWKVLoglikelihoodResponse(tuple):
     """A ``(loglikelihood, is_greedy)`` 2-tuple that also carries the real
     generation this score was derived from.
 
-    ``RWKV7Remote``/``RWKV7RemoteChat`` resolve ``loglikelihood`` requests by
-    generating a real answer (``generate_until``) rather than echo/logprobs,
+    ``RWKV7Remote`` resolves ``loglikelihood`` requests by generating a real
+    answer (``generate_until``) rather than echo/logprobs,
     so a genuine ``prompt`` (the ``build_choice_prompt()`` text actually
     sent), ``text`` (the chosen generation's own completion string), and
     ``raw_response``/``finish_reason``/``output_token_ids`` exist for every

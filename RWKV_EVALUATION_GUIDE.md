@@ -1,9 +1,12 @@
 # RWKV7 Evaluation Guide
 
-本仓库在 lm-evaluation-harness 中提供 `rwkv7-http` 后端。评估进程只通过
-HTTP 访问独立的 `vllm-rwkv` 服务，不导入推理引擎、CUDA 扩展或模型权重。
-因此同一套评估代码可用于 RWKV7 的 0.1B、0.4B、1.5B、2.9B、7.2B 和
-13.3B 权重，差异只体现在服务端权重、上下文长度和 served model 名称。
+本仓库在 lm-evaluation-harness 中提供 `rwkv7-remote` 后端。评估进程只通过
+HTTP 访问一个 vLLM 服务——可以是自建的 `vllm-rwkv`（本地起服务），也可以是
+托管地址（如 `https://api.rwkv.rs`）——不导入推理引擎、CUDA 扩展或模型权重。
+本地与远程只是同一个 backend 的 `base_url` 差异，不是两套评估代码。因此同一套
+评估代码可用于 RWKV7 的 0.1B、0.4B、1.5B、2.9B、7.2B 和 13.3B 权重，差异只
+体现在服务端权重、上下文长度、served model 名称和评估端 `base_url`/
+`tokenizer_name` 的配置。
 
 ## 1. 环境边界
 
@@ -107,37 +110,37 @@ uv run --no-sync --python .venv-rwkv/bin/python vllm serve \
   --max-model-len <context-length> \
   --max-num-seqs 4 \
   --max-num-batched-tokens <context-length> \
-  --gpu-memory-utilization 0.92 \
-  --enable-tokenizer-info-endpoint
+  --gpu-memory-utilization 0.92
 ```
 
-`--enable-tokenizer-info-endpoint` 是必需项。评估端通过 `/tokenizer_info`
-取得服务正在使用的官方模板，并通过 `/tokenize`、`/detokenize` 和
-`/v1/completions` 完成全部通信。若服务暴露到非本机网络，应使用访问控制，
-因为 tokenizer-info 接口会公开模板内容。
+评估端（`rwkv7-remote`）在本地用 `tokenizer_name` 指向一份官方 HF tokenizer
+目录或 repo id，客户端自行渲染 chat template 并编码 NoCoT 似然请求（见第 10.2
+节）；它不依赖服务端暴露任何 tokenizer 相关接口，通信只走标准的
+`/v1/completions`。
 
 启动后进行协议检查：
 
 ```bash
 curl -fsS http://127.0.0.1:8000/health
 curl -fsS http://127.0.0.1:8000/v1/models
-curl -fsS http://127.0.0.1:8000/tokenizer_info
 ```
 
 `/v1/models` 返回的 ID 必须与后续配置中的 `model_name` 完全相同。
 
 ## 6. 创建评估配置
 
-`configs/eval/lm_eval.toml` 是已经验证的 1.5B preset，采用与 Helicopter
-LightEval 相同的版本化、严格字段配置方式。评估其他权重时，复制其结构并修改
-以下配置；不要复用旧权重的 model 名、上下文长度或结果目录。
+[configs/eval/rwkv7_g1j_1.5b_remote_race_scoreboard_example.toml](configs/eval/rwkv7_g1j_1.5b_remote_race_scoreboard_example.toml)
+是已经验证的示例配置，采用与 Helicopter LightEval 相同的版本化、严格字段
+配置方式。评估其他权重时，复制其结构并修改以下配置；不要复用旧权重的 model
+名、上下文长度或结果目录。
 
 ```toml
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 
 model_name = "<model-name>"
 base_url = "http://127.0.0.1:8000/v1/completions"
+tokenizer_name = "<与该权重词表一致的官方 tokenizer 路径或 repo id>"
 benchmarks = [
   "<first-benchmark-name>",
   "<second-benchmark-name>",
@@ -145,9 +148,8 @@ benchmarks = [
 output_dir = "results/<model-name>"
 
 max_length = <context-length>
-batch_size = 1
 max_num_seqs = <served --max-num-seqs>
-device = "cpu"
+max_gen_toks = 8192
 
 apply_chat_template = true
 fewshot_as_multiturn = true
@@ -159,6 +161,10 @@ prompt_template = "assistant"
 generation_prompt = "fake_think"
 wkv_mode = "fp32io16"
 ```
+
+`base_url` 既可以指向自建的本地 `vllm-rwkv`（如上例的 `127.0.0.1:8000`），
+也可以指向托管地址（如 `https://api.rwkv.rs`）——两者都是标准 vLLM
+`/v1/completions` 协议，只是部署位置不同，backend 本身不变。
 
 加载器会把这些字段转换为 lm-eval 的 `model`、`tasks`、`model_args`、
 `output_path` 和 `metadata`。`benchmarks` 数组只写普通 benchmark 名称，
@@ -239,7 +245,7 @@ uv run --no-sync python -m lm_eval validate --tasks <task-or-group>
 
 ```bash
 uv run --no-sync python -m lm_eval run \
-  --config configs/eval/lm_eval.toml \
+  --config configs/eval/rwkv7_g1j_1.5b_remote_race_scoreboard_example.toml \
   --limit 10
 ```
 
@@ -247,7 +253,7 @@ uv run --no-sync python -m lm_eval run \
 
 ```bash
 uv run --no-sync python -m lm_eval run \
-  --config configs/eval/lm_eval.toml
+  --config configs/eval/rwkv7_g1j_1.5b_remote_race_scoreboard_example.toml
 ```
 
 如需使用响应缓存，在 TOML 中设置 `use_cache`。lm-eval 默认不复用随机采样结果；
@@ -281,11 +287,11 @@ Linux 本地文件系统；WSL 下将 SQLite 缓存放在 `/mnt/c` 或 `/mnt/e` 
 4. 同参数量 Qwen3.5 使用各自正确后端和同一 benchmark 协议作为独立基线。
 5. 结果目录不与其他权重、smoke run 或旧协议结果混用。
 
-## 10. 远程 HTTP 后端（`rwkv7-remote`）
+## 10. `rwkv7-remote` 后端细节
 
-除了自建 `vllm-rwkv` 的 `rwkv7-http` 后端外，仓库还提供 `rwkv7-remote`，用于
-直接对接标准 OpenAI 格式的托管 RWKV 服务（例如 `https://api.rwkv.rs`）。两者
-互不影响：`rwkv7-remote` 是独立新增的 backend，不改动 `rwkv7-http` 的行为。
+`rwkv7-remote` 是本仓库唯一的 RWKV HTTP 后端，直接对接标准 OpenAI 格式的
+vLLM 服务——无论是第 1-9 节自建的本地 `vllm-rwkv`，还是托管地址（例如
+`https://api.rwkv.rs`），都是同一个 backend，只有 `base_url` 不同。
 
 `rwkv7-remote` 使用 `/v1/completions`。NoCoT 选择题走原生
 `multiple_choice → construct_requests() → loglikelihood`，以
@@ -293,9 +299,7 @@ Linux 本地文件系统；WSL 下将 SQLite 缓存放在 `/mnt/c` 或 `/mnt/e` 
 多 Token 候选累加全部候选 Token 的 logprob，排除额外生成的探测 Token。
 缺失、无效或不完整的 prompt logprobs 会报错；禁止生成式回退或伪造概率。
 此路径不使用 CoT 模板或 avg@k 生成补丁，候选、标准答案、任务指标及聚合
-仍由原生任务负责。聊天端点和不支持 echo 的 `rwkv7-http` 后端明确拒绝
-NoCoT 似然任务；应使用支持 prompt logprobs 的 completions 服务。
-CoT / FakeCoT 的历史生成式选择题路径保持独立。
+仍由原生任务负责。CoT / FakeCoT 的历史生成式选择题路径保持独立。
 
 ### 10.1 仅生成类任务（`generate_until`，如 DROP）
 
@@ -372,12 +376,10 @@ wkv_mode = "fp32io16"
   `tokenized_requests=True` 方式发送——本地把完整生成提示词编码成 token-id
   数组，直接作为 `prompt` 发给服务端。服务端不会重新分词；若词表不一致，
   输入语义和生成成绩都会失真。
-  正式测评前应确认这份 tokenizer 与该权重在 `rwkv7-http`/`vllm-rwkv` 侧已经
-  验证过的官方 tokenizer 资产是同一个。
+  正式测评前应确认这份 tokenizer 与该权重在推理端（无论是本地 `vllm-rwkv`
+  还是托管服务）已经验证过的官方 tokenizer 资产是同一个。
 - `trust_remote_code` 仅在设置了 `tokenizer_name` 时才允许出现，否则报错
-  `trust_remote_code requires tokenizer_name to be set`；在 `rwkv7-http` 上
-  设置 `tokenizer_name`（无论是否带 `trust_remote_code`）会报错
-  `tokenizer_name is only supported for backend = rwkv7-remote`。
+  `trust_remote_code requires tokenizer_name to be set`。
 - 设置 `tokenizer_name` 后 `model_args` 会多出 `tokenizer`（以及可选的
   `trust_remote_code`）两项。
 - 若运行环境访问 HF Hub 需要代理，`AutoTokenizer.from_pretrained` 会按
@@ -396,9 +398,8 @@ wkv_mode = "fp32io16"
   绝不要把密钥写进 TOML——`RWKV_API_KEY` 只在进程环境中读取，不会进入
   `model_args` 或结果文件的 metadata。未设置该变量时，`rwkv7-remote` 会在
   构造模型时直接报错，而不是发送空 Bearer token。
-- `rwkv7-remote` 使用 `/v1/completions`；`rwkv7-remote-chat` 使用
-  `/v1/chat/completions` 并发送 `chat_template_kwargs`；本仓库未使用
-  `/v1/responses`。
+- `rwkv7-remote` 只使用 `/v1/completions`；本仓库未使用 `/v1/chat/completions`
+  或 `/v1/responses`。
 
 ### 10.4 并发与断点续跑（crash-safe resume）
 
@@ -479,9 +480,6 @@ enabled = true
 
 ## 11. 常见错误
 
-- `rwkv7-http requires tokenizer_backend=remote`：不要给评估端配置本地 tokenizer。
-- `/tokenizer_info` 缺失：服务启动时补上
-  `--enable-tokenizer-info-endpoint`。
 - 模型 ID 不匹配：让 TOML 的 `model_name` 与 `--served-model-name` 完全一致。
 - 请求超过上下文：让服务端 `--max-model-len` 与评估端 `max_length` 匹配，
   并检查 benchmark 的输入与输出 token 上限。
@@ -492,9 +490,8 @@ enabled = true
 - `Tokenizer is required for loglikelihood tasks to compute context lengths.`：
   `rwkv7-remote` 跑 `race` 等 loglikelihood/多选任务时必须设置
   `tokenizer_name`，见第 10.2 节。
-- `tokenizer_name is only supported for backend = rwkv7-remote` /
-  `trust_remote_code requires tokenizer_name to be set`：
-  `tokenizer_name`/`trust_remote_code` 的字段依赖关系配置错误，见第 10.2 节。
+- `trust_remote_code requires tokenizer_name to be set`：
+  `trust_remote_code` 只能在设置了 `tokenizer_name` 时出现，见第 10.2 节。
 - loglikelihood 分数明显不合理但没有报错：优先怀疑 `tokenizer_name` 与远端
   权重词表不一致（代码不会校验这一点），见第 10.2 节。
 - `checkpoint (or --resume) and --use_cache cannot be combined`：
@@ -597,8 +594,8 @@ NoCoT 发布拒绝旧生成协议、缺失 HTTP 输入证据或空明细文件�
 
 ## 13. RWKV 本地 Coding 测评
 
-`lm-eval coding` 是 RWKV 专属入口：`rwkv7-remote` 或
-`rwkv7-remote-chat` 通过 HTTP 生成 Python，本机 Docker 执行本地题库中的测试。
+`lm-eval coding` 是 RWKV 专属入口：`rwkv7-remote` 通过 HTTP 生成 Python，
+本机 Docker 执行本地题库中的测试。
 它与普通任务注册表分开，不下载或复制其他框架已有的 benchmark，不导入
 Helicopter/EvalScope 的运行时代码，也不自动上传成绩。
 

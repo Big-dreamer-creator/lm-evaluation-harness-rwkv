@@ -154,17 +154,12 @@ RWKV_PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
 RWKV_GENERATION_PROMPTS = {"no_think", "fake_think", "open_think"}
 RWKV_WKV_MODES = {"fp16", "fp32io16"}
 RWKV_BACKENDS = {
-    "rwkv7-http",
     "rwkv7-remote",
-    "rwkv7-remote-chat",
 }
 # The two campaign-container keys are consumed by `_expand_models` before a
 # model entry is validated, so a `[[models]]` entry may carry every field a
 # single-model config may carry except the containers themselves.
 VERSIONED_MODEL_ENTRY_FIELDS = VERSIONED_CONFIG_FIELDS - {"models", "model_overrides"}
-# rwkv7-remote-chat renders no chat template locally (the server does, via
-# chat_template_kwargs) so it never needs a tokenizer, same as rwkv7-http.
-RWKV_BACKENDS_WITHOUT_TOKENIZER = {"rwkv7-http", "rwkv7-remote-chat"}
 
 
 @dataclass(slots=True)
@@ -645,10 +640,6 @@ class EvaluatorConfig:
         tokenizer_name = config.get("tokenizer_name")
         if tokenizer_name is not None:
             tokenizer_name = cls._non_empty_string(tokenizer_name, "tokenizer_name")
-            if backend in RWKV_BACKENDS_WITHOUT_TOKENIZER:
-                raise ValueError(
-                    "tokenizer_name is only supported for backend = rwkv7-remote"
-                )
 
         model_name = cls._non_empty_string(config["model_name"], "model_name")
         weight_revision = config.get("weight_revision")
@@ -656,10 +647,7 @@ class EvaluatorConfig:
             weight_revision = cls._non_empty_string(
                 weight_revision, "weight_revision"
             )
-        completion_path = {
-            "rwkv7-remote-chat": "/v1/chat/completions",
-        }.get(backend, "/v1/completions")
-        base_url = cls._completion_url(config["base_url"], completion_path)
+        base_url = cls._completion_url(config["base_url"], "/v1/completions")
         benchmarks = cls._string_list(config["benchmarks"], "benchmarks")
         benchmark_config = cls._non_empty_string(
             config.get("benchmark_config", str(DEFAULT_BENCHMARK_CONFIG)),
@@ -774,30 +762,18 @@ class EvaluatorConfig:
             if checkpoint_value.get("dir") is not None:
                 cls._non_empty_string(checkpoint_value["dir"], "checkpoint.dir")
 
-        if backend in ("rwkv7-http", "rwkv7-remote-chat"):
-            model_args = {
-                "model": model_name,
-                "rwkv_prompt_template": prompt_template,
-                "rwkv_generation_prompt": generation_prompt,
-                # Derived, not user-facing: see the max_num_seqs comment above.
-                "num_concurrent": num_concurrent,
-                "max_length": max_length,
-            }
-        else:
-            model_args = {
-                "model": model_name,
-                "num_concurrent": num_concurrent,
-                "max_length": max_length,
-                "rwkv_prompt_template": prompt_template,
-                "rwkv_generation_prompt": generation_prompt,
-            }
-            if tokenizer_name is not None:
-                model_args["tokenizer"] = tokenizer_name
+        model_args = {
+            "model": model_name,
+            "num_concurrent": num_concurrent,
+            "max_length": max_length,
+            "rwkv_prompt_template": prompt_template,
+            "rwkv_generation_prompt": generation_prompt,
+        }
+        if tokenizer_name is not None:
+            model_args["tokenizer"] = tokenizer_name
         model_args["base_url"] = base_url
-        if backend in {"rwkv7-remote", "rwkv7-remote-chat"}:
-            model_args["seed"] = seed[2]
-        if backend in {"rwkv7-remote", "rwkv7-remote-chat"}:
-            model_args["max_gen_toks"] = cls._positive_int(config.get("max_gen_toks", 8192), "max_gen_toks")
+        model_args["seed"] = seed[2]
+        model_args["max_gen_toks"] = cls._positive_int(config.get("max_gen_toks", 8192), "max_gen_toks")
         # HTTP robustness knobs. Like max_num_seqs they only change how
         # requests are retried, not prompts, sampling or model identity, so
         # they are excluded from the checkpoint fingerprint (see

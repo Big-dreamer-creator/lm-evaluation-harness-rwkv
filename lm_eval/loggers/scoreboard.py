@@ -114,7 +114,7 @@ def _messages(
     ``response_evidence[0]["prompt"]``: the genuine prompt captured at the
     moment the request was actually issued. It takes priority over anything
     reconstructed from ``arguments`` because RWKV's avg@k generative
-    ``multiple_choice`` path (``rwkv_remote.py``/``rwkv_remote_chat.py``)
+    ``multiple_choice`` path (``rwkv_remote.py``)
     fills in the lettered `A./B./C.` options -- and, for the completions
     backend, chat-template markup -- *after* the original loglikelihood
     request's ``arguments`` was already captured, so ``arguments`` alone is
@@ -1137,13 +1137,13 @@ def build_score(
     policy = _task_policy(config, benchmark_name, benchmark_name)
 
     run_config = results["config"]
-    if config.cot_mode == "NoCoT" and run_config.get("model") in {"rwkv7-http", "rwkv7-remote", "rwkv7-remote-chat"}:
+    if config.cot_mode == "NoCoT" and run_config.get("model") == "rwkv7-remote":
         from lm_eval.api.checkpoint import LOGLIKELIHOOD_PROTOCOL_VERSION
         if (any(doc["configs"][name].get("output_type") == "multiple_choice"
                 for name, doc in leaf_docs.items())
                 and run_config.get("evaluation_protocol") != LOGLIKELIHOOD_PROTOCOL_VERSION):
             raise ScoreboardError("NoCoT multiple_choice publication requires actual native loglikelihood evidence")
-    if run_config.get("model") in {"rwkv7-remote", "rwkv7-remote-chat"}:
+    if run_config.get("model") == "rwkv7-remote":
         from lm_eval.api.checkpoint import (
             EVALUATION_PROTOCOL_VERSION,
             LOGLIKELIHOOD_PROTOCOL_VERSION,
@@ -1151,8 +1151,7 @@ def build_score(
         model_args = run_config["model_args"]
         expected_protocol = (
             LOGLIKELIHOOD_PROTOCOL_VERSION
-            if run_config["model"] == "rwkv7-remote"
-            and (model_args.get("cot_mode") or model_args.get("rwkv_generation_prompt")) == "no_think"
+            if (model_args.get("cot_mode") or model_args.get("rwkv_generation_prompt")) == "no_think"
             else EVALUATION_PROTOCOL_VERSION
         )
         if run_config.get("evaluation_protocol") != expected_protocol:

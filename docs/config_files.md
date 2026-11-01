@@ -29,25 +29,25 @@ options.
 
 ### RWKV7 complete run
 
-Start the independent `vllm-rwkv` HTTP service from its own repository and uv environment:
+`rwkv7-remote` is the only RWKV HTTP backend. It speaks standard OpenAI-style
+`/v1/completions` to any vLLM deployment — a self-hosted `vllm-rwkv` instance
+or a hosted endpoint (e.g. `https://api.rwkv.rs`) are the same backend, differing
+only in `base_url`. To self-host, start the independent `vllm-rwkv` HTTP
+service from its own repository and uv environment:
 
 ```bash
 cd /path/to/vllm-rwkv
 # Start the repository's RWKV7 server launcher here.
 ```
 
-Configure the launcher to pass `--enable-tokenizer-info-endpoint`. The service
-must expose `/tokenizer_info` so lm-eval receives the same official RWKV chat
-template used by the inference backend.
-
-`configs/eval/lm_eval.toml` is the versioned, validated preset for
-`rwkv7-g1i-1.5b-20260805-ctx16384`. Run it directly with:
+[configs/eval/rwkv7_g1j_1.5b_remote_race_scoreboard_example.toml](../configs/eval/rwkv7_g1j_1.5b_remote_race_scoreboard_example.toml)
+is a validated example preset. Run it directly with:
 
 ```bash
-uv run --no-sync python -m lm_eval run -C configs/eval/lm_eval.toml
+uv run --no-sync python -m lm_eval run -C configs/eval/rwkv7_g1j_1.5b_remote_race_scoreboard_example.toml
 ```
 
-The `rwkv7-http` backend itself accepts any RWKV7 served model name. For another
+The `rwkv7-remote` backend itself accepts any RWKV7 served model name. For another
 checkpoint size or revision, copy the preset and change `model_name`,
 `max_length`, `benchmarks`, and `output_dir`. The loader derives lm-eval's
 `model_args` and result metadata from this public schema, removing duplicated
@@ -57,18 +57,12 @@ exact model version, endpoint, benchmark selectors, served endpoint capacity
 (`max_num_seqs`), RWKV profile, and result location. The `benchmarks` array
 keeps its configured order as the stable tie-break, but benchmarks execute one
 at a time in ascending pending-rollout order (see
-`lm_eval/api/benchmark_scheduler.py`). For `rwkv7-http`, these ordinary names are resolved through the
-model-specific task adapter declared in the adapted task YAML; internal RWKV
-task names never appear in this file. Each benchmark YAML owns its prompt,
-answer extraction, metrics, stop conditions, and `max_gen_toks`. See the
+`lm_eval/api/benchmark_scheduler.py`). These ordinary names resolve directly as
+native lm-eval-harness task/group/tag names via `TaskManager`, with no adapter
+indirection. Each benchmark YAML owns its prompt, answer extraction, metrics,
+stop conditions, and `max_gen_toks`. See the
 [RWKV evaluation guide](../RWKV_EVALUATION_GUIDE.md) for the complete server and
 evaluation workflow. The deprecated `temp/` launch scripts are not used.
-
-The preset currently exposes 15 benchmark families in configured run order:
-RACE, DROP, XQuAD, BABILong, InfiniteBench, RULER, WMDP, CRUXEval,
-Inverse Scaling Prize, Model-Written Evals, HumanEval-Infilling, MuTual,
-MC-TACO, Discrim-Eval, and Winogender. PALOMA remains excluded because dataset
-access is still blocked; it must not be represented as a completed benchmark.
 
 ## Config Schema
 
@@ -80,10 +74,10 @@ arguments. Unknown fields fail before model or dataset initialization.
 | Versioned RWKV field | Type | Default | Description |
 |----------------------|------|---------|-------------|
 | `schema_version` | int | required | Must be `1` |
-| `backend` | string | required | `rwkv7-http`, `rwkv7-remote`, or `rwkv7-remote-chat` |
+| `backend` | string | required | `rwkv7-remote` |
 | `model_name` | string | required | Model id sent to the inference service as the literal API `model=` value (top level for a single-model file, per `[[models]]` entry for a campaign); normally the short serving alias, and may carry the full release stem for older configs |
 | `weight_revision` | string | unset | Full served weight filename stem, including the release date and `ctx<N>` (e.g. `rwkv7-g1j-1.5b-20260831-ctx16384`); recorded in run metadata and used by scoreboard publication to derive `ctx_len` without putting it in the API-facing `model_name` |
-| `base_url` | string | required | HTTP(S) endpoint: `/v1/completions` or `/v1/chat/completions`, according to `backend` |
+| `base_url` | string | required | HTTP(S) endpoint, always `/v1/completions` |
 | `benchmarks` | list | required | Unique public benchmark names; configured order is the stable tie-break for the runtime ascending-pending-rollout order |
 | `benchmark_config` | string | `configs/benchmarks.toml` | Explicit top-level field-to-selector mapping; relative paths are resolved from the run config |
 | `output_dir` | string | required | Result directory (top level for a single-model file, per `[[models]]` entry for a campaign) |
@@ -153,7 +147,7 @@ used by the server and keep `apply_chat_template = true`. The native
 open-thinking prefix ends in `<think` intentionally. A completed `</think>`
 is required before final-answer grading; raw responses remain in the artifacts.
 Without a tokenizer, this backend only passes raw text through and cannot apply
-a chat template. `rwkv7-remote-chat` delegates template rendering to the server.
+a chat template.
 
 RWKV sampling presets are sent as top-level vLLM fields. The custom server must
 support `penalty_decay` and its required sampler. Each document's repeats use
@@ -336,7 +330,7 @@ dtype = "float32"
 Small or smoke runs can include a formal config and override only their scope:
 
 ```toml
-include = "lm_eval.toml"
+include = "base.toml"
 benchmarks = ["race"]
 limit = 10
 output_dir = "results/smoke/race"

@@ -554,7 +554,7 @@ class TestTaskManagerIntegration:
         assert "arc_challenge" in matches
 
     def test_rwkv_public_benchmark_names_resolve_natively(self, shared_task_manager):
-        """The public names in configs/eval/lm_eval.toml resolve directly
+        """The public names used by RWKV evaluation presets resolve directly
         as native task/group/tag names, with no adapter indirection."""
         public_names = [
             "race",

@@ -94,11 +94,11 @@ class CodingConfig:
         }
         if unknown := coding.keys() - allowed:
             raise ValueError("Unknown coding fields: " + ", ".join(sorted(unknown)))
-        if raw.get("backend") not in {"rwkv7-remote", "rwkv7-remote-chat"}:
-            raise ValueError("Local coding requires rwkv7-remote or rwkv7-remote-chat")
+        if raw.get("backend") != "rwkv7-remote":
+            raise ValueError("Local coding requires rwkv7-remote")
         if raw.get("benchmarks") != [TASK]:
             raise ValueError(f"coding requires benchmarks = ['{TASK}']")
-        if raw.get("backend") == "rwkv7-remote" and not raw.get("tokenizer_name"):
+        if not raw.get("tokenizer_name"):
             raise ValueError("rwkv7-remote coding requires the official tokenizer_name")
         if raw.get("apply_chat_template", True) is not True:
             raise ValueError("RWKV coding requires apply_chat_template = true")
@@ -572,15 +572,9 @@ def _fresh_output(path: Path):
 
 
 def _model(config):
-    if config.model["model"] == "rwkv7-remote":
-        from lm_eval.models.rwkv_remote import RWKV7Remote
+    from lm_eval.models.rwkv_remote import RWKV7Remote
 
-        cls = RWKV7Remote
-    else:
-        from lm_eval.models.rwkv_remote_chat import RWKV7RemoteChat
-
-        cls = RWKV7RemoteChat
-    return cls(**config.model["model_args"])
+    return RWKV7Remote(**config.model["model_args"])
 
 
 def generate(config, problems, output, *, resume=False):

@@ -1,6 +1,6 @@
 """Live network diagnostics for the hosted RWKV service (e.g. api.rwkv.rs).
 
-Unlike test_rwkv_remote.py / test_rwkv_remote_chat.py (pure unit tests, no
+Unlike test_rwkv_remote.py (pure unit tests, no
 network access), everything here makes real HTTP requests. It is opt-in and
 skipped entirely unless RWKV_API_KEY is set in the environment, so it never
 runs in normal CI. Point it at a different deployment with RWKV_LIVE_BASE_URL
@@ -11,16 +11,13 @@ Usage:
         pytest tests/models/test_rwkv_remote_live.py -v
 """
 
-import json
 import os
 
 import pytest
 import requests
 
 from lm_eval.api.instance import Instance
-from lm_eval.models.api_models import JsonChatStr
 from lm_eval.models.rwkv_remote import RWKV7Remote
-from lm_eval.models.rwkv_remote_chat import RWKV7RemoteChat
 
 
 API_KEY = os.environ.get("RWKV_API_KEY")
@@ -124,20 +121,3 @@ def test_rwkv7_remote_generate_until_via_real_network():
     assert str(generated).strip()
 
 
-def test_rwkv7_remote_chat_generate_until_via_real_network():
-    model = RWKV7RemoteChat(model=MODEL, num_concurrent=1)
-    # LocalChatCompletion's _create_payload requires a [{"role", "content"}, ...]
-    # message list; generate_until never wraps a bare string into one (only
-    # apply_chat_template / _resolve_choices do), so the context must already
-    # be a JsonChatStr here.
-    chat_prompt = JsonChatStr(
-        json.dumps([{"role": "user", "content": "Say hello in one word."}])
-    )
-    instance = Instance(
-        request_type="generate_until",
-        doc={},
-        arguments=(chat_prompt, {"until": [], "max_gen_toks": 32}),
-        idx=0,
-    )
-    (generated,) = model.generate_until([instance])
-    assert str(generated).strip()

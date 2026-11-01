@@ -14,12 +14,12 @@
 # dry_run 改成 false，base_url 换成上面两个真实地址之一，并提前 export
 # SCOREBOARD_PUBLICATION_TOKEN。
 schema_version = 1  # 本仓库的带版本配置 schema，目前只有 1 合法。
-backend = "rwkv7-remote"  # 可选：rwkv7-http / rwkv7-remote / rwkv7-remote-chat。"-remote" 走原始 /v1/completions 接口，"-remote-chat" 走 /v1/chat/completions，"-http" 由服务端完成分词。
+backend = "rwkv7-remote"  # 目前仅支持 rwkv7-remote，走原始 /v1/completions 接口，客户端本地分词并渲染官方 Prompt Template。
 
 model_name = "rwkv7-g1j-1.5b"  # lm-eval-rwkv 的模型 id；同时是发给推理端 /v1/completions 的字面 model= 参数，必须是服务端认得的短别名，不能带版本后缀。
 weight_revision = "rwkv7-g1j-1.5b-20260831-ctx16384"  # 完整权重文件名主干，仅供 Scoreboard 解析 ctx_len（arch/data/param 仍取自 model_name；见 lm_eval/loggers/scoreboard.py 的 _weight_ctx_len）；不会被发往推理端。
 base_url = "https://api.rwkv.rs/v1/completions"  # 上面 backend 对应的推理端地址；本次运行的全部请求都发往这个 endpoint。
-tokenizer_name = "/home/link/weight"  # 本地 HF tokenizer 目录；仅当 backend = "rwkv7-remote" 时允许（其它 backend 由服务端分词，不接受此字段）。
+tokenizer_name = "/home/link/weight"  # 本地 HF tokenizer 目录，用于客户端渲染官方 Prompt Template 并编码 NoCoT 似然请求。
 trust_remote_code = true  # tokenizer_name 指向带自定义（非上游）代码的 tokenizer 时必须为 true；要求 tokenizer_name 已设置。
 benchmarks = [
   "race",  # lm_eval/tasks/ 下注册的 task 或 group 名称。

@@ -409,8 +409,8 @@ class RWKV7Remote(LocalCompletionsAPI):
             if valid_indices:
                 majority_index = Counter(valid_indices).most_common(1)[0][0]
             else:
-                # See RWKV7RemoteChat.loglikelihood: no sample parsed means
-                # "no answer given", not "the model chose option A" --
+                # No sample parsed means "no answer given", not "the model
+                # chose option A" --
                 # `majority_index` stays 0 only as a placeholder index, and
                 # every outcome below is tagged `unparsed=True` so
                 # task-specific `process_results` can reject it instead of
@@ -573,7 +573,7 @@ class RWKV7Remote(LocalCompletionsAPI):
         **kwargs,
     ) -> str:
         if self._chat_template_source is None:
-            raise ValueError("rwkv7-remote needs a tokenizer to render its chat template; use rwkv7-remote-chat for server-side templating")
+            raise ValueError("rwkv7-remote needs a tokenizer to render its chat template; set tokenizer_name")
 
         from lm_eval.utils import env
 

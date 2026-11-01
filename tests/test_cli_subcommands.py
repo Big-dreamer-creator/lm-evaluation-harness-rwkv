@@ -1,6 +1,5 @@
 import argparse
 import sys
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -914,30 +913,6 @@ class TestMergeDictAction:
 class TestEvaluatorConfigPrecedence:
     """Test EvaluatorConfig merging precedence: CLI > file > defaults."""
 
-    def test_rwkv_preset_lists_all_validated_benchmarks(self):
-        from lm_eval.config.evaluate_config import EvaluatorConfig
-
-        config_path = Path(__file__).parents[1] / "configs/eval/lm_eval.toml"
-        config = EvaluatorConfig.from_config(config_path)
-
-        assert config.tasks == [
-            "race",
-            "drop",
-            "xquad",
-            "babilong",
-            "infinitebench",
-            "ruler",
-            "wmdp",
-            "cruxeval",
-            "inverse_scaling_prize",
-            "model_written_evals",
-            "humaneval_infilling",
-            "mutual",
-            "mc_taco",
-            "discrim_eval",
-            "winogender",
-        ]
-
     def test_toml_config_and_relative_include(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
 
@@ -945,9 +920,9 @@ class TestEvaluatorConfigPrecedence:
         base.write_text(
             """
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race", "drop"]
 output_dir = "results/formal"
 max_length = 16384
@@ -976,17 +951,19 @@ generation_prompt = "open_think"
 
         cfg = EvaluatorConfig.from_config(smoke)
 
-        assert cfg.model == "rwkv7-http"
+        assert cfg.model == "rwkv7-remote"
         assert cfg.tasks == ["race"]
         assert cfg.limit == 2
         assert cfg.output_path == "results/smoke"
         assert cfg.model_args == {
             "model": "rwkv7-g1i-1.5b-20260805-ctx16384",
-            "base_url": "http://127.0.0.1:8000/v1/completions",
+            "base_url": "https://api.rwkv.rs/v1/completions",
             "rwkv_prompt_template": "assistant",
             "rwkv_generation_prompt": "open_think",
             "num_concurrent": 5,
             "max_length": 16384,
+            "seed": 1234,
+            "max_gen_toks": 8192,
         }
         assert cfg.metadata["wkv_mode"] == "fp32io16"
         assert cfg.metadata["cot_mode"] == "open_think"
@@ -1072,18 +1049,13 @@ wkv_mode = "fp32io16"
     def test_toml_config_accepts_no_think_for_rwkv_backends(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
 
-        for backend, base_url in (
-            ("rwkv7-http", "http://127.0.0.1:8000/v1/completions"),
-            ("rwkv7-remote", "https://api.rwkv.rs/v1/completions"),
-            ("rwkv7-remote-chat", "https://api.rwkv.rs/v1/chat/completions"),
-        ):
-            config = tmp_path / f"{backend}.toml"
-            config.write_text(
-                f'''
+        config = tmp_path / "rwkv7-remote.toml"
+        config.write_text(
+            """
 schema_version = 1
-backend = "{backend}"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b"
-base_url = "{base_url}"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/no-cot"
 max_length = 16384
@@ -1093,15 +1065,15 @@ max_num_seqs = 5
 prompt_template = "assistant"
 generation_prompt = "no_think"
 wkv_mode = "fp32io16"
-''',
-                encoding="utf-8",
-            )
+""",
+            encoding="utf-8",
+        )
 
-            cfg = EvaluatorConfig.from_config(config)
+        cfg = EvaluatorConfig.from_config(config)
 
-            assert cfg.model == backend
-            assert cfg.model_args["rwkv_generation_prompt"] == "no_think"
-            assert cfg.metadata["cot_mode"] == "no_think"
+        assert cfg.model == "rwkv7-remote"
+        assert cfg.model_args["rwkv_generation_prompt"] == "no_think"
+        assert cfg.metadata["cot_mode"] == "no_think"
 
     def test_toml_config_rwkv7_remote_backend_with_tokenizer_name(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
@@ -1220,36 +1192,6 @@ wkv_mode = "fp32io16"
         ):
             EvaluatorConfig.from_config(config)
 
-    def test_versioned_config_rejects_tokenizer_name_for_rwkv7_http(self, tmp_path):
-        from lm_eval.config.evaluate_config import EvaluatorConfig
-
-        config = tmp_path / "config.toml"
-        config.write_text(
-            """
-schema_version = 1
-backend = "rwkv7-http"
-model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
-benchmarks = ["race"]
-output_dir = "results/race"
-max_length = 16384
-max_num_seqs = 5
-tokenizer_name = "some/repo"
-
-[rwkv_profile]
-prompt_template = "assistant"
-generation_prompt = "fake_think"
-wkv_mode = "fp32io16"
-""",
-            encoding="utf-8",
-        )
-
-        with pytest.raises(
-            ValueError,
-            match="tokenizer_name is only supported for backend = rwkv7-remote",
-        ):
-            EvaluatorConfig.from_config(config)
-
     def test_versioned_config_rejects_unknown_backend(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
 
@@ -1259,7 +1201,7 @@ wkv_mode = "fp32io16"
 schema_version = 1
 backend = "rwkv7-vllm"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/race"
 max_length = 16384
@@ -1275,10 +1217,7 @@ wkv_mode = "fp32io16"
 
         with pytest.raises(
             ValueError,
-            match=(
-                "backend must be one of: rwkv7-http, "
-                "rwkv7-remote, rwkv7-remote-chat"
-            ),
+            match="backend must be one of: rwkv7-remote",
         ):
             EvaluatorConfig.load_config(config)
 
@@ -1300,9 +1239,9 @@ wkv_mode = "fp32io16"
         config.write_text(
             """
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/race"
 max_length = 16384
@@ -1455,9 +1394,9 @@ wkv_mode = "fp32io16"
         config.write_text(
             """
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race", "race"]
 output_dir = "results/race"
 max_length = 16384
@@ -1481,9 +1420,9 @@ wkv_mode = "fp32io16"
         config.write_text(
             """
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["graphwalks"]
 output_dir = "results/graphwalks"
 max_length = 16384
@@ -1511,9 +1450,9 @@ rwkv_graphwalks = [0, 4, 9]
         config.write_text(
             """
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["graphwalks"]
 output_dir = "results/graphwalks"
 max_length = 16384
@@ -1545,9 +1484,9 @@ wkv_mode = "fp32io16"
         config.write_text(
             f"""
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["graphwalks"]
 output_dir = "results/graphwalks"
 max_length = 16384
@@ -1584,9 +1523,9 @@ rwkv_graphwalks = {indices}
         config.write_text(
             """
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race", "drop", "xquad"]
 output_dir = "results/formal"
 max_length = 16384
@@ -1621,9 +1560,9 @@ wkv_mode = "fp32io16"
         config.write_text(
             f"""
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/race"
 max_length = 16384
@@ -1650,9 +1589,9 @@ wkv_mode = "fp32io16"
         config.write_text(
             """
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/race"
 max_length = 16384
@@ -1677,9 +1616,9 @@ metric = "exact_match"
         config.write_text(
             """
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race", "drop"]
 output_dir = "results/publication"
 max_length = 16384
@@ -1728,9 +1667,9 @@ avg_k = 1
         config.write_text(
             """
 schema_version = 1
-backend = "rwkv7-http"
+backend = "rwkv7-remote"
 model_name = "rwkv7-g1i-1.5b-20260805-ctx16384"
-base_url = "http://127.0.0.1:8000/v1/completions"
+base_url = "https://api.rwkv.rs/v1/completions"
 benchmarks = ["race"]
 output_dir = "results/publication"
 max_length = 16384
