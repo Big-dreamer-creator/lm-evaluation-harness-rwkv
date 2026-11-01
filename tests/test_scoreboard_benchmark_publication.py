@@ -20,7 +20,27 @@ from lm_eval.loggers.scoreboard import (
     build_score,
 )
 from lm_eval.models.dummy import DummyLM
+from lm_eval.models.openai_completions import _RWKVCompletion
 from lm_eval.tasks import TaskManager
+
+
+class _EvidencedDummyLM(DummyLM):
+    """`DummyLM`, but annotated like a real RWKV adapter response so the
+    orchestration tests below (which publish through the RWKV-only
+    scoreboard pipeline) carry the actual dispatched-prompt evidence that
+    pipeline now requires, instead of exercising the forbidden
+    arguments-reconstruction fallback that used to stand in for it."""
+
+    def generate_until(self, requests, disable_tqdm: bool = False):
+        texts = super().generate_until(requests, disable_tqdm=disable_tqdm)
+        annotated = []
+        for request, text in zip(requests, texts):
+            value = _RWKVCompletion(
+                text, raw_response={"choices": [{"index": 0, "text": text}]}
+            )
+            value.prompt = request.arguments[0]
+            annotated.append(value)
+        return annotated
 
 
 _TEST_DATA = [
@@ -126,7 +146,7 @@ def _run_benchmark(
     task_dict = task_manager.load([benchmark_name])
 
     random.seed(seed)
-    lm = DummyLM()
+    lm = _EvidencedDummyLM()
     evaluation_tracker = EvaluationTracker(output_path=str(tmp_path / _RUN_DIR_NAME))
 
     captured: dict = {}
@@ -387,19 +407,26 @@ def test_rwkv_model_rejects_unknown_shape():
         _rwkv_model("not-a-known-model-name", 4096)
 
 
-def test_messages_parses_json_chat_str_on_disk_shape():
-    arguments = {
-        "gen_args_0": {
-            "arg_0": ['[{"role": "user", "content": "hi"}]'],
-            "arg_1": {"until": []},
-        }
-    }
-    assert _messages(arguments) == [{"role": "user", "content": "hi"}]
+def test_messages_parses_json_chat_messages_evidence():
+    evidence_prompt = '[{"role": "user", "content": "hi"}]'
+    assert _messages(evidence_prompt) == [{"role": "user", "content": "hi"}]
 
 
-def test_messages_falls_back_to_plain_string_prompt():
-    arguments = {"gen_args_0": {"arg_0": "plain prompt text", "arg_1": {}}}
-    assert _messages(arguments) == [{"role": "user", "content": "plain prompt text"}]
+def test_messages_wraps_plain_string_evidence():
+    assert _messages("plain prompt text") == [
+        {"role": "user", "content": "plain prompt text"}
+    ]
+
+
+def test_messages_blocks_publication_when_evidence_missing():
+    """Missing dispatched-prompt evidence must block publication, not fall
+    back to reconstructing a prompt from the original `Instance.arguments`
+    (which predates chat-template rendering and avg@k choice-menu splicing
+    and can silently differ from what the model actually received)."""
+    with pytest.raises(ScoreboardError):
+        _messages(None)
+    with pytest.raises(ScoreboardError):
+        _messages("")
 
 
 def _generative_row(
@@ -420,7 +447,7 @@ def _generative_row(
         "resps": [[answer]],
         "target": target,
         "response_evidence": (
-            [{"text": evidence_text, "finish_reason": "stop"}]
+            [{"text": evidence_text, "finish_reason": "stop", "prompt": "the prompt"}]
             if evidence_text is not None
             else []
         ),
@@ -701,7 +728,7 @@ def _choice_row(index: int, score: float = 1.0) -> dict:
         "filtered_resps": [["A"]],
         "target": "A",
         "filter": "none",
-        "response_evidence": [{"text": "A", "finish_reason": "stop"}],
+        "response_evidence": [{"text": "A", "finish_reason": "stop", "prompt": "prompt"}],
         "acc": score,
     }
 
@@ -972,6 +999,9 @@ def test_rwkv_remote_wire_to_scoreboard_with_open_thinking(tmp_path, monkeypatch
 
         def __call__(self, values, **kwargs):
             return SimpleNamespace(input_ids=[[ord(char) for char in value] for value in values])
+
+        def batch_decode(self, values, **kwargs):
+            return ["".join(chr(token) for token in value) for value in values]
 
     fixtures = tmp_path / "fixtures"
     data = _write_data_and_leaves(fixtures, [("remote_leaf", "exact_match")])

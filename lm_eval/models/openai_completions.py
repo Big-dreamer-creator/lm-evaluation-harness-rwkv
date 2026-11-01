@@ -179,6 +179,7 @@ class _RWKVCompletion(str):
         value = super().__new__(cls, text)
         value.finish_reason = finish_reason
         value.raw_response = raw_response
+        value.prompt = None
         value.prompt_token_ids = None
         value.output_token_ids = None
         value.reasoning = None

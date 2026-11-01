@@ -104,64 +104,48 @@ def _task_policy(
     return policy if isinstance(policy, dict) else {}
 
 
-def _messages(
-    arguments: Any, index: int = 0, evidence_prompt: Any = None
-) -> list[dict[str, str]]:
+def _messages(evidence_prompt: Any) -> list[dict[str, str]]:
     r"""The OpenAI-style chat messages actually sent for one request.
 
-    ``evidence_prompt`` -- when it's a non-empty string -- is
-    ``RWKVLoglikelihoodResponse.prompt`` surfaced via
-    ``response_evidence[0]["prompt"]``: the genuine prompt captured at the
-    moment the request was actually issued. It takes priority over anything
-    reconstructed from ``arguments`` because RWKV's avg@k generative
-    ``multiple_choice`` path (``rwkv_remote.py``)
-    fills in the lettered `A./B./C.` options -- and, for the completions
-    backend, chat-template markup -- *after* the original loglikelihood
-    request's ``arguments`` was already captured, so ``arguments`` alone is
-    missing content the model genuinely saw (it's just the bare echo-style
-    context). Only a plain generate_until doc (no avg@k choice resolution)
-    leaves ``evidence_prompt`` unset, in which case this falls back to the
-    old reconstruction below.
+    ``evidence_prompt`` is ``response_evidence[0]["prompt"]``: the genuine
+    prompt text (or JSON chat-messages payload) captured by the model
+    adapter itself at the moment the request was actually dispatched
+    (``RWKV7Remote``/``TemplateAPI._annotate_generation``, see
+    ``lm_eval/models/api_models.py`` and ``lm_eval/models/rwkv_remote.py``).
+
+    This used to fall back to reconstructing a prompt from the original
+    ``Instance.arguments`` whenever ``evidence_prompt`` was unset, but that
+    predates chat-template rendering, RWKV's avg@k lettered choice-menu
+    splicing, and tokenizer round-tripping -- it can silently differ from
+    what the model actually received. Per the evaluation production
+    contract, missing prompt evidence must block publication rather than
+    be papered over with a reconstructed stand-in, so this now raises
+    instead of falling back.
 
     A chat request's `arg_0` is a `JsonChatStr` NamedTuple (see
     `lm_eval.models.api_models.JsonChatStr`), which round-trips through
     `evaluation_tracker.save_results_samples` as a one-element list holding
     a JSON-encoded message list -- e.g.
-    `["[{\\"role\\": \\"user\\", \\"content\\": \\"...\\"}]"]`. Anything
-    that doesn't match that shape (a bare prompt string) falls back to a
-    single synthesized user message.
+    `["[{\\"role\\": \\"user\\", \\"content\\": \\"...\\"}]"]`.
     """
-    if isinstance(evidence_prompt, str) and evidence_prompt.strip():
-        try:
-            parsed = json.loads(evidence_prompt)
-        except (TypeError, ValueError):
-            parsed = None
-        if isinstance(parsed, list) and parsed and all(
-            isinstance(item, dict) and "role" in item and "content" in item
+    if not (isinstance(evidence_prompt, str) and evidence_prompt.strip()):
+        raise ScoreboardError(
+            "Generative detail lacks actual dispatched-prompt evidence; refusing to "
+            "reconstruct a prompt for publication"
+        )
+    try:
+        parsed = json.loads(evidence_prompt)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, list) and parsed and all(
+        isinstance(item, dict) and "role" in item and "content" in item
+        for item in parsed
+    ):
+        return [
+            {"role": str(item["role"]), "content": _text(item["content"])}
             for item in parsed
-        ):
-            return [
-                {"role": str(item["role"]), "content": _text(item["content"])}
-                for item in parsed
-            ]
-        return [{"role": "user", "content": evidence_prompt}]
-
-    entry = arguments.get(f"gen_args_{index}") if isinstance(arguments, dict) else None
-    arg0 = entry.get("arg_0") if isinstance(entry, dict) else None
-    if isinstance(arg0, list) and len(arg0) == 1 and isinstance(arg0[0], str):
-        try:
-            parsed = json.loads(arg0[0])
-        except (TypeError, ValueError):
-            parsed = None
-        if isinstance(parsed, list) and parsed and all(
-            isinstance(item, dict) and "role" in item and "content" in item
-            for item in parsed
-        ):
-            return [
-                {"role": str(item["role"]), "content": _text(item["content"])}
-                for item in parsed
-            ]
-    return [{"role": "user", "content": _text(arg0)}]
+        ]
+    return [{"role": "user", "content": evidence_prompt}]
 
 
 def _ground_truth(row: dict[str, Any], lettered: bool) -> str:
@@ -295,9 +279,7 @@ def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str,
         "max_tokens",
         "model_length",
     }
-    messages = _messages(
-        row.get("arguments") or {}, evidence_prompt=first_evidence.get("prompt")
-    )
+    messages = _messages(first_evidence.get("prompt"))
     messages.append({"role": "assistant", "content": raw_completion})
     # For RWKV's avg@k generative multiple_choice path, `filtered_resps`/
     # `resps` hold a fabricated `(loglikelihood, is_greedy)` tuple rather

@@ -439,10 +439,17 @@ class RWKV7Remote(LocalCompletionsAPI):
                 is_greedy = choice_idx == majority_index
                 loglikelihood = 0.0 if is_greedy else -1e6
                 if evidence_generation is not None:
+                    # Prefer the prompt actually captured at dispatch time
+                    # (`_annotate_generation`'s decode of the literal tokens/
+                    # text sent) over `plan["prompt"]`, which is the
+                    # pre-tokenization string built before `generate_until()`
+                    # ever encoded and sent it -- the two should usually
+                    # match, but only the dispatched-content decode is
+                    # guaranteed to reflect what the model actually received.
                     outcome = RWKVLoglikelihoodResponse(
                         loglikelihood,
                         is_greedy,
-                        prompt=plan["prompt"],
+                        prompt=getattr(evidence_generation, "prompt", None) or plan["prompt"],
                         text=str(evidence_generation),
                         raw_response=getattr(evidence_generation, "raw_response", None),
                         finish_reason=getattr(evidence_generation, "finish_reason", None),
@@ -453,6 +460,7 @@ class RWKV7Remote(LocalCompletionsAPI):
                         unparsed=doc_unparsed,
                         parsed_answer=parsed_answer,
                         rollouts=rollouts,
+                        prompt_token_ids=getattr(evidence_generation, "prompt_token_ids", None),
                     )
                 else:
                     outcome = RWKVLoglikelihoodResponse(

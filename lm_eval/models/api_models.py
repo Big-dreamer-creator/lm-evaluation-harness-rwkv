@@ -557,7 +557,29 @@ class TemplateAPI(TemplateLM):
             )
         return self.base_url
 
-    def _annotate_generation(self, value, gen_kwargs):
+    def _sent_prompt_evidence(self, sent: Any) -> Tuple[str, Optional[List[int]]]:
+        """Decode the literal content dispatched in the request's ``prompt``
+        field into ``(text, token_ids)`` evidence.
+
+        ``sent`` is the exact per-request item handed to ``_create_payload``
+        (a token-id list when ``tokenized_requests``, otherwise already the
+        rendered text) -- captured here, at dispatch time, rather than
+        reconstructed later from the original ``Instance.arguments``, which
+        predates chat-template rendering and any avg@k choice-menu splicing
+        and so can differ from what the model actually received.
+        """
+        if isinstance(sent, list) and (not sent or isinstance(sent[0], int)):
+            token_ids = list(sent)
+            if self.tokenizer is not None and self.tokenizer_backend == "huggingface":
+                text = self.tokenizer.batch_decode(
+                    [token_ids], skip_special_tokens=False, clean_up_tokenization_spaces=False
+                )[0]
+            else:
+                text = self.decode_batch([token_ids])[0]
+            return text, token_ids
+        return str(sent), None
+
+    def _annotate_generation(self, value, gen_kwargs, sent_prompt=None):
         if not getattr(self, "INDEPENDENT_ROLLOUTS", False) or value is None:
             return value
         from lm_eval.models.openai_completions import _RWKVCompletion
@@ -565,6 +587,8 @@ class TemplateAPI(TemplateLM):
             value = _RWKVCompletion(str(value))
         value.seed = (gen_kwargs or {}).get("seed", self._seed)
         value.requires_think_close = getattr(self, "rwkv_generation_prompt", None) == "open_think"
+        if sent_prompt is not None:
+            value.prompt, value.prompt_token_ids = sent_prompt
         return value
 
     def model_call(
@@ -708,7 +732,16 @@ class TemplateAPI(TemplateLM):
             )
 
             if generate:
-                tmp_answers = [self._annotate_generation(value, gen_kwargs) for value in tmp_answers]
+                independent = getattr(self, "INDEPENDENT_ROLLOUTS", False)
+                if independent and len(messages) == len(tmp_answers):
+                    tmp_answers = [
+                        self._annotate_generation(
+                            value, gen_kwargs, self._sent_prompt_evidence(sent)
+                        )
+                        for value, sent in zip(tmp_answers, messages, strict=True)
+                    ]
+                else:
+                    tmp_answers = [self._annotate_generation(value, gen_kwargs) for value in tmp_answers]
 
             # Convert `None`` values to `LMEVAL_MODEL_NONE_ANSWER_PLACEHOLDER` string to maintain consistency
             answers = []
@@ -1110,7 +1143,15 @@ class TemplateAPI(TemplateLM):
                         outputs=outputs,
                         contexts=contexts,
                     )
-                    generations = [self._annotate_generation(value, all_gen_kwargs[0]) for value in generations]
+                    sent_list = encodings_list if self.tokenized_requests else contexts
+                    generations = [
+                        self._annotate_generation(
+                            value,
+                            all_gen_kwargs[0],
+                            self._sent_prompt_evidence(sent) if independent else None,
+                        )
+                        for value, sent in zip(generations, sent_list, strict=True)
+                    ]
                 except ContextLengthExhausted as e:
                     if strict_context:
                         raise
