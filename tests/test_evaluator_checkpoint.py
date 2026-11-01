@@ -7,8 +7,13 @@ from lm_eval.api.checkpoint import (
     compute_task_fingerprint,
     serialize_response,
 )
+import pytest
+
 from lm_eval.api.instance import Instance
-from lm_eval.evaluator import _build_checkpointed_dispatch
+from lm_eval.evaluator import (
+    _build_checkpointed_dispatch,
+    _check_generative_choice_resume_safety,
+)
 
 
 def _make_store(tmp_path):
@@ -126,6 +131,31 @@ def test_partial_repeat_resume_dispatches_only_missing_ords(tmp_path):
 
     assert reqs[0].resps == ["gen-for-0", "cached text", "gen-for-2"]
     store.close()
+
+
+def test_generative_choice_resume_allows_symmetric_k_bump():
+    # Both choices of doc 0 agree on which repeat-ords are done (ord 0
+    # completed, ord 1 newly pending after an avg@k k=1->2 bump) -- the
+    # ordinary, safe resume case -- so this must not raise.
+    choice_a = _instance(0, 0, ("ctx", "cats"), repeats=2)
+    choice_a.resps = ["cached", None]
+    choice_b = _instance(0, 1, ("ctx", "dogs"), repeats=2)
+    choice_b.resps = ["cached", None]
+
+    _check_generative_choice_resume_safety([choice_a, choice_b])
+
+
+def test_generative_choice_resume_rejects_asymmetric_mix():
+    # Choice "dogs" finished both repeat-ords while "cats" is still missing
+    # one -- the doc can no longer be scored from a shared, equal-size
+    # rollout set, so this must raise instead of silently mis-scoring.
+    choice_a = _instance(0, 0, ("ctx", "cats"), repeats=2)
+    choice_a.resps = ["cached", None]
+    choice_b = _instance(0, 1, ("ctx", "dogs"), repeats=2)
+    choice_b.resps = ["cached", "cached-2"]
+
+    with pytest.raises(ValueError, match="mismatched completed/pending"):
+        _check_generative_choice_resume_safety([choice_a, choice_b])
 
 
 def test_content_change_invalidates_cached_item(tmp_path):

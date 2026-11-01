@@ -161,6 +161,59 @@ def test_remote_rejects_partial_choice_groups(monkeypatch):
         model.loglikelihood(_mc_requests("question", ["cats", "dogs"], repeats=2)[:-1])
 
 
+def test_remote_persists_each_docs_rollout_independently_on_dispatch_failure(monkeypatch, tmp_path):
+    from lm_eval.api.checkpoint import (
+        CheckpointStore,
+        ItemKey,
+        compute_idempotency_key,
+        serialize_response,
+    )
+
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build()
+    store = CheckpointStore(str(tmp_path / "run.sqlite3"), "test")
+    model.set_checkpoint_store(store)
+
+    requests = _mc_requests("question", ["cats", "dogs"], doc_id=0, repeats=2) + \
+        _mc_requests("question", ["cats", "dogs"], doc_id=1, repeats=2)
+    item_keys = [
+        ItemKey(
+            item_id=f"item-{i}",
+            request_fingerprint=f"fp-{i}",
+            idempotency_key=compute_idempotency_key(f"item-{i}", f"fp-{i}"),
+            task_name="some_task",
+            doc_id=req.doc_id,
+            instance_idx=req.idx,
+            request_type="loglikelihood",
+            repeat_ord=0,
+        )
+        for i, req in enumerate(requests)
+    ]
+    store.register_pending_items(item_keys)
+
+    def fake_generate_until(instances, item_keys=None):
+        # Doc 0's 2 rollouts (the first half of `pending_instances`) finish
+        # and get persisted -- mirroring the per-batch
+        # `mark_items_completed`/`mark_items_completed_async` writes the real
+        # `generate_until`/`amodel_call` already perform for every backend --
+        # before doc 1's batch fails outright.
+        for key in item_keys[:2]:
+            store.mark_items_completed([(key.item_id, serialize_response("A"))])
+        raise RuntimeError("simulated transport failure")
+
+    monkeypatch.setattr(model, "generate_until", fake_generate_until)
+
+    with pytest.raises(RuntimeError, match="simulated transport failure"):
+        model.loglikelihood(requests, item_keys=item_keys)
+
+    items = store.get_items("some_task")
+    doc0_item_ids = [item_keys[i].item_id for i in range(4)]
+    doc1_item_ids = [item_keys[i].item_id for i in range(4, 8)]
+    assert all(items[item_id]["status"] == "completed" for item_id in doc0_item_ids)
+    assert all(items[item_id]["status"] == "pending" for item_id in doc1_item_ids)
+    store.close()
+
+
 def test_remote_does_not_copy_history_into_each_quoted_option(monkeypatch):
     model = _build()
     model._chat_template_source = _ASSISTANT_STYLE_TEMPLATE.replace(

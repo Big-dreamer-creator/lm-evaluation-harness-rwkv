@@ -177,6 +177,34 @@ def _build_checkpointed_dispatch(
     return dispatch_reqs, dispatch_keys
 
 
+def _check_generative_choice_resume_safety(reqs: list[Any]) -> None:
+    """Raise if a generative-choice (avg@k) checkpoint resume is unsafe.
+
+    A doc's choices are always scored together from the same ``k`` rollouts
+    (see ``RWKV7Remote.loglikelihood()``'s generative-choice branch), so a
+    safe partial resume requires every choice of a doc to agree on exactly
+    which ``repeat_ord``s are already completed -- e.g. every choice missing
+    the same newly added repeat-ords after an avg@k ``k`` bump. Only an
+    *asymmetric* mix (choices of the same doc disagreeing on which
+    repeat-ords are done) is genuinely unscoreable; that is also what
+    ``rwkv_remote.py``'s own "equally repeated option groups" check catches
+    if it ever slips through here.
+    """
+    docs: dict[Any, list[tuple[bool, ...]]] = defaultdict(list)
+    for request in reqs:
+        docs[request.doc_id].append(
+            tuple(value is not None for value in request.resps)
+        )
+    for doc_id, patterns in docs.items():
+        if len(set(patterns)) > 1:
+            raise ValueError(
+                f"Partial generative-choice checkpoint for doc {doc_id!r} "
+                "has mismatched completed/pending repeat-ords across its "
+                "choices and cannot be safely resumed; use a separate "
+                "fresh run."
+            )
+
+
 def _is_truncated(generation: Any) -> bool:
     """Whether one generation hit the output cap without finishing."""
     if getattr(generation, "truncated", False):
@@ -1077,12 +1105,7 @@ def evaluate(
             if (item_keys is not None and reqtype == "loglikelihood"
                     and getattr(lm, "SUPPORTS_AVG_AT_K", False)
                     and not getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)):
-                docs = defaultdict(list)
-                for request in reqs:
-                    docs[request.doc_id].extend(request.resps)
-                if any(any(value is None for value in values) and any(value is not None for value in values)
-                       for values in docs.values()):
-                    raise ValueError("Partial generative-choice checkpoint cannot be safely resumed; use a separate fresh run")
+                _check_generative_choice_resume_safety(reqs)
             for _ in range(task_padding.get(reqtype, 0)):
                 cloned_reqs.extend([reqs[-1]] * reqs[-1].repeats)
                 if item_keys is not None:

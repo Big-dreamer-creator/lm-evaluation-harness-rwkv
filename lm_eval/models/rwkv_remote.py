@@ -15,6 +15,9 @@ from jinja2 import TemplateError
 from lm_eval.api.checkpoint import (
     LOGLIKELIHOOD_PROTOCOL_VERSION,
     ItemKey,
+    compute_idempotency_key,
+    compute_item_id,
+    deserialize_response,
     serialize_response,
 )
 from lm_eval.api.instance import Instance
@@ -292,6 +295,22 @@ class RWKV7Remote(LocalCompletionsAPI):
         for position, request in enumerate(requests):
             groups[(request.task_name, request.doc_id)].append(position)
 
+        # Every rollout instance gets its own checkpoint item (distinct from
+        # the final per-choice `item_keys` this method receives), so that if
+        # `generate_until()` below raises partway through, whichever docs'
+        # rollouts *did* finish are durably on disk -- via the same per-batch
+        # `mark_items_completed`/`mark_items_completed_async` writes
+        # `generate_until`/`amodel_call` already perform for every other
+        # backend -- instead of the exception losing every doc's work in this
+        # dispatch, not just the one that failed. `repeat_ord` here must carry
+        # the rollout's ordinal within its doc (not a constant), because
+        # `generate_until`'s `INDEPENDENT_ROLLOUTS` seeding reads
+        # `key.repeat_ord` as the per-sample seed offset when `item_keys` are
+        # supplied; collapsing it to one value would make every rollout in a
+        # doc sample with the same seed.
+        checkpoint_active = bool(item_keys) and self.checkpoint_store is not None
+        rollout_item_keys: List[ItemKey] = []
+
         # Build every doc's rollout prompts up front and dispatch them as a
         # single generate_until() call instead of one call per doc: all these
         # instances share the same gen_kwargs, so the Collator's
@@ -369,9 +388,28 @@ class RWKV7Remote(LocalCompletionsAPI):
 
             start = len(pending_instances)
             pending_instances.extend(self._rollout_instances(send_prompt, k))
+            if checkpoint_active:
+                doc_task_name = group[0].task_name
+                for rollout_ord in range(k):
+                    r_item_id = compute_item_id(
+                        doc_task_name, group[0].doc_id, 0, "rwkv_rollout", rollout_ord
+                    )
+                    rollout_item_keys.append(
+                        ItemKey(
+                            item_id=r_item_id,
+                            request_fingerprint=r_item_id,
+                            idempotency_key=compute_idempotency_key(r_item_id, r_item_id),
+                            task_name=doc_task_name,
+                            doc_id=group[0].doc_id,
+                            instance_idx=0,
+                            request_type="rwkv_rollout",
+                            repeat_ord=rollout_ord,
+                        )
+                    )
             doc_plans.append(
                 {
                     "doc_id": group[0].doc_id,
+                    "task_name": group[0].task_name,
                     "letters": letters,
                     "choices": choices,
                     "choice_positions": choice_positions,
@@ -381,7 +419,47 @@ class RWKV7Remote(LocalCompletionsAPI):
                 }
             )
 
-        generations = self.generate_until(pending_instances) if pending_instances else []
+        if checkpoint_active and rollout_item_keys:
+            self.checkpoint_store.register_pending_items(rollout_item_keys)
+
+        dispatch_error: Optional[BaseException] = None
+        try:
+            if not pending_instances:
+                generations = []
+            elif checkpoint_active:
+                generations = self.generate_until(pending_instances, item_keys=rollout_item_keys)
+            else:
+                generations = self.generate_until(pending_instances)
+        except BaseException as exc:  # noqa: BLE001
+            if not checkpoint_active:
+                raise
+            # Recover whichever rollouts' per-batch checkpoint writes (the
+            # same mechanism `generate_until`/`amodel_call` use for every
+            # other backend) landed before the failure, so docs whose full
+            # k-sample set already finished are still scored and persisted
+            # below instead of the whole dispatch's progress being discarded.
+            eval_logger.warning(
+                "rwkv7-remote: generate_until failed mid-dispatch (%r); "
+                "recovering already-completed rollouts from the checkpoint "
+                "store and scoring only docs whose rollouts fully finished "
+                "before the failure. The original exception is re-raised "
+                "after persisting that partial progress.",
+                exc,
+            )
+            dispatch_error = exc
+            task_names = {plan["task_name"] for plan in doc_plans}
+            items_by_id: Dict[str, dict] = {}
+            for task_name_ in task_names:
+                items_by_id.update(self.checkpoint_store.get_items(task_name_))
+            generations = [None] * len(pending_instances)
+            for position, key in enumerate(rollout_item_keys):
+                record = items_by_id.get(key.item_id)
+                if (
+                    record is not None
+                    and record.get("status") == "completed"
+                    and record.get("result_json") is not None
+                ):
+                    generations[position] = deserialize_response(record["result_json"])
 
         for plan in doc_plans:
             doc_id = plan["doc_id"]
@@ -389,6 +467,21 @@ class RWKV7Remote(LocalCompletionsAPI):
             choices = plan["choices"]
             k = plan["k"]
             doc_generations = generations[plan["start"] : plan["start"] + k]
+            if any(generation is None for generation in doc_generations):
+                # Only reachable when `generate_until` above failed partway
+                # through dispatch: this doc's rollouts never finished (or
+                # weren't recovered from the checkpoint store), so its
+                # `results` positions stay `None` and it is left `pending` --
+                # the next resume redispatches only this doc, not the whole
+                # task.
+                eval_logger.warning(
+                    "rwkv7-remote: doc %r missing %d/%d rollouts after a "
+                    "dispatch failure; leaving it pending for the next resume.",
+                    doc_id,
+                    sum(1 for generation in doc_generations if generation is None),
+                    k,
+                )
+                continue
             raw_indices = [
                 parse_choice_index(str(generated), letters, choices, require_think_close=self.rwkv_generation_prompt == "open_think")
                 for generated in doc_generations
@@ -473,14 +566,26 @@ class RWKV7Remote(LocalCompletionsAPI):
                 for position in cg:
                     results[position] = outcome
 
-        if item_keys and self.checkpoint_store is not None:
-            completed = [
-                (key.item_id, serialize_response(res))
-                for key, res in zip(item_keys, results)
-                if key is not None and res is not None
-            ]
-            if completed:
-                self.checkpoint_store.mark_items_completed(completed)
+            # Persist this doc's outcome the moment it's scored, not after
+            # every doc in the dispatch finishes: a later doc's generation
+            # failure (handled above via `dispatch_error`) must not keep this
+            # already-finished doc's result out of the checkpoint store.
+            if item_keys and self.checkpoint_store is not None:
+                doc_positions = [p for cg in plan["choice_positions"] for p in cg]
+                doc_completed = [
+                    (item_keys[p].item_id, serialize_response(results[p]))
+                    for p in doc_positions
+                    if item_keys[p] is not None
+                ]
+                if doc_completed:
+                    self.checkpoint_store.mark_items_completed(doc_completed)
+
+        if dispatch_error is not None:
+            # Already-finished docs are persisted above; re-raise so the run
+            # still surfaces the failure (crash-on-error, as before) instead
+            # of silently returning partial/`None` results for the docs that
+            # never finished.
+            raise dispatch_error
 
         return results
 
