@@ -23,6 +23,36 @@ def test_remote_sends_sampling_fields_to_vllm_directly():
     assert payload["stop"] == [model.PROMPT_STOPS[model.rwkv_prompt_template]]
 
 
+@pytest.mark.parametrize("rwkv_generation_prompt", ["open_think", "fake_think"])
+@pytest.mark.parametrize(
+    "task_until", [["\n"], ["."], ["\n", "User:"]],
+    ids=["xquad_infinitebench_newline", "drop_period", "multi"],
+)
+def test_thinking_modes_drop_native_task_stop_sequences(rwkv_generation_prompt, task_until):
+    """CoT/FakeCoT must not inherit a task's single-answer stop sequences
+    (e.g. DROP's ".", XQuAD/InfiniteBench's "\\n"): those characters occur
+    inside a reasoning trace before the final answer, so only the RWKV
+    prompt template's turn-boundary marker may end the completion."""
+    model = _build(rwkv_generation_prompt=rwkv_generation_prompt)
+    payload = model._create_payload(
+        "question", generate=True,
+        gen_kwargs={"max_gen_toks": 32, "until": task_until},
+    )
+    assert payload["stop"] == [model.PROMPT_STOPS[model.rwkv_prompt_template]]
+    for stop_seq in task_until:
+        assert stop_seq not in payload["stop"]
+
+
+def test_no_think_mode_still_honors_native_task_stop_sequences():
+    model = _build(rwkv_generation_prompt="no_think")
+    payload = model._create_payload(
+        "question", generate=True,
+        gen_kwargs={"max_gen_toks": 32, "until": ["\n"]},
+    )
+    assert "\n" in payload["stop"]
+    assert model.PROMPT_STOPS[model.rwkv_prompt_template] in payload["stop"]
+
+
 def test_remote_independent_seeds_share_one_concurrent_dispatch(monkeypatch):
     model = _build(num_concurrent=4, seed=100)
     captured = []

@@ -759,6 +759,14 @@ class RWKV7Remote(LocalCompletionsAPI):
         gen_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> dict:
+        if generate and self.rwkv_generation_prompt != "no_think" and gen_kwargs:
+            # CoT/FakeCoT must not inherit the native task's single-answer
+            # stop sequences (e.g. DROP's ".", XQuAD/InfiniteBench's "\n"):
+            # those characters legitimately occur inside a reasoning trace
+            # before the final answer, so only the model's own stop
+            # protocol/EOS plus the RWKV prompt template's turn-boundary
+            # marker (appended below) may end the completion.
+            gen_kwargs = {k: v for k, v in gen_kwargs.items() if k != "until"}
         payload = super()._create_payload(
             messages, generate=generate, gen_kwargs=gen_kwargs, **kwargs
         )
