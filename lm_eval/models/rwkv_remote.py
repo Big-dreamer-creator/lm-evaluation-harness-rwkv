@@ -328,6 +328,23 @@ class RWKV7Remote(LocalCompletionsAPI):
         checkpoint_active = bool(item_keys) and self.checkpoint_store is not None
         rollout_item_keys: List[ItemKey] = []
 
+        # A doc's rollouts can already be durably `completed` from a prior
+        # run even when the doc's own final per-choice item never got
+        # marked complete (e.g. the process died right after persisting the
+        # last rollout but before this method reached its own
+        # `mark_items_completed` call below) -- in that case the doc is
+        # still redispatched into this method on resume. Without this
+        # lookup, every rollout below would be rebuilt into
+        # `pending_instances` and resent unconditionally, discarding
+        # already-paid-for generations; mirrors `_build_checkpointed_dispatch`
+        # (lm_eval/evaluator.py) restoring already-`completed` items instead
+        # of redispatching them.
+        existing_rollout_items: Dict[str, dict] = {}
+        if checkpoint_active:
+            task_names = {request.task_name for request in requests}
+            for task_name_ in task_names:
+                existing_rollout_items.update(self.checkpoint_store.get_items(task_name_))
+
         # Build every doc's rollout prompts up front and dispatch them as a
         # single generate_until() call instead of one call per doc: all these
         # instances share the same gen_kwargs, so the Collator's
@@ -403,16 +420,33 @@ class RWKV7Remote(LocalCompletionsAPI):
                         [{"role": "user", "content": menu_prompt}]
                     )
 
-            start = len(pending_instances)
-            pending_instances.extend(
-                self._rollout_instances(send_prompt, k, group[0].task_name)
-            )
-            if checkpoint_active:
-                doc_task_name = group[0].task_name
-                for rollout_ord in range(k):
-                    r_item_id = compute_item_id(
-                        doc_task_name, group[0].doc_id, 0, "rwkv_rollout", rollout_ord
-                    )
+            doc_task_name = group[0].task_name
+            rollout_instances = self._rollout_instances(send_prompt, k, doc_task_name)
+            # `recovered[rollout_ord]` holds a rollout already `completed` in
+            # the checkpoint store (restored instead of redispatched);
+            # `dispatch_slots[rollout_ord]` holds the position inside
+            # `pending_instances`/`rollout_item_keys` for a rollout that
+            # still needs dispatching. Every ordinal lands in exactly one of
+            # the two, so `k` is preserved regardless of how many rollouts
+            # this doc already had on disk.
+            recovered: Dict[int, Any] = {}
+            dispatch_slots: Dict[int, int] = {}
+            for rollout_ord in range(k):
+                r_item_id = compute_item_id(
+                    doc_task_name, group[0].doc_id, 0, "rwkv_rollout", rollout_ord
+                )
+                existing = (
+                    existing_rollout_items.get(r_item_id) if checkpoint_active else None
+                )
+                if (
+                    existing is not None
+                    and existing.get("status") == "completed"
+                    and existing.get("result_json") is not None
+                ):
+                    recovered[rollout_ord] = deserialize_response(existing["result_json"])
+                    continue
+                dispatch_slots[rollout_ord] = len(pending_instances)
+                if checkpoint_active:
                     rollout_item_keys.append(
                         ItemKey(
                             item_id=r_item_id,
@@ -425,6 +459,7 @@ class RWKV7Remote(LocalCompletionsAPI):
                             repeat_ord=rollout_ord,
                         )
                     )
+                pending_instances.append(rollout_instances[rollout_ord])
             doc_plans.append(
                 {
                     "doc_id": group[0].doc_id,
@@ -433,7 +468,8 @@ class RWKV7Remote(LocalCompletionsAPI):
                     "choices": choices,
                     "choice_positions": choice_positions,
                     "k": k,
-                    "start": start,
+                    "recovered": recovered,
+                    "dispatch_slots": dispatch_slots,
                     "prompt": send_prompt,
                 }
             )
@@ -485,7 +521,14 @@ class RWKV7Remote(LocalCompletionsAPI):
             letters = plan["letters"]
             choices = plan["choices"]
             k = plan["k"]
-            doc_generations = generations[plan["start"] : plan["start"] + k]
+            recovered = plan["recovered"]
+            dispatch_slots = plan["dispatch_slots"]
+            doc_generations = [
+                recovered[ord_]
+                if ord_ in recovered
+                else generations[dispatch_slots[ord_]]
+                for ord_ in range(k)
+            ]
             if any(generation is None for generation in doc_generations):
                 # Only reachable when `generate_until` above failed partway
                 # through dispatch: this doc's rollouts never finished (or

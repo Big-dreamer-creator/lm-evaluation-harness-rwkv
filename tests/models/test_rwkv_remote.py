@@ -244,6 +244,71 @@ def test_remote_persists_each_docs_rollout_independently_on_dispatch_failure(mon
     store.close()
 
 
+def test_remote_does_not_redispatch_rollouts_already_completed_on_resume(monkeypatch, tmp_path):
+    """A doc's rollouts can be durably `completed` from a prior run even
+    though the doc's own final per-choice item never got marked complete
+    (e.g. the process died right after persisting the last rollout). On
+    resume, `loglikelihood()` must restore those rollouts from the
+    checkpoint store instead of rebuilding and redispatching them via
+    `generate_until`."""
+    from lm_eval.api.checkpoint import (
+        CheckpointStore,
+        ItemKey,
+        compute_idempotency_key,
+        compute_item_id,
+        serialize_response,
+    )
+
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build()
+    store = CheckpointStore(str(tmp_path / "run.sqlite3"), "test")
+    model.set_checkpoint_store(store)
+
+    requests = _mc_requests("question", ["cats", "dogs"], doc_id=0, repeats=2)
+    item_keys = [
+        ItemKey(
+            item_id=f"item-{i}",
+            request_fingerprint=f"fp-{i}",
+            idempotency_key=compute_idempotency_key(f"item-{i}", f"fp-{i}"),
+            task_name="some_task",
+            doc_id=req.doc_id,
+            instance_idx=req.idx,
+            request_type="loglikelihood",
+            repeat_ord=0,
+        )
+        for i, req in enumerate(requests)
+    ]
+    store.register_pending_items(item_keys)
+
+    # Simulate the prior run: both of doc 0's rollouts already finished and
+    # were persisted, but the doc's own per-choice items never got marked
+    # completed.
+    for rollout_ord in range(2):
+        r_item_id = compute_item_id("some_task", 0, 0, "rwkv_rollout", rollout_ord)
+        store.register_pending_items([
+            ItemKey(
+                item_id=r_item_id,
+                request_fingerprint=r_item_id,
+                idempotency_key=compute_idempotency_key(r_item_id, r_item_id),
+                task_name="some_task",
+                doc_id=0,
+                instance_idx=0,
+                request_type="rwkv_rollout",
+                repeat_ord=rollout_ord,
+            )
+        ])
+        store.mark_items_completed([(r_item_id, serialize_response("A"))])
+
+    def fail_if_called(instances, item_keys=None):
+        raise AssertionError("generate_until must not be called when every rollout is already completed")
+
+    monkeypatch.setattr(model, "generate_until", fail_if_called)
+
+    responses = model.loglikelihood(requests, item_keys=item_keys)
+    assert [response[1] for response in responses[::2]] == [True, False]
+    store.close()
+
+
 def test_remote_does_not_copy_history_into_each_quoted_option(monkeypatch):
     model = _build()
     model._chat_template_source = _ASSISTANT_STYLE_TEMPLATE.replace(
