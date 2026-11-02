@@ -136,6 +136,7 @@ class RWKV7Remote(LocalCompletionsAPI):
         rwkv_prompt_template="assistant",
         rwkv_generation_prompt="fake_think",
         cot_mode=None,
+        task_max_gen_toks: Optional[Dict[str, int]] = None,
         **kwargs,
     ):
         if tokenizer is not None and tokenizer_backend is None:
@@ -151,6 +152,13 @@ class RWKV7Remote(LocalCompletionsAPI):
                 "rwkv_generation_prompt must be no_think, open_think, or fake_think."
             )
 
+        if task_max_gen_toks is not None:
+            for task_name_key, value in task_max_gen_toks.items():
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(
+                        f"task_max_gen_toks[{task_name_key!r}] must be a positive int"
+                    )
+        self._task_max_gen_toks: Dict[str, int] = dict(task_max_gen_toks or {})
         self.rwkv_prompt_template = rwkv_prompt_template
         self.rwkv_generation_prompt = rwkv_generation_prompt
         self.SUPPORTS_LOGLIKELIHOOD = rwkv_generation_prompt == "no_think"
@@ -229,6 +237,15 @@ class RWKV7Remote(LocalCompletionsAPI):
         if sentinel not in probe:
             return None
         return probe.split(sentinel, 1)[1]
+
+    def _resolve_max_gen_toks(self, task_name: Optional[str]) -> int:
+        """Per-task generation budget override, falling back to the model default.
+
+        ``task_name`` comes from ``Instance.task_name`` (the leaf task actually
+        being scored); ``task_max_gen_toks`` is keyed the same way via the
+        eval config's ``task_overrides.<task>.max_gen_toks``.
+        """
+        return self._task_max_gen_toks.get(task_name, self._max_gen_toks)
 
     @property
     def tokenizer_name(self) -> str:
@@ -387,7 +404,9 @@ class RWKV7Remote(LocalCompletionsAPI):
                     )
 
             start = len(pending_instances)
-            pending_instances.extend(self._rollout_instances(send_prompt, k))
+            pending_instances.extend(
+                self._rollout_instances(send_prompt, k, group[0].task_name)
+            )
             if checkpoint_active:
                 doc_task_name = group[0].task_name
                 for rollout_ord in range(k):
@@ -640,7 +659,9 @@ class RWKV7Remote(LocalCompletionsAPI):
             ))
         return results
 
-    def _rollout_instances(self, prompt: str, k: int) -> List[Instance]:
+    def _rollout_instances(
+        self, prompt: str, k: int, task_name: Optional[str] = None
+    ) -> List[Instance]:
         """Build ``k`` independent generate_until instances for one doc's prompt.
 
         Every doc's rollouts share this same ``gen_kwargs`` literal, so
@@ -648,9 +669,12 @@ class RWKV7Remote(LocalCompletionsAPI):
         ``generate_until`` call: the Collator's ``group_by="gen_kwargs"``
         batches them all together and the ``num_concurrent`` asyncio
         semaphore parallelizes across docs, not just within one doc's k
-        samples.
+        samples. Docs from different tasks with different
+        ``task_max_gen_toks`` overrides land in different gen_kwargs groups
+        and are batched separately -- still parallelized, just not pooled
+        into the same HTTP batch.
         """
-        gen_kwargs = {"until": [], "max_gen_toks": self._max_gen_toks}
+        gen_kwargs = {"until": [], "max_gen_toks": self._resolve_max_gen_toks(task_name)}
         return [
             Instance(
                 request_type="generate_until",
@@ -662,7 +686,12 @@ class RWKV7Remote(LocalCompletionsAPI):
         ]
 
     def _resolve_choices(
-        self, prompt: str, letters: List[str], choices: List[str], k: int
+        self,
+        prompt: str,
+        letters: List[str],
+        choices: List[str],
+        k: int,
+        task_name: Optional[str] = None,
     ) -> List[int]:
         """Resolve ``k`` independent choice generations for one doc, standalone.
 
@@ -674,7 +703,7 @@ class RWKV7Remote(LocalCompletionsAPI):
         ``generate_until`` call instead); kept for any caller that needs a
         single doc resolved on its own.
         """
-        generations = self.generate_until(self._rollout_instances(prompt, k))
+        generations = self.generate_until(self._rollout_instances(prompt, k, task_name))
         return [
             parse_choice_index(str(generated), letters, choices, require_think_close=self.rwkv_generation_prompt == "open_think") for generated in generations
         ]

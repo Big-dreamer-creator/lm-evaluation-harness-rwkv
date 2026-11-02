@@ -1009,6 +1009,122 @@ wkv_mode = "fp32io16"
         assert cfg.metadata["wkv_mode"] == "fp32io16"
         assert cfg.metadata["cot_mode"] == "fake_think"
 
+    def test_toml_config_task_overrides_max_gen_toks(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1i-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["discrim_eval_explicit"]
+output_dir = "results/rwkv7-g1i-1.5b-remote"
+max_length = 16384
+max_num_seqs = 5
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "open_think"
+wkv_mode = "fp32io16"
+
+[task_overrides.discrim_eval_explicit]
+max_gen_toks = 24576
+""",
+            encoding="utf-8",
+        )
+
+        cfg = EvaluatorConfig.from_config(config)
+
+        assert cfg.model_args["task_max_gen_toks"] == {"discrim_eval_explicit": 24576}
+        assert cfg.model_args["max_gen_toks"] == 8192
+
+    def test_toml_config_without_task_overrides_omits_task_max_gen_toks(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1i-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/rwkv7-g1i-1.5b-remote"
+max_length = 16384
+max_num_seqs = 5
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        cfg = EvaluatorConfig.from_config(config)
+
+        assert "task_max_gen_toks" not in cfg.model_args
+
+    def test_toml_config_task_overrides_rejects_unknown_subfield(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1i-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/rwkv7-g1i-1.5b-remote"
+max_length = 16384
+max_num_seqs = 5
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+
+[task_overrides.race]
+temperature = 0.5
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="Unknown task_overrides.race fields"):
+            EvaluatorConfig.from_config(config)
+
+    def test_toml_config_task_overrides_rejects_non_positive_budget(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1i-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+output_dir = "results/rwkv7-g1i-1.5b-remote"
+max_length = 16384
+max_num_seqs = 5
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "fake_think"
+wkv_mode = "fp32io16"
+
+[task_overrides.race]
+max_gen_toks = 0
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="max_gen_toks"):
+            EvaluatorConfig.from_config(config)
+
     def test_weight_revision_is_metadata_not_the_api_model_id(self, tmp_path):
         """The API alias stays short; the full release name is run metadata.
 

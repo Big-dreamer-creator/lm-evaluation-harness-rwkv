@@ -335,6 +335,18 @@ wkv_mode = "fp32io16"
   输入必须已经包含适当的原生角色与生成前缀；这里只支持原始文本直传。
 - `seed[2]` 作为生成基础 seed，同一题的第 r 次采样使用 `base_seed + r`。
   顶层 `max_gen_toks` 控制选择题的输出预算，默认 8192。
+- 需要按 benchmark 单独设置预算时（AGENTS.md 第9条：普通任务 ≤4096，高难度
+  数学/推理任务 ≤24576），使用 `[task_overrides.<leaf_task_name>]` 表，例如：
+
+  ```toml
+  [task_overrides.discrim_eval_explicit]
+  max_gen_toks = 24576
+  ```
+
+  键必须是实际执行时的叶子任务名（即请求携带的 `Instance.task_name`），不是
+  `benchmarks` 列表里可能展开成多个叶子任务的 group/tag 名。该覆盖对
+  CoT/open_think/fake_think 的 avg@k rollout 生效（此前这条路径完全忽略任务
+  级配置，固定使用模型默认预算），未命中的任务回退到顶层 `max_gen_toks`。
 - `config.truncation` 会输出真实的完成数/截断数/截断率（原理见第 9 节），
   不再是恒为 `null` 的占位值。
 

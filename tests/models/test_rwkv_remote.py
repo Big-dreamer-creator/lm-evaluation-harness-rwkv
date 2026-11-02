@@ -417,7 +417,7 @@ def test_rwkv7_remote_parse_generations_reports_finish_reason():
     assert generation.truncated is True
 
 
-def _mc_requests(context, choices, doc_id=0, repeats=1):
+def _mc_requests(context, choices, doc_id=0, repeats=1, task_name="some_task"):
     # Mirrors evaluator.py's `cloned_reqs = [req for req in reqs for _ in
     # range(req.repeats)]`: avg@k's k is read off the actual number of
     # cloned instances per choice, not off the `repeats` metadata value
@@ -428,7 +428,7 @@ def _mc_requests(context, choices, doc_id=0, repeats=1):
             doc={},
             arguments=(context, choice),
             idx=idx,
-            metadata=("some_task", doc_id, repeats),
+            metadata=(task_name, doc_id, repeats),
         )
         for idx, choice in enumerate(choices)
         for _ in range(repeats)
@@ -472,6 +472,43 @@ def test_rwkv7_remote_avg_at_k_samples_k_generations_via_generate_until(monkeypa
     # `requests` has 4 cloned instances per choice, so `results` mirrors that
     # shape: 4 outcomes for choice "one" (the winner) then 4 for "two".
     assert results == [(0.0, True)] * 4 + [(-1e6, False)] * 4
+
+
+def test_rwkv7_remote_rollout_uses_per_task_max_gen_toks_override(monkeypatch):
+    monkeypatch.setenv("RWKV_API_KEY", "test-key")
+    model = _build(
+        rwkv_generation_prompt="open_think",
+        task_max_gen_toks={"taskA": 24576},
+    )
+
+    calls = []
+
+    def fake_generate_until(instances):
+        calls.append(instances)
+        return ["A"] * len(instances)
+
+    monkeypatch.setattr(model, "generate_until", fake_generate_until)
+
+    requests_a = _mc_requests(
+        "What is 1+1?", ["one", "two"], doc_id=1, repeats=2, task_name="taskA"
+    )
+    requests_b = _mc_requests(
+        "What is 2+2?", ["three", "four"], doc_id=2, repeats=2, task_name="taskB"
+    )
+    model.loglikelihood(requests_a + requests_b)
+
+    assert len(calls) == 1
+    budgets_by_task = {
+        "taskA": next(
+            inst.args[1]["max_gen_toks"] for inst in calls[0] if "A. one" in inst.args[0]
+        ),
+        "taskB": next(
+            inst.args[1]["max_gen_toks"]
+            for inst in calls[0]
+            if "A. three" in inst.args[0]
+        ),
+    }
+    assert budgets_by_task == {"taskA": 24576, "taskB": model._max_gen_toks}
 
 
 def test_rwkv7_remote_avg_at_k_ignores_unparsed_rollouts_in_majority_vote(monkeypatch):

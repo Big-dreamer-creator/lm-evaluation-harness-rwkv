@@ -774,6 +774,27 @@ class EvaluatorConfig:
         model_args["base_url"] = base_url
         model_args["seed"] = seed[2]
         model_args["max_gen_toks"] = cls._positive_int(config.get("max_gen_toks", 8192), "max_gen_toks")
+        task_overrides_value = config.get("task_overrides")
+        if task_overrides_value is not None:
+            if not isinstance(task_overrides_value, dict):
+                raise TypeError("task_overrides must be a table keyed by benchmark name")
+            task_max_gen_toks: dict[str, int] = {}
+            for task_name_key, overrides in task_overrides_value.items():
+                if not isinstance(overrides, dict):
+                    raise TypeError(f"task_overrides.{task_name_key} must be a table")
+                unknown_task_override = sorted(set(overrides) - {"max_gen_toks"})
+                if unknown_task_override:
+                    raise ValueError(
+                        f"Unknown task_overrides.{task_name_key} fields: "
+                        + ", ".join(unknown_task_override)
+                    )
+                if "max_gen_toks" in overrides:
+                    task_max_gen_toks[task_name_key] = cls._positive_int(
+                        overrides["max_gen_toks"],
+                        f"task_overrides.{task_name_key}.max_gen_toks",
+                    )
+            if task_max_gen_toks:
+                model_args["task_max_gen_toks"] = task_max_gen_toks
         # HTTP robustness knobs. Like max_num_seqs they only change how
         # requests are retried, not prompts, sampling or model identity, so
         # they are excluded from the checkpoint fingerprint (see
