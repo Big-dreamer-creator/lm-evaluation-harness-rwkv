@@ -114,17 +114,11 @@ This repository is independently responsible for the lm-eval native evaluation p
 This repository needs to periodically sync with the upstream EleutherAI/lm-evaluation-harness repository. Verify the actual remote URL, branch, and latest commit used for comparison. First refactor the code according to the Correspondence Principle and Non-Interference Principle, remove single-use wrappers, clean up stale static tests, then sync upstream. Finally, the sync status should show "ahead x, behind 0".
 
 ## Score Publication
-Wait for the scoreboard-rwkv repository and detailed publication instructions. Do not perform publication work yet. Publication-related requirements above apply once publication is enabled.
+Score publication targets the scoreboard repository at https://github.com/rwkv-rs/scoreboard-rwkv. Publication is enabled: all publication-related requirements in `Evaluation Producer Contract` and `Responsibility Boundaries` apply to every production run, not only once some future signal arrives. Do not modify the scoreboard-rwkv repository's AGENTS or implementation from this repository.
 
 ## Env
 Use uv to manage the local and remote dedicated environment ./.venv. This project is strictly prohibited from using other environments, and other projects are strictly prohibited from using this project's environment, to avoid environment pollution issues.
 
-## Machine for Testing and Benchmarking
-```bash
-ssh rwkv-sha-pro6000x8
-cd ~/Projects/MachineLearning/lm-evaluation-harness-rwkv
-```
-Use git to sync your changes instead of rsync.
 
 ## Inference API
 Obtain current endpoints, weights, wkv mode, and pool capacity from the external inference project's endpoint manifest.
