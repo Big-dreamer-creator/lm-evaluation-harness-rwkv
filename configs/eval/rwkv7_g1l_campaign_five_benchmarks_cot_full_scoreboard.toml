@@ -1,0 +1,80 @@
+# RWKV7-G1L full CoT campaign for mc_taco, mutual, race, winogender, and wmdp.
+# With no limit, the harness enables avg@k and chooses a power-of-two k per
+# benchmark so that each benchmark targets 3000-6000 completions. mc_taco is
+# the unavoidable exception because its full split already contains 9442 docs.
+schema_version = 1
+backend = "rwkv7-remote"
+
+base_url = "https://vllm.rwkvos.com/v1/completions"
+benchmarks = ["mc_taco", "mutual", "race", "winogender", "wmdp"]
+include_path = ["configs/eval/offline_six_tasks"]
+max_length = 32768
+trust_remote_code = true
+
+apply_chat_template = true
+fewshot_as_multiturn = true
+log_samples = true
+timeout = 1800
+max_retries = 6
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "open_think"
+wkv_mode = "fp32io16"
+
+[checkpoint]
+enabled = true
+fresh = false
+
+[publication]
+enabled = true
+base_url = "http://127.0.0.1:7862"
+cot_mode = "CoT"
+token_env = "SCOREBOARD_PUBLICATION_TOKEN"
+rerun_reason = "full RWKV7-G1L five-benchmark avg@k CoT campaign, fp32io16, vllm.rwkvos.com"
+
+[publication.tasks.mc_taco]
+field = "reasoning"
+
+[publication.tasks.mutual]
+field = "reasoning"
+
+[publication.tasks.race]
+field = "reading_comprehension"
+
+[publication.tasks.winogender]
+field = "reasoning"
+
+[publication.tasks.wmdp]
+field = "knowledge"
+
+# The G1L tokenizer.json and assistant chat template are byte-identical to the
+# local G1K copies. max_length above supplies G1L's official 32768 serving
+# context instead of the older tokenizer_config.json metadata.
+[[models]]
+model_name = "rwkv7-g1l-1.5b"
+weight_revision = "rwkv7-g1l-1.5b-temp6331-ctx32768"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/1.5b"
+max_num_seqs = 200
+output_dir = "results/rwkv7-g1l-1.5b-temp6331-ctx32768-remote-five-benchmarks-cot-full"
+
+[[models]]
+model_name = "rwkv7-g1l-2.9b"
+weight_revision = "rwkv7-g1l-2.9b-temp5764-ctx32768"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/2.9b"
+max_num_seqs = 200
+output_dir = "results/rwkv7-g1l-2.9b-temp5764-ctx32768-remote-five-benchmarks-cot-full"
+
+[[models]]
+model_name = "rwkv7-g1l-7.2b"
+weight_revision = "rwkv7-g1l-7.2b-temp3797-ctx32768"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/7.2b"
+max_num_seqs = 200
+output_dir = "results/rwkv7-g1l-7.2b-temp3797-ctx32768-remote-five-benchmarks-cot-full"
+
+[[models]]
+model_name = "rwkv7-g1l-13.3b"
+weight_revision = "rwkv7-g1l-13.3b-temp5497-ctx32768"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/13.3b"
+max_num_seqs = 200
+output_dir = "results/rwkv7-g1l-13.3b-temp5497-ctx32768-remote-five-benchmarks-cot-full"

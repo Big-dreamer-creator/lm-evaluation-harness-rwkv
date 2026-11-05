@@ -62,7 +62,7 @@ rerun_reason = "full RWKV7-G1J RULER+xQuad NoCoT campaign, all documents, avg@k 
 field = "reasoning"
 
 [publication.tasks.xquad]
-field = "reasoning"
+field = "reading_comprehension"
 
 # Request budget per size. vllm.rwkvos.com serves the four G1J aliases from
 # one endpoint and was measured to take ~800 concurrent requests cleanly;

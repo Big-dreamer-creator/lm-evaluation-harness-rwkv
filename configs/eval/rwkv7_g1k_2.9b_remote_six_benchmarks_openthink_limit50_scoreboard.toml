@@ -45,7 +45,7 @@ field = "reasoning"
 field = "reasoning"
 
 [publication.tasks.race]
-field = "reasoning"
+field = "reading_comprehension"
 
 [publication.tasks.winogender]
 field = "reasoning"

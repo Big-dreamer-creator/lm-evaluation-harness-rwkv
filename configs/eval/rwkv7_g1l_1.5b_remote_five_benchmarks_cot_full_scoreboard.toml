@@ -1,0 +1,56 @@
+# RWKV7-G1L-1.5B full CoT evaluation for the five requested benchmarks.
+# With no limit, avg@k is enabled and targets 3000-6000 completions per
+# benchmark. mc_taco is the unavoidable exception because its full split
+# already contains 9442 documents.
+schema_version = 1
+backend = "rwkv7-remote"
+
+model_name = "rwkv7-g1l-1.5b"
+weight_revision = "rwkv7-g1l-1.5b-temp6331-ctx32768"
+base_url = "https://vllm.rwkvos.com/v1/completions"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/1.5b"
+trust_remote_code = true
+benchmarks = ["mc_taco", "mutual", "race", "winogender", "wmdp"]
+include_path = ["configs/eval/offline_six_tasks"]
+output_dir = "results/rwkv7-g1l-1.5b-temp6331-ctx32768-remote-five-benchmarks-cot-full"
+
+max_length = 32768
+max_num_seqs = 400
+timeout = 1800
+max_retries = 6
+
+apply_chat_template = true
+fewshot_as_multiturn = true
+log_samples = true
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "open_think"
+wkv_mode = "fp32io16"
+
+[checkpoint]
+enabled = true
+fresh = false
+dir = "results/rwkv7-g1l-1.5b-temp6331-ctx32768-remote-five-benchmarks-cot-full/checkpoints-800"
+
+[publication]
+enabled = true
+base_url = "http://127.0.0.1:7862"
+cot_mode = "CoT"
+token_env = "SCOREBOARD_PUBLICATION_TOKEN"
+rerun_reason = "full RWKV7-G1L-1.5B five-benchmark avg@k CoT campaign, fp32io16, ctx32768"
+
+[publication.tasks.mc_taco]
+field = "reasoning"
+
+[publication.tasks.mutual]
+field = "reasoning"
+
+[publication.tasks.race]
+field = "reading_comprehension"
+
+[publication.tasks.winogender]
+field = "reasoning"
+
+[publication.tasks.wmdp]
+field = "knowledge"

@@ -1,0 +1,65 @@
+knowledge = [
+  "wmdp",
+  "arab_culture",
+  "bertaqa_eu",
+  "bertaqa_en",
+  "click",
+  "eus_trivia",
+  "haerae",
+  "kmmlu",
+  "kmmlu_hard",
+  "tmlu",
+  "tmmluplus",
+  "careqa_en",
+  "careqa_es",
+  "med_concepts_qa",
+  "kbl_bar_exam_em",
+  "kbl_knowledge_em",
+  "kbl_reasoning_em",
+  "kormedmcqa",
+  "mediqa_qa2019",
+  "olaph",
+  "nrk_quiz_qa",
+]
+
+reasoning = [
+  "babilong",
+  "discrim_eval",
+  "infinitebench_rwkv_production",
+  "inverse_scaling_prize",
+  "mc_taco",
+  "model_written_evals",
+  "mutual",
+  "ruler",
+  "winogender",
+  "mutual_plus",
+]
+
+reading_comprehension = [
+  "drop",
+  "race",
+  "xquad",
+  "eus_reading",
+  "naijarc_tasks",
+  "norquad",
+  "aclue_reading_comprehension",
+  "logiqa2",
+  "infinitebench_longbook_qa_en",
+  "infinitebench_longbook_qa_chn",
+  "infinitebench_longdialogue_qa_en",
+  "infinitebench_longbook_choice_en",
+]
+
+maths = []
+
+coding = [
+  "cruxeval",
+  "humaneval_infilling",
+  "rwkv_coding_local",
+]
+
+instruction_following = []
+
+agentic = []
+
+vision = []

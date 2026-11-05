@@ -1,0 +1,128 @@
+# RWKV7-G1L NoCoT full campaign for the reading-comprehension benchmarks
+# confirmed not covered by LightEval or EvalScope: EusReading, LogiQA 2.0,
+# NaijaRC, MuTual+, NorEval's NorQuAD, ACLUE's classical-Chinese reading
+# comprehension subtask, and InfiniteBench's longbook_qa/longbook_choice/
+# dialogue_qa reading subtasks. LogiQA 1.0 is intentionally excluded (already
+# covered). BABiLong, MC-TACO, and MuTual already run under existing
+# campaigns and already carry benchmarks.toml registration / rwkv_no_think
+# overrides from before this campaign, so they are not repeated here to
+# avoid double-publishing the same benchmark.
+#
+# EusReading and ACLUE's reading-comprehension subtask are natively
+# multiple_choice but end their prompt in a non-English cue (Basque
+# "Erantzuna:", Chinese "答案："); each carries a metadata.rwkv_no_think
+# override that only replaces doc_to_text with the same template ending in
+# the standard "\nAnswer:" cue the RWKV adapter's cue-detection regex
+# recognizes, leaving doc_to_choice/doc_to_target/metrics untouched.
+# LogiQA 2.0, NaijaRC, MuTual+, NorQuAD, and the three new InfiniteBench
+# selectors needed no code changes: their native prompts already end in an
+# English cue, have no cue at all (adapter appends one), or are genuinely
+# generative with their own native metric (f1/exact_match/score).
+#
+# No limit is applied, so RWKV avg@k planning remains enabled for the
+# multiple_choice/loglikelihood tasks where it is applicable. A benchmark
+# whose full document count already exceeds the planner's target range
+# necessarily runs at k=1.
+schema_version = 1
+backend = "rwkv7-remote"
+
+base_url = "https://vllm.rwkvos.com/v1/completions"
+benchmarks = [
+  "eus_reading",
+  "logiqa2",
+  "naijarc_tasks",
+  "mutual_plus",
+  "norquad",
+  "aclue_reading_comprehension",
+  "infinitebench_longbook_qa_en",
+  "infinitebench_longbook_qa_chn",
+  "infinitebench_longdialogue_qa_en",
+  "infinitebench_longbook_choice_en",
+]
+max_length = 32768
+trust_remote_code = true
+
+apply_chat_template = true
+fewshot_as_multiturn = true
+log_samples = true
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "no_think"
+wkv_mode = "fp32io16"
+
+[checkpoint]
+enabled = true
+fresh = false
+
+[model_overrides]
+timeout = 1800
+max_retries = 6
+
+[publication]
+enabled = true
+base_url = "http://127.0.0.1:7862"
+cot_mode = "NoCoT"
+token_env = "SCOREBOARD_PUBLICATION_TOKEN"
+rerun_reason = "RWKV7-G1L 1.5B/2.9B/7.2B/13.3B reading-comprehension NoCoT full campaign (EusReading/LogiQA2.0/NaijaRC/MuTual+/NorQuAD/ACLUE-reading-comprehension/InfiniteBench-longbook_qa-longbook_choice-dialogue_qa), fp32io16, ctx32768"
+
+[publication.tasks.eus_reading]
+field = "reading_comprehension"
+
+[publication.tasks.logiqa2]
+field = "reading_comprehension"
+
+[publication.tasks.naijarc_tasks]
+field = "reading_comprehension"
+
+[publication.tasks.mutual_plus]
+field = "reasoning"
+
+[publication.tasks.norquad]
+field = "reading_comprehension"
+
+[publication.tasks.aclue_reading_comprehension]
+field = "reading_comprehension"
+
+[publication.tasks.infinitebench_longbook_qa_en]
+field = "reading_comprehension"
+
+[publication.tasks.infinitebench_longbook_qa_chn]
+field = "reading_comprehension"
+
+[publication.tasks.infinitebench_longdialogue_qa_en]
+field = "reading_comprehension"
+
+[publication.tasks.infinitebench_longbook_choice_en]
+field = "reading_comprehension"
+
+# Three child processes run concurrently. 300 requests per model gives the
+# endpoint 900 in-flight requests, matching the concurrency level used by the
+# existing four-benchmark NoCoT campaign against the same endpoint.
+[[models]]
+model_name = "rwkv7-g1l-1.5b"
+weight_revision = "rwkv7-g1l-1.5b-temp6331-ctx32768"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/1.5b"
+max_num_seqs = 300
+output_dir = "results/rwkv7-g1l-1.5b-temp6331-ctx32768-remote-reading-comprehension-nocot-full"
+
+[[models]]
+model_name = "rwkv7-g1l-2.9b"
+weight_revision = "rwkv7-g1l-2.9b-temp5764-ctx32768"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/2.9b"
+max_num_seqs = 300
+output_dir = "results/rwkv7-g1l-2.9b-temp5764-ctx32768-remote-reading-comprehension-nocot-full"
+
+[[models]]
+model_name = "rwkv7-g1l-7.2b"
+weight_revision = "rwkv7-g1l-7.2b-temp3797-ctx32768"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/7.2b"
+max_num_seqs = 300
+output_dir = "results/rwkv7-g1l-7.2b-temp3797-ctx32768-remote-reading-comprehension-nocot-full"
+
+[[models]]
+model_name = "rwkv7-g1l-13.3b"
+weight_revision = "rwkv7-g1l-13.3b-temp5497-ctx32768"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/13.3b"
+max_num_seqs = 300
+output_dir = "results/rwkv7-g1l-13.3b-temp5497-ctx32768-remote-reading-comprehension-nocot-full"

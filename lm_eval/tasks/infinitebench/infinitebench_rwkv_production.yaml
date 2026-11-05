@@ -1,0 +1,9 @@
+group: infinitebench_rwkv_production
+task:
+  - infinitebench_passkey
+  - infinitebench_kv_retrieval
+  - infinitebench_number_string
+  - infinitebench_code_run
+  - infinitebench_code_debug
+  - infinitebench_math_find
+  - infinitebench_longbook_sum_en

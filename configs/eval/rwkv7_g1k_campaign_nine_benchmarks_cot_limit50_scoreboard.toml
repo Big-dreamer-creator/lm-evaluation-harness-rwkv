@@ -1,0 +1,126 @@
+# RWKV7-G1K CoT (open_think) campaign over the nine adapted RWKV benchmark
+# families that the earlier six-benchmark (race/wmdp/winogender/discrim_eval/
+# mc_taco/mutual) runs left uncovered:
+#
+#   drop, xquad, babilong, infinitebench, ruler, cruxeval,
+#   inverse_scaling_prize, model_written_evals, humaneval_infilling
+#
+# One campaign TOML covers the whole weight ladder: vllm.rwkvos.com serves
+# rwkv7-g1k-<size> from the rwkv7-g1k-<size>-20260930-ctx25600 revisions, so
+# each [[models]] entry only carries what differs per size (served model name,
+# official tokenizer assets, request budget, result directory). `lm-eval run
+# -C` starts one child process per size (see RWKV_EVALUATION_GUIDE.md 6.1).
+#
+# Every benchmark runs with --limit 50, so the evaluator pins avg@k to k=1
+# (a limited run is a smoke pass, not an avg@k measurement) and every leaf of
+# every benchmark stops after 50 documents. All nine run in open_think mode
+# (cot_mode = "CoT") with the RWKV7 official decoding parameters; wkv_mode
+# records the fp32io16 service mode for audit.
+#
+# max_length = 8192 is the client-side context window: requests whose
+# prompt+continuation exceed it are left-truncated (LM context) or have their
+# completion budget shrunk (generation). The served weights accept up to
+# 32768, so this is a deliberate cap, not a server limit -- it only bites the
+# long-context families (infinitebench/babilong/ruler), whose numbers should
+# be read as "what fits in 8192 tokens".
+#
+# tokenizer_name is required here even though most of these tasks generate:
+# multiple_choice families (inverse_scaling_prize, model_written_evals) score
+# by sampling choice letters, and ruler's synthetic haystacks are built with
+# this exact tokenizer. The three files in each directory are the official
+# rwkv7-g1k tokenizer assets (tokenizer.json/config + chat_template.jinja).
+schema_version = 1
+backend = "rwkv7-remote"
+
+base_url = "https://vllm.rwkvos.com/v1/completions"
+benchmarks = [
+  "drop",
+  "xquad",
+  "babilong",
+  "infinitebench_rwkv_production",
+  "ruler",
+  "cruxeval",
+  "inverse_scaling_prize",
+  "model_written_evals",
+  "humaneval_infilling",
+]
+max_length = 8192
+# limit is part of the effective config: "limit 50" is the declared protocol
+# for this campaign, not a launch-time override.
+limit = 50
+trust_remote_code = true
+
+apply_chat_template = true
+fewshot_as_multiturn = true
+log_samples = true
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "open_think"
+wkv_mode = "fp32io16"
+
+[checkpoint]
+enabled = true
+fresh = false
+
+[publication]
+enabled = true
+base_url = "http://127.0.0.1:7862"
+cot_mode = "CoT"
+token_env = "SCOREBOARD_PUBLICATION_TOKEN"
+rerun_reason = "RWKV7-G1K nine-benchmark CoT campaign (drop/xquad/babilong/infinitebench/ruler/cruxeval/inverse_scaling_prize/model_written_evals/humaneval_infilling), limit 50, ctx 8192, official Open Think sampling"
+
+[publication.tasks.drop]
+field = "reading_comprehension"
+
+[publication.tasks.xquad]
+field = "reading_comprehension"
+
+[publication.tasks.babilong]
+field = "reasoning"
+
+[publication.tasks.infinitebench_rwkv_production]
+field = "reasoning"
+
+[publication.tasks.ruler]
+field = "reasoning"
+
+[publication.tasks.cruxeval]
+field = "coding"
+
+[publication.tasks.inverse_scaling_prize]
+field = "reasoning"
+
+[publication.tasks.model_written_evals]
+field = "reasoning"
+
+[publication.tasks.humaneval_infilling]
+field = "coding"
+
+# Request budget per size. The repository default was sized for api.rwkv.rs;
+# vllm.rwkvos.com serves a large in-flight batch cleanly, so 50 concurrent
+# requests per size (200 across the four concurrent child processes) is a
+# conservative budget that still keeps the endpoint busy.
+[[models]]
+model_name = "rwkv7-g1k-1.5b"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/1.5b"
+max_num_seqs = 50
+output_dir = "results/rwkv7-g1k-1.5b-20260930-ctx25600-remote-nine-benchmarks-cot-limit50"
+
+[[models]]
+model_name = "rwkv7-g1k-2.9b"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/2.9b"
+max_num_seqs = 50
+output_dir = "results/rwkv7-g1k-2.9b-20260930-ctx25600-remote-nine-benchmarks-cot-limit50"
+
+[[models]]
+model_name = "rwkv7-g1k-7.2b"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/7.2b"
+max_num_seqs = 50
+output_dir = "results/rwkv7-g1k-7.2b-20260930-ctx25600-remote-nine-benchmarks-cot-limit50"
+
+[[models]]
+model_name = "rwkv7-g1k-13.3b"
+tokenizer_name = "/home/link/weight/rwkv-g1k-tokenizer/13.3b"
+max_num_seqs = 50
+output_dir = "results/rwkv7-g1k-13.3b-20260930-ctx25600-remote-nine-benchmarks-cot-limit50"

@@ -50,6 +50,6 @@ cot_mode = "FakeCoT"  # 可选：NoCoT / FakeCoT / CoT——Scoreboard 侧对本
 token_env = "SCOREBOARD_PUBLICATION_TOKEN"  # 存放 bearer token 的环境变量名，会以 `Authorization: Bearer <token>` 发送；非 dry-run 上传前必须先 export 这个变量。
 
 [publication.tasks.race]
-field = "reasoning"  # 可选：knowledge / reasoning / maths / coding / instruction_following / agentic / vision——该 benchmark 在 Scoreboard 中归属的类别（对应 scoreboard-server/db/init.sql 里 benchmarks.field 的约束）。
+field = "reading_comprehension"  # 可选：knowledge / reasoning / maths / coding / instruction_following / agentic / vision / reading_comprehension——该 benchmark 在 Scoreboard 中归属的类别（对应 scoreboard-server/db/init.sql 里 benchmarks.field 的约束）。race 是经典阅读理解基准（RACE: ReAding Comprehension Dataset From Examinations），故归入 reading_comprehension。
 # `avg_k` 不再手填：上传时由结果推导（completions / samples，多 leaf 按 completion 加权，
 # 可为小数）。确实要钉住某个值时再显式写上，推导值与它不一致会直接报错，而不是照发。

@@ -41,7 +41,7 @@ token_env = "SCOREBOARD_PUBLICATION_TOKEN"
 model_sha256 = "c43176881caf85fe22ad654ab02e7519260d560f3d20420ab590adb0c823860f"
 
 [publication.tasks.race]
-field = "reasoning"
+field = "reading_comprehension"
 
 [publication.tasks.wmdp]
 field = "knowledge"

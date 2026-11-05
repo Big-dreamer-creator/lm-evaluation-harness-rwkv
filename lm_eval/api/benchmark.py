@@ -32,6 +32,7 @@ BenchmarkField = Literal[
     "instruction_following",
     "agentic",
     "vision",
+    "reading_comprehension",
 ]
 BENCHMARK_FIELDS = frozenset(
     {
@@ -42,10 +43,11 @@ BENCHMARK_FIELDS = frozenset(
         "instruction_following",
         "agentic",
         "vision",
+        "reading_comprehension",
     }
 )
 DEFAULT_BENCHMARK_CONFIG = (
-    Path(__file__).resolve().parents[2] / "configs" / "benchmarks.toml"
+    Path(__file__).resolve().parent.parent / "config" / "benchmarks.toml"
 )
 
 
