@@ -1,0 +1,15 @@
+group: evalscope_ds1000
+task:
+  - evalscope_ds1000_pandas
+  - evalscope_ds1000_numpy
+  - evalscope_ds1000_matplotlib
+  - evalscope_ds1000_sklearn
+  - evalscope_ds1000_scipy
+  - evalscope_ds1000_pytorch
+  - evalscope_ds1000_tensorflow
+aggregate_metric_list:
+  - metric: accuracy
+    aggregation: mean
+    weight_by_size: true
+metadata:
+  version: 1.0

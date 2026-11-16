@@ -112,6 +112,16 @@ Set the served weight, tokenizer, endpoint, and local problem-file path in the
 [RWKV evaluation guide](RWKV_EVALUATION_GUIDE.md#13-rwkv-本地-coding-测评) for
 the problem schema, container prerequisites, generation-only runs, and replay.
 
+## Native Coding benchmark suite
+
+All 16 non-agent EvalScope Coding protocols are available as native lm-eval tasks,
+without an EvalScope runtime dependency. The suite includes HumanEval(+), MBPP(+),
+MultiPL-E (18 languages), BigCodeBench/Hard, LiveCodeBench, SciCode, DS-1000,
+BIRD-SQL, oracle-context SWE-bench, and the MT-Bench Coding subset.
+Use the `evalscope_coding` group or individual `evalscope_...` selectors.
+See the [Coding task guide](lm_eval/tasks/evalscope_coding/README.md) for installation,
+Docker runtimes, repeated sampling, multi-turn checkpoints, and source attribution.
+
 ## Basic Usage
 
 ### Documentation

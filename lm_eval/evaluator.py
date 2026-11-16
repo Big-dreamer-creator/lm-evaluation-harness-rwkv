@@ -693,7 +693,11 @@ def simple_evaluate(
             if set(task_obj._metric_fn_list) & {"acc_mutual_info", "brier_score", "perplexity", "likelihood"}:
                 raise NotImplementedError(f"{task_name}: likelihood metrics require real prompt log probabilities")
 
-        if getattr(lm, "EVALUATION_PROTOCOL_VERSION", None) and task_obj.OUTPUT_TYPE == "generate_until":
+        if (
+            getattr(lm, "EVALUATION_PROTOCOL_VERSION", None)
+            and task_obj.OUTPUT_TYPE == "generate_until"
+            and not getattr(task_obj, "HANDLES_FINAL_ANSWER", False)
+        ):
             from lm_eval.filters.extraction import FinalAnswerFilter
             for ensemble in task_obj._filters:
                 ensemble.filters.insert(0, partial(
@@ -705,7 +709,11 @@ def simple_evaluate(
         # for tasks that haven't already opted into their own repeated-sampling
         # scoring (e.g. cruxeval's native repeats=10 pass@k) -- clobbering those
         # would break their bespoke process_results.
-        if supports_avg_at_k and task_obj.get_config("repeats") in (None, 1):
+        if (
+            supports_avg_at_k
+            and not getattr(task_obj, "HANDLES_REPEATS", False)
+            and task_obj.get_config("repeats") in (None, 1)
+        ):
             plan = avg_k_plans.get(task_name)
             k = plan.k if plan is not None else 1
             metric_name = plan.metric_name if plan is not None else "avg@1"
@@ -1186,6 +1194,8 @@ def evaluate(
                         "target_hash": hash_string(str(target)),
                     }
                     example.update(metrics)
+                    if hasattr(task, "scoring_details"):
+                        example["scoring_details"] = task.scoring_details
                     acc["logged_samples"].append(example)
                 for metric, value in metrics.items():
                     if isinstance(value, _RepeatedMetricValues):
@@ -1415,6 +1425,11 @@ def evaluate(
     def _run_one_task(
         task_name: str, acc: ResultAcc, task_limit: int | None
     ) -> None:
+        task = acc["task"]
+        if callable(getattr(task, "validate_runtime", None)):
+            task.validate_runtime()
+        if getattr(task, "requires_multi_turn", False) and WORLD_SIZE != 1:
+            raise ValueError("Native multi-turn Coding tasks currently require one model process")
         task_fingerprint = None
         if checkpoint_store is not None:
             task_fingerprint = compute_task_fingerprint(dict(acc["task"].dump_config()))
@@ -1422,12 +1437,20 @@ def evaluate(
         benchmark_requests = defaultdict(list)
         for instance in acc["task"].instances:
             benchmark_requests[instance.request_type].append(instance)
-        run_requests(
-            benchmark_requests,
-            task_padding_requests.get(task_name, {}),
-            task_name=task_name,
-            task_fingerprint=task_fingerprint,
-        )
+        if getattr(task, "requires_multi_turn", False):
+            task.run_generation_rounds(
+                lambda requests: run_requests(
+                    requests, {}, task_name=task_name,
+                    task_fingerprint=task_fingerprint,
+                )
+            )
+        else:
+            run_requests(
+                benchmark_requests,
+                task_padding_requests.get(task_name, {}),
+                task_name=task_name,
+                task_fingerprint=task_fingerprint,
+            )
 
     # Group leaf tasks into schedulable units: every leaf of a benchmark group
     # runs as one unit so they still aggregate/publish together once all their

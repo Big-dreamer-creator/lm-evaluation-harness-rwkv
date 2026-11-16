@@ -52,3 +52,6 @@ examples/wandb/
 *.secrets
 *_api_key
 *_api_key.*
+
+# Downloaded SciCode test data is a runtime input.
+lm_eval/tasks/evalscope_coding/docker/scicode/test_data.h5

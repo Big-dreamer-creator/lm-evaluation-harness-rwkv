@@ -1,0 +1,17 @@
+task: evalscope_mt_bench_coding
+class: !function task.Coding
+dataset_path: HuggingFaceH4/mt_bench_prompts
+dataset_name: default
+test_split: train
+num_fewshot: 0
+repeats: 1
+generation_kwargs:
+  until: []
+  max_gen_toks: 1024
+  do_sample: true
+metadata:
+  version: 1.0
+  benchmark: mt_bench
+  subset: coding
+  hub: modelscope
+  source_revision: d9b7287e90c6bb9ddca1432ebcce88025895e211

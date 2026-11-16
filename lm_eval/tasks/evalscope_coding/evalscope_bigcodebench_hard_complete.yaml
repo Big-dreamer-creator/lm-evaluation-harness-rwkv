@@ -1,0 +1,18 @@
+task: evalscope_bigcodebench_hard_complete
+class: !function task.Coding
+dataset_path: bigcode/bigcodebench-hard
+dataset_name: null
+test_split: v0.1.4
+num_fewshot: 0
+repeats: 1
+generation_kwargs:
+  until: []
+  max_gen_toks: 4096
+  do_sample: true
+metadata:
+  version: 1.0
+  benchmark: bigcodebench_hard
+  subset: default
+  hub: huggingface
+  source_revision: d9b7287e90c6bb9ddca1432ebcce88025895e211
+  bcb_split: complete
