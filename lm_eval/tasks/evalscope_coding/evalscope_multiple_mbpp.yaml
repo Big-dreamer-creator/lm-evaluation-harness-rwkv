@@ -1,0 +1,26 @@
+group: evalscope_multiple_mbpp
+task:
+  - evalscope_multiple_mbpp_cpp
+  - evalscope_multiple_mbpp_ts
+  - evalscope_multiple_mbpp_sh
+  - evalscope_multiple_mbpp_cs
+  - evalscope_multiple_mbpp_go
+  - evalscope_multiple_mbpp_java
+  - evalscope_multiple_mbpp_lua
+  - evalscope_multiple_mbpp_js
+  - evalscope_multiple_mbpp_php
+  - evalscope_multiple_mbpp_pl
+  - evalscope_multiple_mbpp_rkt
+  - evalscope_multiple_mbpp_r
+  - evalscope_multiple_mbpp_rs
+  - evalscope_multiple_mbpp_scala
+  - evalscope_multiple_mbpp_swift
+  - evalscope_multiple_mbpp_rb
+  - evalscope_multiple_mbpp_d
+  - evalscope_multiple_mbpp_jl
+aggregate_metric_list:
+  - metric: pass@1
+    aggregation: mean
+    weight_by_size: true
+metadata:
+  version: 1.0

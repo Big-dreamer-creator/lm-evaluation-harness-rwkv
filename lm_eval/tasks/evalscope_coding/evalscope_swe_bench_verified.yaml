@@ -1,0 +1,17 @@
+task: evalscope_swe_bench_verified
+class: !function task.Coding
+dataset_path: princeton-nlp/SWE-bench_Verified
+dataset_name: null
+test_split: test
+num_fewshot: 0
+repeats: 1
+generation_kwargs:
+  until: []
+  max_gen_toks: 4096
+  do_sample: true
+metadata:
+  version: 1.0
+  benchmark: swe_bench_verified
+  subset: default
+  hub: huggingface
+  source_revision: d9b7287e90c6bb9ddca1432ebcce88025895e211

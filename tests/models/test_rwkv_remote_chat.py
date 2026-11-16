@@ -135,6 +135,7 @@ def test_rwkv7_remote_chat_create_payload_sends_chat_template_kwargs(monkeypatch
     assert payload["chat_template_kwargs"] == {
         "rwkv_prompt_template": "bot",
         "rwkv_generation_prompt": "open_think",
+        "fake_cot_mode": False,
     }
     assert "generation_config" not in payload
     assert payload["top_p"] == 0.76
@@ -155,6 +156,7 @@ def test_rwkv7_remote_chat_no_think_sends_template_and_deterministic_profile(mon
     assert payload["chat_template_kwargs"] == {
         "rwkv_prompt_template": "assistant",
         "rwkv_generation_prompt": "no_think",
+        "fake_cot_mode": False,
     }
     generation_config = json.loads(payload["generation_config"])
     assert generation_config["temperature"] == 0.0

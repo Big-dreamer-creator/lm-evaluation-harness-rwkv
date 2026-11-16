@@ -1,0 +1,17 @@
+task: evalscope_live_code_bench_v1_v4
+class: !function task.Coding
+dataset_path: evalscope/livecodebench_code_generation_lite_parquet
+dataset_name: v1_v4
+test_split: test
+num_fewshot: 0
+repeats: 1
+generation_kwargs:
+  until: []
+  max_gen_toks: 24576
+  do_sample: true
+metadata:
+  version: 1.0
+  benchmark: live_code_bench
+  subset: v1_v4
+  hub: modelscope
+  source_revision: d9b7287e90c6bb9ddca1432ebcce88025895e211

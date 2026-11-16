@@ -1,0 +1,9 @@
+group: evalscope_bigcodebench_hard
+task:
+  - evalscope_bigcodebench_hard_instruct
+aggregate_metric_list:
+  - metric: pass@1
+    aggregation: mean
+    weight_by_size: true
+metadata:
+  version: 1.0

@@ -1,0 +1,267 @@
+{
+  "source_revision": "d9b7287e90c6bb9ddca1432ebcce88025895e211",
+  "benchmarks": {
+    "bigcodebench": {
+      "dataset_id": "evalscope/bigcodebench",
+      "subset_list": [
+        "default"
+      ],
+      "eval_split": "v0.1.4",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "{prompt}"
+    },
+    "bigcodebench_hard": {
+      "dataset_id": "evalscope/bigcodebench-hard",
+      "subset_list": [
+        "default"
+      ],
+      "eval_split": "v0.1.4",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "{prompt}"
+    },
+    "bird_sql": {
+      "dataset_id": "evalscope/bird_mini_dev",
+      "subset_list": [
+        "simple",
+        "moderate",
+        "challenging"
+      ],
+      "eval_split": "mini_dev_sqlite",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "{question}"
+    },
+    "ds1000": {
+      "dataset_id": "xlangai/DS-1000",
+      "subset_list": [
+        "Pandas",
+        "Numpy",
+        "Matplotlib",
+        "Sklearn",
+        "Scipy",
+        "Pytorch",
+        "Tensorflow"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "Write a short code following the given format and indentation. Place the executable code between <code> and </code> tags, without any other non-executable things.",
+      "prompt_template": "{question}"
+    },
+    "humaneval": {
+      "dataset_id": "opencompass/humaneval",
+      "subset_list": [
+        "openai_humaneval"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "Read the following function signature and docstring, and fully implement the function described. Your response should only contain the code for this function.\n{question}"
+    },
+    "humaneval_plus": {
+      "dataset_id": "evalscope/humanevalplus",
+      "subset_list": [
+        "default"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "Read the following function signature and docstring, and fully implement the function described. Your response should only contain the code for this function.\n{question}"
+    },
+    "live_code_bench": {
+      "dataset_id": "evalscope/livecodebench_code_generation_lite_parquet",
+      "subset_list": [
+        "release_latest",
+        "release_v1",
+        "release_v2",
+        "release_v3",
+        "release_v4",
+        "release_v5",
+        "release_v6",
+        "v1",
+        "v1_v2",
+        "v1_v3",
+        "v1_v4",
+        "v1_v5",
+        "v1_v6",
+        "v2",
+        "v2_v3",
+        "v2_v4",
+        "v2_v5",
+        "v2_v6",
+        "v3",
+        "v3_v4",
+        "v3_v5",
+        "v3_v6",
+        "v4",
+        "v4_v5",
+        "v4_v6",
+        "v5",
+        "v5_v6",
+        "v6"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests. You will NOT return anything except for the program.",
+      "prompt_template": "### Question:\n{question_content}\n\n{format_prompt} ### Answer: (use the provided format with backticks)\n\n"
+    },
+    "mbpp": {
+      "dataset_id": "google-research-datasets/mbpp",
+      "subset_list": [
+        "full"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 3,
+      "system_prompt": "",
+      "prompt_template": "You are an expert Python programmer, and here is your task: {question} Your code should pass these tests:\n\n{tests}"
+    },
+    "mbpp_plus": {
+      "dataset_id": "evalscope/mbppplus",
+      "subset_list": [
+        "default"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "You are an expert Python programmer, and here is your task: {question} Your code should pass these tests:\n\n{tests}"
+    },
+    "mt_bench": {
+      "dataset_id": "HuggingFaceH4/mt_bench_prompts",
+      "subset_list": [
+        "writing",
+        "roleplay",
+        "reasoning",
+        "math",
+        "coding",
+        "extraction",
+        "stem",
+        "humanities"
+      ],
+      "eval_split": "train",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": ""
+    },
+    "multiple_humaneval": {
+      "dataset_id": "evalscope/MultiPL-E",
+      "subset_list": [
+        "humaneval-cpp",
+        "humaneval-ts",
+        "humaneval-sh",
+        "humaneval-cs",
+        "humaneval-go",
+        "humaneval-java",
+        "humaneval-lua",
+        "humaneval-js",
+        "humaneval-php",
+        "humaneval-pl",
+        "humaneval-rkt",
+        "humaneval-r",
+        "humaneval-rs",
+        "humaneval-scala",
+        "humaneval-swift",
+        "humaneval-rb",
+        "humaneval-d",
+        "humaneval-jl"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "{prompt}"
+    },
+    "multiple_mbpp": {
+      "dataset_id": "evalscope/MultiPL-E",
+      "subset_list": [
+        "mbpp-cpp",
+        "mbpp-ts",
+        "mbpp-sh",
+        "mbpp-cs",
+        "mbpp-go",
+        "mbpp-java",
+        "mbpp-lua",
+        "mbpp-js",
+        "mbpp-php",
+        "mbpp-pl",
+        "mbpp-rkt",
+        "mbpp-r",
+        "mbpp-rs",
+        "mbpp-scala",
+        "mbpp-swift",
+        "mbpp-rb",
+        "mbpp-d",
+        "mbpp-jl"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "{prompt}"
+    },
+    "scicode": {
+      "dataset_id": "evalscope/SciCode",
+      "subset_list": [
+        "default"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "\nPROBLEM DESCRIPTION:\nYou will be provided with a description of a scientific problem. You will solve these problems by solving a sequence of *subproblems*. The solution to each subproblem may be implemented using your solutions to earlier subproblems. Each subproblem should be solved by providing a Python function that meets the specifications provided.\n\nFor each subproblem, you will be provided with the following\n 1. a description of the subproblem\n 2. a function header, which you must use in your solution implementation\n 3. a return line, which you must use in your solution implementation\n\nYou must only use the following dependencies to implement your solution:\n{required_dependencies}\n\nYou MUST NOT import these dependencies anywhere in the code you generate.\n\nFor each subproblem provided you must solve it as follows:\n 1. Generate scientific background required for the next step, in a comment\n 2. Implement a function to solve the problem provided, using the provided header and return line\n\nThe response must be formatted as ```python```\n"
+    },
+    "swe_bench_lite": {
+      "dataset_id": "princeton-nlp/SWE-bench_Lite",
+      "subset_list": [
+        "default"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "{question}"
+    },
+    "swe_bench_verified": {
+      "dataset_id": "princeton-nlp/SWE-bench_Verified",
+      "subset_list": [
+        "default"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "{question}"
+    },
+    "swe_bench_verified_mini": {
+      "dataset_id": "evalscope/swe-bench-verified-mini",
+      "subset_list": [
+        "default"
+      ],
+      "eval_split": "test",
+      "few_shot_num": 0,
+      "system_prompt": "",
+      "prompt_template": "{question}"
+    }
+  },
+  "helpers": {
+    "code_utils.py": {
+      "source": "evalscope/utils/code_utils.py",
+      "sha256": "2da977154bed4f95b2955aa61226f667b3c1c0d11d582d13c4860234fec14fff"
+    },
+    "multiple.py": {
+      "source": "evalscope/benchmarks/multipl_e/utils.py",
+      "sha256": "9039da00ddfdd08d4afae9605cb0c5d883e1b09c619a7b1108b96f8c4f9ade51"
+    },
+    "lcb_testing.py": {
+      "source": "evalscope/benchmarks/live_code_bench/testing_util.py",
+      "sha256": "e5bf8f4fc5680d756471c33afffe7ff6c16f71936247b80fbc6706a198bbe58f"
+    },
+    "lcb_extract.py": {
+      "source": "evalscope/benchmarks/live_code_bench/extract_utils.py",
+      "sha256": "d14abb2fa00a4bde9e9521f670dff84185e058eee1e99c4c630e4e78726b7992"
+    },
+    "bird.py": {
+      "source": "evalscope/benchmarks/bird_sql/utils.py",
+      "sha256": "d09d353e7bcf609a30a1dc31b206429cbda8978b05ff61f44da70091ad66bd70"
+    },
+    "scicode_prompts.py": {
+      "source": "evalscope/benchmarks/scicode/prompt_templates.py",
+      "sha256": "dc21e643549366fe2c82b0325ec089102ba1cb40cef19247e8aa3486a8072ba8"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+task: evalscope_bird_sql_simple
+class: !function task.Coding
+dataset_path: evalscope/bird_mini_dev
+dataset_name: default
+test_split: mini_dev_sqlite
+num_fewshot: 0
+repeats: 1
+generation_kwargs:
+  until: []
+  max_gen_toks: 4096
+  do_sample: true
+metadata:
+  version: 1.0
+  benchmark: bird_sql
+  subset: simple
+  hub: modelscope
+  source_revision: d9b7287e90c6bb9ddca1432ebcce88025895e211

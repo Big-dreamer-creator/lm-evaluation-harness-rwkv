@@ -13,6 +13,22 @@ def _build(**kwargs):
     return RWKV7Remote(**kwargs)
 
 
+@pytest.mark.parametrize("mode", ["fake_think", "open_think", "no_think"])
+def test_official_fake_cot_flag_template_preserves_requested_mode(mode):
+    model = _build(rwkv_generation_prompt=mode)
+    model._chat_template_source = (
+        "User: {{ messages[0].content }}\n\nAssistant: "
+        "{{ '<think></think' if fake_cot_mode|default(false) else '<think' }}"
+    )
+    rendered = model.apply_chat_template([{"role": "user", "content": "Write code"}])
+    expected = {
+        "fake_think": "Assistant: <think></think>\n",
+        "open_think": "Assistant: <think",
+        "no_think": "Assistant: ",
+    }
+    assert rendered.endswith(expected[mode])
+
+
 def test_remote_sends_sampling_fields_to_vllm_directly():
     model = _build(rwkv_generation_prompt="open_think")
     payload = model._create_payload("question", generate=True,

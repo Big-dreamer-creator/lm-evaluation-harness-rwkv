@@ -1,0 +1,18 @@
+group: evalscope_coding
+task:
+  - evalscope_bigcodebench
+  - evalscope_bigcodebench_hard
+  - evalscope_bird_sql
+  - evalscope_ds1000
+  - evalscope_humaneval
+  - evalscope_humaneval_plus
+  - evalscope_live_code_bench
+  - evalscope_mbpp
+  - evalscope_mbpp_plus
+  - evalscope_mt_bench_coding
+  - evalscope_multiple_humaneval
+  - evalscope_multiple_mbpp
+  - evalscope_scicode
+  - evalscope_swe_bench_lite
+  - evalscope_swe_bench_verified
+  - evalscope_swe_bench_verified_mini

@@ -1,0 +1,9 @@
+group: evalscope_live_code_bench
+task:
+  - evalscope_live_code_bench_release_latest
+aggregate_metric_list:
+  - metric: pass@1
+    aggregation: mean
+    weight_by_size: true
+metadata:
+  version: 1.0

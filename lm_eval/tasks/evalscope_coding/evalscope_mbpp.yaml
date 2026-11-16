@@ -1,0 +1,17 @@
+task: evalscope_mbpp
+class: !function task.Coding
+dataset_path: google-research-datasets/mbpp
+dataset_name: full
+test_split: test
+num_fewshot: 3
+repeats: 1
+generation_kwargs:
+  until: []
+  max_gen_toks: 4096
+  do_sample: true
+metadata:
+  version: 1.0
+  benchmark: mbpp
+  subset: full
+  hub: huggingface
+  source_revision: d9b7287e90c6bb9ddca1432ebcce88025895e211

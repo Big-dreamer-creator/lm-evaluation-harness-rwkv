@@ -43,9 +43,11 @@ class RWKV7RemoteChat(LocalChatCompletion):
     """
 
     SUPPORTS_AVG_AT_K = True
+    SUPPORTS_TASK_TEMPERATURE = True
     INDEPENDENT_ROLLOUTS = True
     PRESERVE_INPUT_CONTEXT = True
-    EVALUATION_PROTOCOL_VERSION = "rwkv-generative-v2"
+    # Template kwargs changed: do not reuse chat checkpoints from the old contract.
+    EVALUATION_PROTOCOL_VERSION = "rwkv-generative-v3"
 
     DEFAULT_BASE_URL = "https://api.rwkv.rs/v1/chat/completions"
     PROMPT_TEMPLATES = RWKV7Remote.PROMPT_TEMPLATES
@@ -361,6 +363,8 @@ class RWKV7RemoteChat(LocalChatCompletion):
         gen_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> dict:
+        gen_kwargs = dict(gen_kwargs or {})
+        task_temperature = gen_kwargs.pop("rwkv_task_temperature", None)
         # generate_until only produces a JsonChatStr (-> list[dict]) when the
         # caller renders one via apply_chat_template/_resolve_choice; plain
         # generate_until tasks with apply_chat_template=false hand create_message
@@ -382,11 +386,17 @@ class RWKV7RemoteChat(LocalChatCompletion):
         payload["chat_template_kwargs"] = {
             "rwkv_prompt_template": self.rwkv_prompt_template,
             "rwkv_generation_prompt": self.rwkv_generation_prompt,
+            "fake_cot_mode": self.rwkv_generation_prompt == "fake_think",
         }
         if self.rwkv_generation_prompt == "no_think":
+            profile = dict(self._generation_profile)
+            if task_temperature is not None:
+                profile["temperature"] = task_temperature
             payload["generation_config"] = json.dumps(
-                self._generation_profile, separators=(",", ":"), sort_keys=True
+                profile, separators=(",", ":"), sort_keys=True
             )
+        if task_temperature is not None:
+            payload["temperature"] = task_temperature
 
         return payload
 

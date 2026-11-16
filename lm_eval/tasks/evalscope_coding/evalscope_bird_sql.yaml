@@ -1,0 +1,11 @@
+group: evalscope_bird_sql
+task:
+  - evalscope_bird_sql_simple
+  - evalscope_bird_sql_moderate
+  - evalscope_bird_sql_challenging
+aggregate_metric_list:
+  - metric: accuracy
+    aggregation: mean
+    weight_by_size: true
+metadata:
+  version: 1.0

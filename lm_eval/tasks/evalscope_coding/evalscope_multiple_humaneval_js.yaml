@@ -1,0 +1,17 @@
+task: evalscope_multiple_humaneval_js
+class: !function task.Coding
+dataset_path: nuprl/MultiPL-E
+dataset_name: humaneval-js
+test_split: test
+num_fewshot: 0
+repeats: 1
+generation_kwargs:
+  until: []
+  max_gen_toks: 4096
+  do_sample: true
+metadata:
+  version: 1.0
+  benchmark: multiple_humaneval
+  subset: humaneval-js
+  hub: huggingface
+  source_revision: d9b7287e90c6bb9ddca1432ebcce88025895e211
