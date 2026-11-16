@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from contextlib import closing
 
 from lm_eval.api.filter import FilterEnsemble
 from lm_eval.api.instance import Instance
@@ -52,7 +53,9 @@ class Coding(ConfigurableTask):
         config.update(
             output_type="generate_until",
             unsafe_code=True,
-            process_results=self.process_results,
+            # Like Task.override_metric, name the class override without retaining
+            # the live task/model (which can hold locks) in serializable config.
+            process_results="process_results",
             metric_list=[
                 {"metric": key, "aggregation": "mean", "higher_is_better": True}
                 for key in keys
@@ -153,6 +156,9 @@ class Coding(ConfigurableTask):
         if self.benchmark == "mt_bench":
             args = dict(request.arguments[1])
             args["temperature"] = 0.0  # Official Coding category temperature.
+            owner = getattr(self._render_chat, "__self__", None)
+            if getattr(owner, "SUPPORTS_TASK_TEMPERATURE", False):
+                args["rwkv_task_temperature"] = 0.0
             request.arguments = (request.arguments[0], args)
         return request
 
@@ -177,7 +183,7 @@ class Coding(ConfigurableTask):
             import docker
             import swebench.harness.run_evaluation  # noqa: F401
 
-            with docker.from_env() as client:
+            with closing(docker.from_env()) as client:
                 client.ping()
         elif self.benchmark == "mt_bench":
             import os

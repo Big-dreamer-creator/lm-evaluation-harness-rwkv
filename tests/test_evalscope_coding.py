@@ -556,8 +556,6 @@ def test_swe_official_verdicts_and_incomplete_runs(monkeypatch, tmp_path, outcom
     constants.APPLY_PATCH_FAIL = ">>>>> Patch Apply Failed"
     client = Mock()
     modules["docker"].from_env = Mock(return_value=client)
-    client.__enter__ = Mock(return_value=client)
-    client.__exit__ = Mock(return_value=False)
     make_spec = Mock(return_value="spec")
     modules["swebench.harness.test_spec.test_spec"].make_test_spec = make_spec
     calls = []
@@ -578,7 +576,14 @@ def test_swe_official_verdicts_and_incomplete_runs(monkeypatch, tmp_path, outcom
         return {"completed": outcome in {"pass", "fail"}, "resolved": outcome == "pass"}
 
     modules["swebench.harness.run_evaluation"].run_instance = run_instance
-    doc = {"instance_id": "repo__issue-1", "test_patch": "original tests"}
+    from datetime import datetime
+
+    doc = {
+        "instance_id": "repo__issue-1",
+        "test_patch": "original tests",
+        # HF's JSON loader infers this real SWE-bench field as a timestamp.
+        "created_at": datetime(2023, 1, 1),
+    }
     if outcome == "infrastructure":
         with pytest.raises(runtime.JudgeError, match="could not complete"):
             runtime.swe_judge(doc, "patch", {})
@@ -596,6 +601,7 @@ def test_swe_official_verdicts_and_incomplete_runs(monkeypatch, tmp_path, outcom
         else {**doc, "test_patch": "different tests"},
         namespace="swebench",
     )
+    assert client.close.called
 
 
 @pytest.mark.parametrize("pass_k", [[], [0], [True], [2]])
@@ -605,3 +611,65 @@ def test_invalid_sampling_contract_rejected_before_grading(
     task = build_task(monkeypatch, records, "humaneval", pass_k=pass_k)
     with pytest.raises(ValueError, match="pass_k"):
         task.validate_runtime()
+
+
+def test_task_config_does_not_copy_live_model_or_grader(monkeypatch, records):
+    import threading
+
+    task = build_task(monkeypatch, records, "humaneval")
+
+    class LiveModel:
+        def __init__(self):
+            self.lock = threading.Lock()
+
+        def render(self, messages):
+            return str(messages)
+
+    task._render_chat = LiveModel().render
+    task._judge = threading.Lock()
+    assert task.dump_config()["process_results"] == "process_results"
+
+
+@pytest.mark.parametrize("benchmark", ["mt_bench", "humaneval"])
+def test_only_mt_bench_overrides_rwkv_profile_temperature(
+    monkeypatch, records, benchmark
+):
+    from lm_eval.models.rwkv_remote import RWKV7Remote
+
+    task = build_task(monkeypatch, records, benchmark)
+    task._render_chat = RWKV7Remote(
+        model="test", tokenizer_backend=None
+    ).apply_chat_template
+    request = task.construct_requests(task.eval_docs[0], "prompt")
+    if benchmark == "mt_bench":
+        assert request.args[1]["rwkv_task_temperature"] == 0.0
+        assert request.args[1]["temperature"] == 0.0
+    else:
+        assert "rwkv_task_temperature" not in request.args[1]
+
+
+@pytest.mark.parametrize("chat", [False, True])
+@pytest.mark.parametrize("mode", ["fake_think", "open_think", "no_think"])
+def test_rwkv_task_temperature_is_opt_in_and_never_sent_as_extra_field(
+    monkeypatch, chat, mode
+):
+    from lm_eval.models.rwkv_remote import RWKV7Remote
+    from lm_eval.models.rwkv_remote_chat import RWKV7RemoteChat
+
+    model_class = RWKV7RemoteChat if chat else RWKV7Remote
+    monkeypatch.setenv("RWKV_API_KEY", "fixture-key")
+    model = model_class(model="test", rwkv_generation_prompt=mode)
+    kwargs = {"max_gen_toks": 32, "until": [], "temperature": 0.0}
+    baseline = model._create_payload("question", generate=True, gen_kwargs=kwargs)
+    assert baseline["temperature"] == model._generation_profile["temperature"]
+    override = {**kwargs, "rwkv_task_temperature": 0.0}
+    payload = model._create_payload("question", generate=True, gen_kwargs=override)
+    assert payload["temperature"] == 0.0
+    assert "rwkv_task_temperature" not in payload
+    if chat:
+        assert payload["chat_template_kwargs"]["fake_cot_mode"] == (
+            mode == "fake_think"
+        )
+    assert override["rwkv_task_temperature"] == 0.0
+    if chat and mode == "no_think":
+        assert json.loads(payload["generation_config"])["temperature"] == 0.0

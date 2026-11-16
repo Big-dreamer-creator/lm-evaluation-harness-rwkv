@@ -66,6 +66,7 @@ class RWKV7Remote(LocalCompletionsAPI):
     # no_think/open_think/fake_think sampling profile) and averaging correctness over
     # them, rather than the echo/logprob loglikelihood path used by default.
     SUPPORTS_AVG_AT_K = True
+    SUPPORTS_TASK_TEMPERATURE = True
     INDEPENDENT_ROLLOUTS = True
     PRESERVE_INPUT_CONTEXT = True
     EVALUATION_PROTOCOL_VERSION = "rwkv-generative-v2"
@@ -510,6 +511,9 @@ class RWKV7Remote(LocalCompletionsAPI):
             add_generation_prompt=add_generation_prompt,
             rwkv_prompt_template=self.rwkv_prompt_template,
             rwkv_generation_prompt=template_generation_prompt,
+            # Current official G1L templates use this flag; older templates
+            # consume rwkv_generation_prompt instead. Supply both contracts.
+            fake_cot_mode=self.rwkv_generation_prompt == "fake_think",
             tools=kwargs.pop("tools", None),
             raise_exception=raise_exception,
             **kwargs,
@@ -535,6 +539,8 @@ class RWKV7Remote(LocalCompletionsAPI):
         gen_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> dict:
+        gen_kwargs = dict(gen_kwargs or {})
+        task_temperature = gen_kwargs.pop("rwkv_task_temperature", None)
         payload = super()._create_payload(
             messages, generate=generate, gen_kwargs=gen_kwargs, **kwargs
         )
@@ -546,6 +552,8 @@ class RWKV7Remote(LocalCompletionsAPI):
             "temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "penalty_decay"
         )})
         payload["stop"] = list(dict.fromkeys([*(payload.get("stop") or []), self.PROMPT_STOPS[self.rwkv_prompt_template]]))
+        if task_temperature is not None:
+            payload["temperature"] = task_temperature
 
         return payload
 

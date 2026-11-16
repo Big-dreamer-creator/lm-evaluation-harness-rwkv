@@ -585,7 +585,11 @@ def test_cli_real_http_chat_and_docker(suite, tmp_path, docker_judge, monkeypatc
     assert sorted(payload["seed"] for payload in sent) == [40, 41]
     assert all(
         payload["chat_template_kwargs"]
-        == {"rwkv_prompt_template": "assistant", "rwkv_generation_prompt": "open_think"}
+        == {
+            "rwkv_prompt_template": "assistant",
+            "rwkv_generation_prompt": "open_think",
+            "fake_cot_mode": False,
+        }
         for payload in sent
     )
     assert all(

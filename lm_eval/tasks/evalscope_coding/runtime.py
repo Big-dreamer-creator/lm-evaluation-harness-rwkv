@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
 import requests
 
 from lm_eval.rwkv_coding import DockerJudge, JudgeError
+from lm_eval.utils import handle_non_serializable
 
 
 JUDGE_FORMAT = (
@@ -121,12 +123,14 @@ def swe_judge(doc: dict, patch: str, metadata: dict) -> dict:
         return {"passed": False, "status": "empty_patch"}
     # Include both tests and prediction: official run_instance caches by run ID.
     identity = hashlib.sha256(
-        json.dumps([doc, patch], sort_keys=True).encode()
+        json.dumps(
+            [doc, patch], sort_keys=True, default=handle_non_serializable
+        ).encode()
     ).hexdigest()
     run_id = "lm-eval-coding-" + identity
     spec = make_test_spec(doc, namespace=metadata.get("swe_namespace", "swebench"))
     log_dir = RUN_EVALUATION_LOG_DIR / run_id / "lm-eval" / doc["instance_id"]
-    with docker.from_env() as client:
+    with closing(docker.from_env()) as client:
         result = run_instance(
             spec,
             {

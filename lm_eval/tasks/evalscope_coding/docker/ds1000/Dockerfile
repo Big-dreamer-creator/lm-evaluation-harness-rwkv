@@ -1,6 +1,8 @@
 # DS-1000 official evaluation environment (environment.yml of https://github.com/xlang-ai/DS-1000).
 FROM python:3.10-slim
 
+RUN python -m pip install --no-cache-dir --upgrade pip==25.3
+
 RUN pip install --no-cache-dir \
     numpy==1.26.4 \
     pandas==1.5.3 \
@@ -24,3 +26,6 @@ RUN if [ "$(uname -m)" = "x86_64" ]; then \
 RUN if [ "$(uname -m)" = "x86_64" ]; then \
         pip install --no-cache-dir tensorflow-cpu==2.16.1; \
     fi
+
+# Match the grader's one-CPU allocation; host-sized pools can exhaust its PID cap.
+ENV TF_NUM_INTEROP_THREADS=1 TF_NUM_INTRAOP_THREADS=1 OMP_NUM_THREADS=1
