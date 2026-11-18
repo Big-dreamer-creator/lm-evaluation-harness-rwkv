@@ -35,6 +35,9 @@ Homepage: https://huggingface.co/datasets/sean0042/KorMedMCQA
 * `kormedmcqa_dentist`: `Official Korean Dentist Examination`
 
 ### Changelog
+- v3.1: use native choice accuracy (`acc`) for the RWKV NoCoT
+  `multiple_choice` variant. The official `generate_until` path retains its
+  `exact_match` extraction scorer.
 - v3.0: added the answer-extraction filter from Appendix B of the paper, so verbose generations (e.g. `정답: B`) are scored on the extracted option letter instead of the raw text. Expect higher scores for models that do not answer with a bare letter.
 
 ### Checklist

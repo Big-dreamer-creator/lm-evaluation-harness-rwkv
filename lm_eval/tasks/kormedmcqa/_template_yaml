@@ -33,4 +33,16 @@ generation_kwargs:
   temperature: 0.0
   max_gen_toks: 1024
 metadata:
-  version: 3.0
+  version: 3.1
+  rwkv_no_think:
+    output_type: multiple_choice
+    doc_to_text: "{{question.strip()}}\nA. {{A}}\nB. {{B}}\nC. {{C}}\nD. {{D}}\nE. {{E}}\nAnswer:"
+    doc_to_choice: ["A", "B", "C", "D", "E"]
+    doc_to_target: "{{answer-1}}"
+    process_results: null
+    generation_kwargs: null
+    filter_list: null
+    metric_list:
+      - metric: acc
+        aggregation: mean
+        higher_is_better: true

@@ -1,10 +1,11 @@
 import datasets
+import numpy as np
 
 from lm_eval.tasks.discrim_eval.utils import (
-    agg_age_bias_slope,
-    agg_demographic_bias_diff,
+    agg_demographic_bias_regression,
     process_results,
     shuffle_scenarios,
+    stratify_by_scenario,
 )
 
 
@@ -12,118 +13,61 @@ def _make_doc(race, gender, age, template_id):
     return {"race": race, "gender": gender, "age": age, "decision_question_id": template_id}
 
 
-def test_process_results_extracts_hard_choice_from_yes_no_filter():
-    # `results[0]` is the `yes_no` filter's single-generation output (see
-    # lm_eval/filters/extraction.py) -- already normalized to "yes"/"no".
+def _logit(p: float) -> float:
+    return float(np.log(p) - np.log1p(-p))
+
+
+def test_process_results_computes_logit_yes_from_four_way_likelihoods():
     doc = _make_doc("white", "male", 30.0, 0)
-    out = process_results(doc, [["yes"]])
-    assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", 1)
-
-    out = process_results(doc, [["no"]])
-    assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", 0)
-
-
-def test_process_results_returns_none_for_unparsed_generation():
-    # The `yes_no` filter returns its fallback sentinel ("[invalid]") when
-    # no "yes"/"no" verdict could be extracted from the generation at all --
-    # `process_results` must not guess "no" for that case.
-    doc = _make_doc("white", "male", 30.0, 0)
-    out = process_results(doc, [["[invalid]"]])
-    assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", None)
+    # yes=Yes=no=No equally likely -> pnorm(yes) = 0.5 -> logit 0.0
+    out = process_results(doc, [(0.0, True), (0.0, True), (0.0, True), (0.0, True)])
+    demographics, bias_name, logit_yes = out["black_bias"]
+    assert demographics == ("white", "male", 30.0, 0)
+    assert bias_name == "black_bias"
+    assert logit_yes == 0.0
 
 
-def test_process_results_ranks_native_likelihoods_instead_of_greedy_flags():
-    doc = _make_doc("white", "male", 30.0, 0)
-    # More than one candidate can be greedy; select the sequence by logprob.
-    out = process_results(doc, [(-2.0, True), (-3.0, True), (-0.5, False), (-1.0, False)])
-    assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", 0)
+def test_process_results_combines_upper_and_lower_case_candidates():
+    doc = _make_doc("black", "female", 45.0, 1)
+    # yes/Yes overwhelmingly more likely than no/No.
+    out = process_results(doc, [(-0.01, True), (-0.01, True), (-10.0, False), (-10.0, False)])
+    _, _, logit_yes = out["age_bias"]
+    assert logit_yes > 0
 
 
-def test_agg_demographic_bias_diff_recovers_injected_bias():
-    # Scenario 0: black always chosen "yes", white always chosen "no" ->
-    # a clean +1.0 bias favoring black over the white reference.
+def test_agg_demographic_bias_regression_empty_input_is_zero():
+    assert agg_demographic_bias_regression([]) == 0.0
+
+
+def test_agg_demographic_bias_regression_too_few_rows_is_zero():
+    items = [(("white", "male", 30.0, 0), "black_bias", 1.0)]
+    assert agg_demographic_bias_regression(items) == 0.0
+
+
+def test_agg_demographic_bias_regression_skips_rows_with_missing_demographics():
+    # Every row is missing a demographic field, so none can enter the
+    # regression -- must fall back to 0.0 rather than raising.
+    items = [
+        ((None, "male", 30.0, 0), "black_bias", 1.0),
+        (("white", None, 30.0, 0), "black_bias", 0.0),
+    ]
+    assert agg_demographic_bias_regression(items) == 0.0
+
+
+def test_agg_demographic_bias_regression_recovers_injected_bias():
+    # A balanced race x gender x age cross per scenario, with black
+    # consistently scored higher logit_yes than white -> a clean positive
+    # coefficient for black vs. the white reference.
     items = []
-    for _ in range(3):
-        items.append(
-            (("black", "male", 30.0, 0), "black_bias", 1)
-        )
-        items.append(
-            (("white", "male", 30.0, 0), "black_bias", 0)
-        )
-    assert agg_demographic_bias_diff(items) == 1.0
-
-
-def test_agg_demographic_bias_diff_averages_across_scenarios():
-    items = [
-        (("black", "male", 30.0, 0), "black_bias", 1),
-        (("white", "male", 30.0, 0), "black_bias", 0),
-        (("black", "male", 30.0, 1), "black_bias", 0),
-        (("white", "male", 30.0, 1), "black_bias", 0),
-    ]
-    # scenario 0 diff = 1.0, scenario 1 diff = 0.0 -> mean 0.5
-    assert agg_demographic_bias_diff(items) == 0.5
-
-
-def test_agg_demographic_bias_diff_skips_scenarios_missing_a_group():
-    items = [
-        # scenario 0 has no white rows at all -> skipped
-        (("black", "male", 30.0, 0), "black_bias", 1),
-        (("black", "male", 30.0, 1), "black_bias", 1),
-        (("white", "male", 30.0, 1), "black_bias", 0),
-    ]
-    assert agg_demographic_bias_diff(items) == 1.0
-
-
-def test_agg_demographic_bias_diff_empty_input_is_zero():
-    assert agg_demographic_bias_diff([]) == 0.0
-
-
-def test_agg_demographic_bias_diff_skips_unparsed_none_entries():
-    # An unparsed doc (chose_yes=None) must not be silently counted as
-    # "chose no" -- that would fabricate a fake bias signal from a
-    # generation the model's answer couldn't even be extracted from.
-    items = [
-        (("black", "male", 30.0, 0), "black_bias", 1),
-        (("black", "male", 30.0, 0), "black_bias", None),
-        (("white", "male", 30.0, 0), "black_bias", 0),
-    ]
-    assert agg_demographic_bias_diff(items) == 1.0
-
-
-def test_agg_age_bias_slope_recovers_positive_trend():
-    items = [
-        (("white", "male", 20.0, 0), "age_bias", 0),
-        (("white", "male", 40.0, 0), "age_bias", 0),
-        (("white", "male", 60.0, 0), "age_bias", 1),
-        (("white", "male", 80.0, 0), "age_bias", 1),
-    ]
-    assert agg_age_bias_slope(items) > 0.0
-
-
-def test_agg_age_bias_slope_empty_input_is_zero():
-    assert agg_age_bias_slope([]) == 0.0
-
-
-def test_agg_age_bias_slope_skips_unparsed_none_entries():
-    items = [
-        (("white", "male", 20.0, 0), "age_bias", 0),
-        (("white", "male", 30.0, 0), "age_bias", None),
-        (("white", "male", 40.0, 0), "age_bias", 0),
-        (("white", "male", 60.0, 0), "age_bias", 1),
-        (("white", "male", 80.0, 0), "age_bias", 1),
-    ]
-    assert agg_age_bias_slope(items) > 0.0
-
-
-def test_agg_age_bias_slope_skips_degenerate_scenarios():
-    items = [
-        # single row: not enough to compute a slope
-        (("white", "male", 20.0, 0), "age_bias", 1),
-        # all same age: zero variance, must be skipped rather than div-by-zero
-        (("white", "male", 30.0, 1), "age_bias", 1),
-        (("white", "female", 30.0, 1), "age_bias", 0),
-    ]
-    assert agg_age_bias_slope(items) == 0.0
+    ages = [20.0, 40.0, 60.0, 80.0]
+    for scenario in range(3):
+        for age in ages:
+            items.append((("black", "male", age, scenario), "black_bias", _logit(0.9)))
+            items.append((("white", "male", age, scenario), "black_bias", _logit(0.1)))
+            items.append((("black", "female", age, scenario), "black_bias", _logit(0.9)))
+            items.append((("white", "female", age, scenario), "black_bias", _logit(0.1)))
+    coef = agg_demographic_bias_regression(items)
+    assert coef > 0
 
 
 def test_shuffle_scenarios_preserves_rows_and_scenario_contiguity():
@@ -160,3 +104,26 @@ def test_shuffle_scenarios_is_deterministic():
     ]
     dataset = datasets.Dataset.from_list(rows)
     assert shuffle_scenarios(dataset)["value"] == shuffle_scenarios(dataset)["value"]
+
+
+def test_stratify_by_scenario_preserves_rows_and_covers_every_scenario_first():
+    rows = []
+    for template_id in range(4):
+        for race in ["white", "black"]:
+            for gender in ["male", "female"]:
+                for age in [20.0, 40.0]:
+                    rows.append(
+                        {
+                            "decision_question_id": template_id,
+                            "race": race,
+                            "gender": gender,
+                            "age": age,
+                        }
+                    )
+    dataset = datasets.Dataset.from_list(rows)
+
+    stratified = stratify_by_scenario(dataset, per_scenario=2)
+
+    assert len(stratified) == len(dataset)
+    first_block_ids = set(stratified["decision_question_id"][: 4 * 2])
+    assert first_block_ids == {0, 1, 2, 3}

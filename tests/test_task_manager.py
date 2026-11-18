@@ -9,7 +9,7 @@ from lm_eval.tasks._index import Entry, Kind, TaskIndex
 from lm_eval.tasks._yaml_loader import load_yaml
 
 
-@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("native", [False, True, "auto"])
 def test_rwkv_no_think_choice_tasks_use_native_requests_without_affecting_other_modes(monkeypatch, native):
     import datasets
 
@@ -24,15 +24,26 @@ def test_rwkv_no_think_choice_tasks_use_native_requests_without_affecting_other_
     monkeypatch.setattr(datasets, "load_dataset", lambda *a, **k: datasets.DatasetDict(
         {split: data for split in ["train", "validation", "test", "code_debug", "longbook_choice_eng"]}
     ))
+    # discrim_eval's native protocol is multiple_choice (likelihood-scored
+    # yes/Yes/no/No) *by default*, regardless of the RWKV NoCoT metadata flag
+    # below -- unlike mutual/mc_taco/infinitebench, which default to
+    # generate_until and only switch to multiple_choice under the
+    # `rwkv_native_loglikelihood` override. Changing discrim_eval's own
+    # default output_type would affect every backend's scoring, not just
+    # RWKV's NoCoT variant.
+    discrim_eval_names = {"discrim_eval_implicit", "discrim_eval_explicit"}
     names = ["mutual", "mc_taco", "discrim_eval_implicit", "discrim_eval_explicit",
              "infinitebench_longbook_choice_en", "infinitebench_code_debug"]
-    manager = TaskManager(metadata={"rwkv_native_loglikelihood": native})
+    manager = TaskManager(metadata={"rwkv_task_modes": True} if native == "auto" else {"rwkv_native_loglikelihood": native})
     loaded = manager.load(names)
     assert sorted(loaded["tasks"]) == sorted(names)
     for name, task in loaded["tasks"].items():
-        assert task.OUTPUT_TYPE == ("multiple_choice" if native else "generate_until")
+        is_discrim_eval = name in discrim_eval_names
+        assert task.OUTPUT_TYPE == (
+            "multiple_choice" if (native or is_discrim_eval) else "generate_until"
+        )
         doc = task.eval_docs[0]
-        if native:
+        if native or is_discrim_eval:
             context = task.doc_to_text(doc)
             requests = task.construct_requests(doc, context, metadata=(name, 0, 1))
             assert len(requests) == len(task.doc_to_choice(doc))
@@ -49,7 +60,146 @@ def test_rwkv_no_think_choice_tasks_use_native_requests_without_affecting_other_
             elif name.startswith("infinitebench"):
                 assert metrics == {"score": 1.0}
             else:
-                assert metrics["black_bias"][-1] == 1
+                # discrim_eval's native scoring is a logit over the
+                # likelihood-weighted yes/no split, not a 0/1 label -- the
+                # synthetic scores above clearly favor "Yes" (index 1), so
+                # the logit must come out positive.
+                assert metrics["black_bias"][-1] > 0
+
+
+@pytest.mark.parametrize("native", [False, True, "auto"])
+def test_rwkv_no_think_choice_accuracy_does_not_change_generative_scoring(monkeypatch, native):
+    import datasets
+
+    row = {
+        "article": "A dialogue.",
+        "options": ["cats", "dogs", "birds", "fish"],
+        "answers": "B",
+        "sentence": "A sentence.",
+        "question": "Question?",
+        "answer": 1,
+        "label": "A",
+        "gt": "A",
+        "query_case_appellant": "Appellant",
+        "query_case_fact": "Facts",
+        "query_case_claim": "Claim",
+        "query_case_judicial_opinion": "Opinion",
+        "retrieved_case_appellant": "Retrieved appellant",
+        "retrieved_case_fact": "Retrieved facts",
+        "retrieved_case_claim": "Retrieved claim",
+        "retrieved_case_judicial_opinion": "Retrieved opinion",
+        "A": "first",
+        "B": "second",
+        "C": "third",
+        "D": "fourth",
+        "E": "fifth",
+    }
+    data = datasets.Dataset.from_list([row])
+    monkeypatch.setattr(
+        datasets,
+        "load_dataset",
+        lambda *args, **kwargs: datasets.DatasetDict(
+            {split: data for split in ["train", "validation", "test", "fewshot"]}
+        ),
+    )
+    names = [
+        "kbl_bar_exam_em_civil_2012",
+        "kbl_common_legal_mistake_qa_em",
+        "kbl_case_relevance_qa_p_em",
+        "kormedmcqa_doctor",
+    ]
+    manager = TaskManager(metadata={"rwkv_task_modes": True} if native == "auto" else {"rwkv_native_loglikelihood": native})
+    loaded = manager.load(names)
+
+    assert sorted(loaded["tasks"]) == sorted(names)
+    for name, task in loaded["tasks"].items():
+        metric_names = [metric["metric"] for metric in task.config.metric_list]
+        if native:
+            assert task.OUTPUT_TYPE == "multiple_choice"
+            assert metric_names == ["acc"]
+            doc = task.eval_docs[0]
+            requests = task.construct_requests(doc, task.doc_to_text(doc), metadata=(name, 0, 1))
+            assert all(request.request_type == "loglikelihood" for request in requests)
+            scores = [(0.0 if index == 0 else -1.0, False) for index in range(len(requests))]
+            assert task.process_results(doc, scores) == {"acc": 1.0}
+        else:
+            assert task.OUTPUT_TYPE == "generate_until"
+            assert metric_names == ["exact_match"]
+
+
+def test_kbl_bar_exam_docs_skip_missing_choice_targets():
+    import datasets
+
+    from lm_eval.tasks.kbl.utils import process_bar_exam_docs
+
+    dataset = datasets.Dataset.from_dict(
+        {
+            "question": ["valid", "missing"],
+            "gt": ["A", "정답없음"],
+        }
+    )
+
+    filtered = process_bar_exam_docs(dataset)
+
+    assert filtered["question"] == ["valid"]
+    assert filtered["gt"] == ["A"]
+
+
+def test_drop_target_uses_a_real_gold_answer(monkeypatch):
+    import datasets
+
+    row = {
+        "query_id": "q1",
+        "passage": "A passage.",
+        "question": "Who scored?",
+        "answer": {
+            "number": "",
+            "date": {"day": "", "month": "", "year": ""},
+            "spans": ["Chaz Schilens"],
+            "worker_id": "",
+            "hit_id": "",
+        },
+        "validated_answers": {
+            "number": [""],
+            "date": [{"day": "", "month": "", "year": ""}],
+            "spans": [["JaMarcus Russell"]],
+            "worker_id": [""],
+            "hit_id": [""],
+        },
+    }
+    data = datasets.Dataset.from_list([row])
+    monkeypatch.setattr(
+        datasets,
+        "load_dataset",
+        lambda *args, **kwargs: datasets.DatasetDict(
+            {split: data for split in ["train", "validation", "test"]}
+        ),
+    )
+
+    task = TaskManager().load(["drop"])["tasks"]["drop"]
+    assert task.doc_to_target(task.eval_docs[0]) == "Chaz Schilens"
+
+
+def test_norquad_uses_lm_eval_generation_budget(monkeypatch):
+    import datasets
+
+    row = {
+        "context": "Title\nThe passage.",
+        "question": "What happened?",
+        "answers": {"text": ["answer"], "answer_start": [0]},
+    }
+    data = datasets.Dataset.from_list([row])
+    monkeypatch.setattr(
+        datasets,
+        "load_dataset",
+        lambda *args, **kwargs: datasets.DatasetDict(
+            {split: data for split in ["train", "validation", "test"]}
+        ),
+    )
+
+    task = TaskManager().load(["norquad_p0"])["tasks"]["norquad_p0"]
+    assert task.config.generation_kwargs["max_gen_toks"] == 32
+    assert "max_new_tokens" not in task.config.generation_kwargs
 
 
 # =============================================================================
@@ -1214,3 +1364,46 @@ class TestGroupBuilding:
 
         direct_tasks = parent.get_all_tasks(recursive=False)
         assert len(direct_tasks) == 0  # parent only has a subgroup, no direct tasks
+
+
+def test_rwkv_native_generation_modes_match_selected_benchmark_variants():
+    from types import SimpleNamespace
+    from lm_eval.models.rwkv_remote import RWKV7Remote
+
+    manager = TaskManager()
+    model = object.__new__(RWKV7Remote)
+    model.RWKV_TASK_MODES = True
+    for name, expected in [
+        ("drop", "no_think"), ("xquad_en", "no_think"),
+        ("cruxeval_input", "no_think"), ("cruxeval_output", "no_think"),
+        ("cruxeval_input_cot", "open_think"), ("cruxeval_output_cot", "open_think"),
+    ]:
+        config = manager._factory._load_full_config(manager.task_index[name])
+        task = SimpleNamespace(OUTPUT_TYPE=config["output_type"], config=SimpleNamespace(
+            task=name, metadata=config.get("metadata", {})))
+        model.configure_task(task)
+        assert model.rwkv_generation_prompt == expected
+        assert model.EVALUATION_PROTOCOL_VERSION == "rwkv-generative-v2"
+        assert config["generation_kwargs"]["max_gen_toks"] == (512 if name == "cruxeval_input_cot" else 1024 if name.startswith("cruxeval") else 64)
+
+
+def test_rwkv_mode_selector_expansion_uses_native_groups_and_tags(monkeypatch):
+    from lm_eval.tasks._factory import TaskFactory
+
+    registry = {
+        "family": Entry("family", Kind.GROUP, None, cfg={"group": "family", "task": ["tagged"]}),
+        "tagged": Entry("tagged", Kind.TAG, None, tags={"leaf"}),
+        "leaf": Entry("leaf", Kind.TASK, None, cfg={"task": "leaf"}),
+    }
+    captured = []
+
+    def construct(config):
+        captured.append(config)
+        return config
+
+    monkeypatch.setattr("lm_eval.tasks._factory.ConfigurableTask", construct)
+    factory = TaskFactory(meta={"rwkv_task_modes": True})
+    factory._build_group_members(["tagged"], "family", {"_rwkv_mode_selectors": ["family"]}, registry)
+    assert captured[-1]["metadata"]["rwkv_mode_selectors"] == ["family", "tagged"]
+    factory.build(registry["tagged"], registry=registry)
+    assert captured[-1]["metadata"]["rwkv_mode_selectors"] == ["tagged"]

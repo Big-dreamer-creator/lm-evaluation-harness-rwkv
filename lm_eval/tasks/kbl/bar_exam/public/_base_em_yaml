@@ -5,6 +5,7 @@ tag:
 description: '당신은 사용자의 질문에 친절하고 논리적으로 답변해 주는 법률 전문가 챗봇 입니다.\n'
 dataset_path: lbox/kbl
 test_split: test
+process_docs: !function lm_eval.tasks.kbl.utils.process_bar_exam_docs
 output_type: generate_until
 doc_to_text: '### 질문: {{question}}
 
@@ -34,3 +35,17 @@ filter_list:
     - function: regex
       regex_pattern: ([A-E]).*
     - function: take_first
+metadata:
+  version: 1.2
+  rwkv_no_think:
+    output_type: multiple_choice
+    doc_to_text: "### 질문: {{question}}\n다음 각 선택지를 읽고 A, B, C, D, E 중 하나를 선택하여 '답변: A' 와 같이 단답식으로 답해 주세요.\nA. {{A}}\nB. {{B}}\nC. {{C}}\nD. {{D}}\nE. {{E}}\nAnswer:"
+    doc_to_choice: ["A", "B", "C", "D", "E"]
+    doc_to_target: "{{['A', 'B', 'C', 'D', 'E'].index(gt)}}"
+    process_results: null
+    generation_kwargs: null
+    filter_list: null
+    metric_list:
+      - metric: acc
+        aggregation: mean
+        higher_is_better: true

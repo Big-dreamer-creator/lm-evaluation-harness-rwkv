@@ -9,5 +9,8 @@ aggregate_metric_list:
     aggregation: mean
     weight_by_size: true
     filter_list: extract_answer
+  - metric: acc
+    aggregation: mean
+    weight_by_size: true
 metadata:
-  version: 3.0
+  version: 3.1

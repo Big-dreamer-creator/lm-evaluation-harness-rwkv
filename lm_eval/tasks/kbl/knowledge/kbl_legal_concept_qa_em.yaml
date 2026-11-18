@@ -2,3 +2,16 @@ task: kbl_legal_concept_qa_em
 dataset_name: kbl_knowledge_legal_concept_qa
 doc_to_text: "### 질문: {{question}}\nA. {{A}}\nB. {{B}}\nC. {{C}}\nD. {{D}}\nE. {{E}}\n'A', 'B', 'C', 'D', 'E' 중 하나를 선택하여 ''답변: A'' 와 같이 단답식으로 답해 주세요."
 include: _kbl_knowledge_yaml
+metadata:
+  version: 1.1
+  rwkv_no_think:
+    output_type: multiple_choice
+    doc_to_choice: ["A", "B", "C", "D", "E"]
+    doc_to_target: "{{['A', 'B', 'C', 'D', 'E'].index(label)}}"
+    process_results: null
+    generation_kwargs: null
+    filter_list: null
+    metric_list:
+      - metric: acc
+        aggregation: mean
+        higher_is_better: true

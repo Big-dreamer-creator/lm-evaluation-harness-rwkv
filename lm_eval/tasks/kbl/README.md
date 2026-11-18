@@ -45,6 +45,21 @@ Homepage: `https://github.com/lbox-kr/kbl`
 * `kbl_bar_exam_em_public`: `13 bar exam tasks, public law`
 * `kbl_bar_exam_em_responsibility`: `14 bar exam tasks, professional responsibility (RESP) examination`
 
+#### RWKV NoCoT
+
+The private `rwkv_no_think` variant uses the KBL `test` split with native
+multiple-choice loglikelihood requests. Knowledge and bar-exam choices are
+scored as `A` through the benchmark's final option letter; reasoning choices
+are `A`/`B`. Gold targets are option indices and
+`doc_to_target` derives them from the dataset's `label` or `gt` field. The
+selection metric is `acc`, matching the native multiple-choice prototype in
+`lm_eval/tasks/arc/arc_easy.yaml`; the official `generate_until` variant keeps
+its benchmark-native `exact_match` metric unchanged.
+
+Bar-exam rows whose `gt` is not one of the defined `A`-`E` choices are
+excluded during preprocessing. The upstream test split contains one
+`gt='정답없음'` row, which cannot form a valid multiple-choice target.
+
 
 #### Tasks
 
