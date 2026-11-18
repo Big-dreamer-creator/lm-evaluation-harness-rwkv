@@ -19,6 +19,43 @@ DEFAULT_SEQ_LENGTHS = [
 ]
 
 
+TOKENIZER_ARG_KEYS = ("tokenizer", "pretrained", "tokenizer_base_url", "tokenizer_model", "model")
+
+
+def resolve_tokenizer_name(kwargs: dict) -> str | None:
+    """Pick the tokenizer name out of the model args a synthetic task is given.
+
+    Returns the first non-empty string among `tokenizer`, `pretrained` and
+    `model`, or None if there is none.
+    """
+    for key in ("tokenizer", "pretrained", "model"):
+        value = kwargs.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def resolve_tokenizer_kwargs(kwargs: dict) -> dict:
+    """Pull `get_tokenizer`'s own arguments out of a synthetic task's kwargs.
+
+    Synthetic RULER tasks are invoked as
+    `custom_dataset(**(config.metadata or {}), **(config.dataset_kwargs or {}))`,
+    so `kwargs` is whatever a user's `--metadata` JSON or task YAML happens to
+    contain -- e.g. `max_seq_lengths`, or a `generation_parameters={...}` dict.
+    `get_tokenizer` is decorated with `functools.cache`, which hashes every
+    argument before its body runs, so passing such a dict/list value straight
+    through (`get_tokenizer(**kwargs)`) raises `TypeError: unhashable type:
+    'dict'` before the tokenizer resolution logic ever gets a chance to run.
+    Keeping only the known, string-valued tokenizer keys here is what keeps
+    `get_tokenizer` callable regardless of what else a task's kwargs carries.
+    """
+    return {
+        key: kwargs[key]
+        for key in TOKENIZER_ARG_KEYS
+        if isinstance(kwargs.get(key), str) and kwargs[key]
+    }
+
+
 class RemoteRulerTokenizer:
     def __init__(self, base_url: str, model: str, timeout: float = 30):
         self.base_url = base_url.removesuffix("/v1/completions").rstrip("/")
@@ -55,7 +92,6 @@ def get_tokenizer(
     tokenizer_base_url=None,
     tokenizer_model=None,
     model=None,
-    **kwargs,
 ) -> Union[
     RemoteRulerTokenizer,
     "transformers.PreTrainedTokenizer",
@@ -68,7 +104,7 @@ def get_tokenizer(
             "Using remote tokenizer %s for synthetic tasks.", tokenizer_base_url
         )
         return RemoteRulerTokenizer(tokenizer_base_url, remote_model)
-    pretrained = tokenizer or pretrained
+    pretrained = tokenizer or pretrained or model
     assert pretrained, "No tokenizer or pretrained provided."
     eval_logger.info(f"Using tokenizer {pretrained} for synthetic tasks.")
     return AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)

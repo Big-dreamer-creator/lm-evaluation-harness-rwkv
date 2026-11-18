@@ -21,7 +21,7 @@ import datasets
 import requests
 from tqdm import tqdm
 
-from lm_eval.tasks.ruler.common_utils import DEFAULT_SEQ_LENGTHS, get_tokenizer
+from lm_eval.tasks.ruler.common_utils import DEFAULT_SEQ_LENGTHS, get_tokenizer, resolve_tokenizer_kwargs
 
 CONFIG = {
     "tokens_to_generate": 32,
@@ -216,7 +216,7 @@ def get_dataset(tokenizer, docs, qas, max_seq_length=None, **kwargs) -> list[dic
 
 def get_qa_dataset(ds, **kwargs) -> dict[str, datasets.Dataset]:
     seq_lengths = kwargs.pop("max_seq_lengths", DEFAULT_SEQ_LENGTHS)
-    tokenizer = get_tokenizer(**kwargs)
+    tokenizer = get_tokenizer(**resolve_tokenizer_kwargs(kwargs))
     if ds == "squad":
         qas, docs = read_squad()
     else:

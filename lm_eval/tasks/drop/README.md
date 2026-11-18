@@ -39,6 +39,11 @@ https://github.com/allenai/allennlp-reading-comprehension/blob/master/allennlp_r
 
 * `drop`
 
+### Changelog
+
+- v3.1: derive the displayed target from the first real gold answer instead of
+  joining the raw answer-object keys.
+
 ### Checklist
 
 For adding novel benchmarks/datasets to the library:

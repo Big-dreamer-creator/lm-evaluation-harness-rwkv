@@ -25,6 +25,30 @@ def doc_to_text_context(doc) -> str:
     return f"Pasartea: {doc['context']}\n\nGaldera: {doc['question']}\n{formatted_choices}\nErantzuna:"
 
 
+def doc_to_text_context_rwkv_no_think(doc) -> str:
+    """
+    Same rendering as doc_to_text_context, but ending in the standard
+    "\\nAnswer:" cue instead of the native Basque "Erantzuna:" cue, so the
+    RWKV adapter's existing-cue detection recognizes it and does not append
+    a duplicate cue.
+
+    Args:
+        doc (dict): A dictionary containing the document information.
+
+    Returns:
+        str: A formatted string containing the question and answer choices.
+    """
+    candidates = doc["candidates"]
+    num_choices = len(candidates)
+    if num_choices < 2:
+        raise ValueError("Invalid number of candidates")
+    choices = letters[:num_choices]
+    formatted_choices = "\n".join(
+        [f"{choice}: {candidates[i]}" for i, choice in enumerate(choices)]
+    )
+    return f"Pasartea: {doc['context']}\n\nGaldera: {doc['question']}\n{formatted_choices}\nAnswer:"
+
+
 def doc_to_choice(doc) -> List[str]:
     """
     Returns the answer choices for a document.

@@ -2,3 +2,7 @@
 "description": "以下是关于古文阅读理解的单项选择题，请直接给出正确答案的选项。\n\n"
 "include": "_default_template_yaml"
 "task": "aclue_reading_comprehension"
+metadata:
+  version: 1.0
+  rwkv_no_think:
+    doc_to_text: "{{Question.strip()}}\nA. {{A}}\nB. {{B}}\nC. {{C}}\nD. {{D}}\nAnswer:"
