@@ -22,7 +22,6 @@ log_samples = true
 
 [rwkv_profile]
 prompt_template = "assistant"
-generation_prompt = "open_think"
 wkv_mode = "fp32io16"
 
 [checkpoint]
@@ -32,7 +31,6 @@ fresh = false
 [publication]
 enabled = true
 base_url = "http://127.0.0.1:7862"
-cot_mode = "CoT"
 token_env = "SCOREBOARD_PUBLICATION_TOKEN"
 rerun_reason = "full five-benchmark avg@k campaign with official RWKV7-G1K-1.5B 20260930 revision"
 

@@ -36,7 +36,6 @@ log_samples = true  # 把每条样本的输入输出落盘；Scoreboard 上传�
 
 [rwkv_profile]
 prompt_template = "assistant"  # 可选：assistant / bot / function_calling——对应官方三套 Prompt Template 之一（见 transformers-rwkv / rwkv7-g1-st）。
-generation_prompt = "fake_think"  # 可选：fake_think / open_think——决定 CoT 模式及其固定解码参数（按 AGENTS.md：open_think 为 temp 0.96/top_p 0.76/top_k 32/presence_penalty 1.0/frequency_penalty 0.1/penalty_decay 0.988；fake_think 为 temp 1.0/top_p 0.28/top_k 32）。
 wkv_mode = "fp32io16"  # 可选：fp16 / fp32io16——AGENTS.md 规定默认使用 fp32io16 作为正确性检查的基准模式。
 
 [checkpoint]
@@ -46,7 +45,6 @@ enabled = true  # 把每条样本的结果持久化写入 output_dir/checkpoints
 enabled = true  # 打开 Scoreboard 上传回调（lm_eval/loggers/scoreboard.py）；不设或为 false 时整次运行只落在本地。
 dry_run = true  # 只构建并校验 (benchmark_info, score) 上传数据，不会真的调用 /api/health、/api/add_benchmarks、/api/upload。要真的上传改成 false。
 base_url = "http://127.0.0.1:8811"  # Scoreboard 服务根地址。真实地址：https://eval.rwkv.rs/test/api（test）或 https://eval.rwkv.rs/api（production）——见 ~/code/scoreboard-rwkv/README.md。
-cot_mode = "FakeCoT"  # 可选：NoCoT / FakeCoT / CoT——Scoreboard 侧对本次运行 CoT 模式的标签；需与上面 rwkv_profile.generation_prompt 保持一致。
 token_env = "SCOREBOARD_PUBLICATION_TOKEN"  # 存放 bearer token 的环境变量名，会以 `Authorization: Bearer <token>` 发送；非 dry-run 上传前必须先 export 这个变量。
 
 [publication.tasks.race]

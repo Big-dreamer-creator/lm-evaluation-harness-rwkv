@@ -19,7 +19,6 @@ max_retries = 6
 
 [rwkv_profile]
 prompt_template = "assistant"
-generation_prompt = "open_think"
 wkv_mode = "fp32io16"
 
 [checkpoint]
@@ -29,7 +28,6 @@ fresh = false
 [publication]
 enabled = true
 base_url = "http://127.0.0.1:7862"
-cot_mode = "CoT"
 token_env = "SCOREBOARD_PUBLICATION_TOKEN"
 rerun_reason = "full RWKV7-G1J five-benchmark avg@k CoT campaign, fp32io16, vllm.rwkvos.com"
 

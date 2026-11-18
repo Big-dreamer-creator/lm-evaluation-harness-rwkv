@@ -50,7 +50,6 @@ log_samples = true
 
 [rwkv_profile]
 prompt_template = "assistant"
-generation_prompt = "no_think"
 wkv_mode = "fp32io16"
 
 [checkpoint]
@@ -69,7 +68,6 @@ max_retries = 6
 [publication]
 enabled = true
 base_url = "http://127.0.0.1:7862"
-cot_mode = "NoCoT"
 token_env = "SCOREBOARD_PUBLICATION_TOKEN"
 rerun_reason = "RWKV7-G1K four-benchmark NoCoT full campaign (babilong/cruxeval/inverse_scaling_prize/model_written_evals), no limit, avg@k live, ctx 25600, deterministic no_think decoding"
 

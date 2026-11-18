@@ -18,7 +18,6 @@ seed = [0, 1234, 1234, 1234]
 
 [rwkv_profile]
 prompt_template = "assistant"
-generation_prompt = "open_think"
 wkv_mode = "fp32io16"
 
 [coding]

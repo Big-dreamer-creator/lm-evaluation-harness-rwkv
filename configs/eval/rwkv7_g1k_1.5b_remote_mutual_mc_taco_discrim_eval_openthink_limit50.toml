@@ -19,7 +19,6 @@ log_samples = true
 
 [rwkv_profile]
 prompt_template = "assistant"
-generation_prompt = "open_think"
 wkv_mode = "fp32io16"
 
 [checkpoint]
@@ -29,7 +28,6 @@ fresh = true
 [publication]
 enabled = true
 base_url = "http://127.0.0.1:7862"
-cot_mode = "CoT"
 token_env = "SCOREBOARD_PUBLICATION_TOKEN"
 rerun_reason = "fix mutual/mc_taco/discrim_eval prompt assembly and scoring (generate_until + yes_no/albatross_mcq extractors)"
 
