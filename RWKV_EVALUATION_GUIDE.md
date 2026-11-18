@@ -158,7 +158,6 @@ seed = [0, 1234, 1234, 1234]
 
 [rwkv_profile]
 prompt_template = "assistant"
-generation_prompt = "fake_think"
 wkv_mode = "fp32io16"
 ```
 
@@ -172,7 +171,7 @@ wkv_mode = "fp32io16"
 顺序执行，配置顺序只作并列时的稳定次序）；这些名称本身就是原生
 lm-eval-harness 的 task/group/tag
 名称，由 `TaskManager` 直接解析，不存在额外的适配层。`model_name`、
-`rwkv_profile.generation_prompt`、`rwkv_profile.prompt_template` 同时生成执行参数
+`rwkv_profile.prompt_template` 生成执行参数
 和结果元数据，避免重复字段分叉；`rwkv_profile.wkv_mode` 只记录服务端模式，
 仍需与 vllm-rwkv 启动日志核对。
 未知字段、重复 benchmark、非法 URL、非正数并发或上下文长度会在连接模型前报错。
@@ -218,7 +217,11 @@ output_dir = "results/rwkv7-g1k-1.5b-...-full"
 - `bot`
 - `function_calling`
 
-`rwkv_profile.generation_prompt` 支持：
+模式统一由 `lm_eval/config/benchmark_modes.toml` 清单选择：原生选择题使用 NoCoT；
+生成任务保留原生直接回答的 NoCoT，明确的推理变体列入 CoT 或 FakeCoT 清单。运行配置不再指定
+模式，旧 `rwkv_profile.generation_prompt` 只会触发弃用警告，不影响执行。
+
+生成模式对应的固定参数：
 
 - `open_think`：temperature 0.96、top_p 0.76、top_k 32、
   presence_penalty 1.0、frequency_penalty 0.1、penalty_decay 0.988。
@@ -321,7 +324,6 @@ fewshot_as_multiturn = false
 
 [rwkv_profile]
 prompt_template = "assistant"
-generation_prompt = "fake_think"
 wkv_mode = "fp32io16"
 ```
 
@@ -330,7 +332,7 @@ wkv_mode = "fp32io16"
 - `apply_chat_template` 必须设为 `false`：未设置 `tokenizer_name` 时
   `rwkv7-remote` 没有接入任何 tokenizer/chat_template 来源，无法渲染聊天
   模板。
-- `rwkv_profile.generation_prompt` 决定固定采样参数，`prompt_template` 决定
+- 任务选择的生成模式决定固定采样参数，`prompt_template` 决定
   角色停止符；`wkv_mode` 是服务端执行模式的审计记录。未配置 tokenizer 时，
   输入必须已经包含适当的原生角色与生成前缀；这里只支持原始文本直传。
 - `seed[2]` 作为生成基础 seed，同一题的第 r 次采样使用 `base_seed + r`。
@@ -377,7 +379,6 @@ fewshot_as_multiturn = false
 
 [rwkv_profile]
 prompt_template = "assistant"
-generation_prompt = "no_think"
 wkv_mode = "fp32io16"
 ```
 
@@ -678,3 +679,21 @@ uv run --no-sync python -m lm_eval coding -C configs/eval/rwkv7_coding_local.tom
 分别记录，后者为 `1 - C(n-c,k) / C(n,k)`，要求每题至少有 k 次作答。
 截断率与未结束思考率也分别记录；闭合思考后达到长度上限且已生成完整代码的作答
 仍按同一套测试执行。运行产生的是此版本本地协议的结果，不能直接替代历史榜单成绩。
+
+### 按任务选择模式与发布字段（2026-11-13）
+
+`configs/eval/*.toml` 不再声明 `generation_prompt` 或 `publication.cot_mode`。
+任务的 `output_type` 和已有 `metadata.rwkv_no_think` 原生变体决定请求路径；
+模式集中维护在 `lm_eval/config/benchmark_modes.toml` 的
+`no_think`、`fake_think`、`open_think` 清单中，具体子任务优先于所属组／标签。
+生成任务默认 `no_think`，只有明确的 CoT 变体才在该清单中列入 `open_think`。
+任务 YAML 和运行配置不再指定模式。DROP/XQuAD
+按照社区原生直接回答协议使用 NoCoT 生成及原有短答案预算；不因生成接口自动开启推理。
+同一次运行可以包含 NoCoT、FakeCoT、CoT，每个任务在构造和发送请求前切换模式。
+
+发布使用各 benchmark 保存的实际模式、协议和采样证据，旧发布标签不能覆盖它。
+领域仍从 `lm_eval/config/benchmarks.toml` 经 `BenchmarkSpec.field` 写入
+`benchmark.field`；权重与模型身份仍从结果记录读取。模式或采样配置不同的子任务
+不能冒充同一种协议发布为一个总分。全局结果的 `config.task_execution` 保存各任务
+设置，不能使用最后执行任务的采样参数代表整个运行。新运行使用独立的缓存/恢复
+身份；不要在未审核的情况下复用历史生成式 NoCoT 成绩。
