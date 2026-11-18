@@ -190,9 +190,9 @@ def _extracted_answer(row: dict[str, Any]) -> str | None:
     if not isinstance(filtered, list) or not filtered:
         return None
     first = filtered[0]
-    if not isinstance(first, list) or not first:
-        return None
-    return _text(first[0])
+    if isinstance(first, list):
+        return _text(first[0]) if first else ""
+    return _text(first)
 
 
 def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str, bool]:
@@ -223,6 +223,14 @@ def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str,
                 or not selected.get("prompt") or not selected.get("prompt_token_ids")
                 or not str(selected.get("request_url", "")).endswith("/v1/completions")):
             raise ScoreboardError("Native multiple_choice detail lacks actual /v1/completions input evidence")
+        continuation = _text(selected.get("text"))
+        user_prompt = _text(selected["prompt"])
+        if continuation and user_prompt.endswith(continuation):
+            user_prompt = user_prompt[:-len(continuation)]
+        if not user_prompt.rstrip().endswith("Answer:"):
+            raise ScoreboardError(
+                "Native multiple_choice detail prompt does not end at an Answer: cue"
+            )
         target = row.get("choice_target", row.get("target"))
         ground_truth = (
             _text(choices[target]) if isinstance(target, int) and 0 <= target < len(choices)
@@ -233,8 +241,8 @@ def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str,
         outcome = "passed" if score == 1 or not isinstance(score, (int, float)) else "wrong"
         return {
             "messages": [
-                {"role": "user", "content": selected["prompt"]},
-                {"role": "assistant", "content": selected["text"]},
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": continuation},
             ],
             "answer": _text(choices[index]),
             "ground_truth": ground_truth,
@@ -251,10 +259,17 @@ def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str,
     # answer" there (see the `answer` field logic below), so judge
     # usability from it directly rather than treating a legitimately
     # unfiltered task as if nothing could be extracted.
+    unclosed_thinking = "<think" in raw_completion and "</think>" not in raw_completion
     has_usable_answer = (
-        bool(raw_completion.strip()) if extracted is None else extracted != "[invalid]"
+        bool(raw_completion.strip())
+        if extracted is None
+        else bool(extracted.strip()) and extracted != "[invalid]"
     )
-    if not raw_completion.strip() or first_evidence.get("unparsed") is True or extracted == "[invalid]":
+    if (
+        not has_usable_answer
+        or unclosed_thinking
+        or first_evidence.get("unparsed") is True
+    ):
         outcome = "failed"
     elif scalar_score == 1:
         outcome = "passed"
@@ -303,7 +318,7 @@ def _detail(row: dict[str, Any], metric_name: str) -> tuple[dict[str, Any], str,
         extracted = _extracted_answer(row)
         if extracted is None:
             answer = raw_completion
-        elif extracted == "[invalid]":
+        elif not extracted.strip() or extracted == "[invalid]":
             answer = "-"
         else:
             answer = extracted
@@ -563,7 +578,12 @@ def _weight_ctx_len(
     return ctx_len
 
 
-def _rwkv_model(model_name: str, ctx_len: int) -> dict[str, Any]:
+def _rwkv_model(
+    model_name: str,
+    ctx_len: int,
+    *,
+    is_preview: bool = False,
+) -> dict[str, Any]:
     """Build the board's model identity from the served weight."""
     match = MODEL_NAME_PATTERN.match(model_name)
     if match is None:
@@ -592,6 +612,7 @@ def _rwkv_model(model_name: str, ctx_len: int) -> dict[str, Any]:
         "data_version": data_version,
         "param_size": param_size,
         "ctx_len": int(ctx_len),
+        "is_preview": is_preview,
     }
 
 
@@ -628,11 +649,21 @@ def _sampling_config(
     sampling.setdefault(
         "max_generated_tokens",
         effective.get("max_gen_toks")
+        or effective.get("max_new_tokens")
         or effective.get("max_tokens")
         or (run_config.get("sampling_config") or {}).get("max_gen_toks")
         or DEFAULT_MAX_GENERATED_TOKENS,
     )
     sampling.setdefault("seed", DEFAULT_SEED)
+    sampling.setdefault(
+        "prompt_template",
+        effective.get("prompt_template") or effective.get("rwkv_prompt_template"),
+    )
+    generation_kwargs = task_config.get("generation_kwargs") or {}
+    sampling.setdefault("stop", effective.get("stop", generation_kwargs.get("until")))
+    if effective.get("declared_context_length") is not None:
+        sampling["declared_context_length"] = effective["declared_context_length"]
+    sampling.setdefault("request_type", "generate_until")
     if run_config.get("evaluation_protocol"):
         sampling["seed_strategy"] = "base_plus_repeat_ord"
         sampling["evaluation_protocol"] = run_config["evaluation_protocol"]
@@ -640,11 +671,13 @@ def _sampling_config(
             and task_config.get("output_type") == "multiple_choice"):
         sampling.update({
             "max_generated_tokens": 1,
+            "stop": [],
             "request_type": "loglikelihood",
             "prompt_template": "native",
             "seed_strategy": "fixed",
             "declared_context_length": run_config.get("model_args", {}).get("max_length"),
         })
+    sampling = {key: value for key, value in sampling.items() if value is not None}
     missing = [field for field in REQUIRED_SAMPLING_FIELDS if field not in sampling]
     if missing:
         raise ScoreboardError(
@@ -652,6 +685,35 @@ def _sampling_config(
             + ", ".join(missing)
         )
     return sampling
+
+
+def _shared_sampling_task_config(leaf_docs: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Task fields shared by every publishable leaf.
+
+    Scoreboard records one sampling block per benchmark. Multi-leaf groups used
+    to fall back to the model's global 8192-token generation default even when
+    every leaf used native loglikelihood scoring or the same 64-token budget.
+    Use a shared leaf configuration when all leaves agree; otherwise leave the
+    field unset rather than inventing a common value.
+    """
+    configs = [
+        leaf_doc["configs"][leaf_name]
+        for leaf_name, leaf_doc in leaf_docs.items()
+    ]
+    if not configs:
+        return {}
+    output_types = {config.get("output_type") for config in configs}
+    generation_kwargs = [
+        config.get("generation_kwargs") for config in configs
+    ]
+    if len(output_types) != 1 or any(
+        value != generation_kwargs[0] for value in generation_kwargs[1:]
+    ):
+        return {}
+    return {
+        "output_type": next(iter(output_types)),
+        "generation_kwargs": generation_kwargs[0],
+    }
 
 
 def _primary_metric(
@@ -861,7 +923,7 @@ def _leaf_metric_key(
 class PublicationConfig:
     base_url: str
     token_env: str
-    cot_mode: str
+    cot_mode: str | None
     tasks: dict[str, dict[str, Any]]
     timeout: float
     control_timeout: float
@@ -869,15 +931,19 @@ class PublicationConfig:
     retry_delay: float
     rerun_reason: str | None
     dry_run: bool
+    is_preview: bool
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> PublicationConfig:
         value = dict(raw)
         cot_mode = value.get("cot_mode")
-        if cot_mode not in COT_MODES:
+        if cot_mode is not None and cot_mode not in COT_MODES:
             raise ScoreboardError(
                 f"publication.cot_mode must be one of {sorted(COT_MODES)}, got {cot_mode!r}"
             )
+        is_preview = value.get("is_preview", False)
+        if not isinstance(is_preview, bool):
+            raise ScoreboardError("publication.is_preview must be a boolean")
         return cls(
             base_url=str(value["base_url"]),
             token_env=str(value.get("token_env", "SCOREBOARD_PUBLICATION_TOKEN")),
@@ -889,6 +955,7 @@ class PublicationConfig:
             retry_delay=float(value.get("retry_delay", 1)),
             rerun_reason=value.get("rerun_reason"),
             dry_run=value.get("dry_run") is True,
+            is_preview=is_preview,
         )
 
 
@@ -1119,7 +1186,35 @@ def build_score(
     policy = _task_policy(config, benchmark_name, benchmark_name)
 
     run_config = results["config"]
-    if config.cot_mode == "NoCoT" and run_config.get("model") == "rwkv7-remote":
+    actual_modes = {
+        {"no_think": "NoCoT", "fake_think": "FakeCoT", "open_think": "CoT"}.get(
+            ((doc.get("config", {}).get("model_args") or {}).get("cot_mode")
+             or (doc.get("config", {}).get("model_args") or {}).get("rwkv_generation_prompt"))
+        )
+        for doc in leaf_docs.values()
+    } - {None}
+    derived_mode = {"no_think": "NoCoT", "fake_think": "FakeCoT", "open_think": "CoT"}.get(
+        ((run_config.get("model_args") or {}).get("cot_mode")
+         or (run_config.get("model_args") or {}).get("rwkv_generation_prompt"))
+    )
+    if len(actual_modes) > 1 or (actual_modes and derived_mode not in actual_modes):
+        raise ScoreboardError("Benchmark leaves have conflicting actual RWKV modes")
+    if run_config.get("rwkv_task_modes"):
+        if derived_mode is None or len(actual_modes) != 1:
+            raise ScoreboardError("Automatic RWKV artifacts lack actual task mode evidence")
+        profiles = [
+            _sampling_config(
+                doc, doc["configs"][name], doc["config"]["model_args"],
+                doc["configs"][name].get("metadata") or {},
+            )
+            for name, doc in leaf_docs.items() if name in publish_leaves
+        ]
+        if profiles and any(profile != profiles[0] for profile in profiles[1:]):
+            raise ScoreboardError("Benchmark leaves have conflicting actual sampling profiles")
+    cot_mode = derived_mode or config.cot_mode
+    if cot_mode not in COT_MODES:
+        raise ScoreboardError("Artifact lacks an actual evaluation cot_mode")
+    if cot_mode == "NoCoT" and run_config.get("model") == "rwkv7-remote":
         from lm_eval.api.checkpoint import LOGLIKELIHOOD_PROTOCOL_VERSION
         if (any(doc["configs"][name].get("output_type") == "multiple_choice"
                 for name, doc in leaf_docs.items())
@@ -1131,9 +1226,15 @@ def build_score(
             LOGLIKELIHOOD_PROTOCOL_VERSION,
         )
         model_args = run_config["model_args"]
+        native_requests = (
+            all(doc["configs"][name].get("output_type") in
+                {"multiple_choice", "loglikelihood", "loglikelihood_rolling"}
+                for name, doc in leaf_docs.items())
+            if run_config.get("rwkv_task_modes") else True
+        )
         expected_protocol = (
             LOGLIKELIHOOD_PROTOCOL_VERSION
-            if (model_args.get("cot_mode") or model_args.get("rwkv_generation_prompt")) == "no_think"
+            if native_requests and (model_args.get("cot_mode") or model_args.get("rwkv_generation_prompt")) == "no_think"
             else EVALUATION_PROTOCOL_VERSION
         )
         if run_config.get("evaluation_protocol") != expected_protocol:
@@ -1240,11 +1341,14 @@ def build_score(
     # A single-leaf (standalone) benchmark carries its task's own generation
     # kwargs/metadata, which the run's sampling config must include; a
     # multi-leaf benchmark has no single such task.
-    sole_config = (
-        leaf_docs[next(iter(leaf_docs))]["configs"][next(iter(leaf_docs))]
-        if len(leaf_docs) == 1
-        else {}
+    sole_config = _shared_sampling_task_config(
+        {name: leaf_docs[name] for name in publish_leaves}
     )
+    if (run_config.get("evaluation_protocol") == "rwkv-loglikelihood-v1"
+            and all(leaf_docs[name]["configs"][name].get("output_type") == "multiple_choice"
+                    for name in publish_leaves)):
+        # Generation-only task kwargs do not describe native likelihood calls.
+        sole_config = {"output_type": "multiple_choice", "generation_kwargs": {}}
     benchmark_info = _benchmark_info(
         benchmark_name,
         benchmark_field,
@@ -1257,11 +1361,12 @@ def build_score(
         _weight_ctx_len(
             model_name, *artifact_hint_paths, weight_revision=weight_revision
         ),
+        is_preview=config.is_preview,
     )
     payload = {
         "benchmark_id": None,
         "model": model,
-        "cot_mode": config.cot_mode,
+        "cot_mode": cot_mode,
         "sampling_config": _sampling_config(
             results,
             sole_config,
@@ -1350,7 +1455,26 @@ class ScoreboardPublisher:
                 with urlopen(  # noqa: S310 - publication URL is configured.
                     request, timeout=self.config.timeout
                 ) as response:
-                    return json.loads(response.read().decode("utf-8"))
+                    receipt = json.loads(response.read().decode("utf-8"))
+                expected_benchmark_id = score.get("benchmark_id")
+                uploaded_benchmark_id = receipt.get("benchmark_id")
+                if (
+                    expected_benchmark_id is not None
+                    and uploaded_benchmark_id is not None
+                    and uploaded_benchmark_id != expected_benchmark_id
+                    and receipt.get("score_id") is not None
+                ):
+                    self._send(
+                        "/api/expire",
+                        body={"score_id": receipt["score_id"]},
+                        timeout=self.config.control_timeout,
+                    )
+                    raise ScoreboardError(
+                        "scoreboard attached the upload to benchmark_id "
+                        f"{uploaded_benchmark_id}, expected {expected_benchmark_id}; "
+                        "the ambiguous score was expired"
+                    )
+                return receipt
             except HTTPError as error:
                 raw = error.read().decode("utf-8", errors="replace")
                 try:
@@ -1370,16 +1494,10 @@ class ScoreboardPublisher:
                         for item in detail
                     )
                 ):
-                    eval_logger.info(
-                        "scoreboard rejected the upload for a missing "
-                        "benchmark_name; retrying with the name (older server "
-                        "revision keyed by benchmark name)."
-                    )
-                    return self._upload(
-                        {**score, "benchmark_name": benchmark_name},
-                        benchmark_name=benchmark_name,
-                        allow_expire=allow_expire,
-                    )
+                    raise ScoreboardError(
+                        "Scoreboard upload API requires benchmark_name and cannot "
+                        "guarantee benchmark_id/field identity; refusing name-only fallback"
+                    ) from error
                 if error.code == 409:
                     if (
                         allow_expire

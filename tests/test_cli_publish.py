@@ -13,6 +13,21 @@ from lm_eval.models.dummy import DummyLM
 from lm_eval.tasks import TaskManager
 
 
+class _EvidencedDummyLM(DummyLM):
+    """Prototype: publication regression's _EvidencedDummyLM; record dispatched inputs."""
+
+    def generate_until(self, requests, disable_tqdm=False):
+        from lm_eval.models.openai_completions import _RWKVCompletion
+
+        responses = super().generate_until(requests, disable_tqdm=disable_tqdm)
+        values = []
+        for request, text in zip(requests, responses, strict=True):
+            value = _RWKVCompletion(text, raw_response={"choices": [{"text": text}]})
+            value.prompt = request.args[0]
+            values.append(value)
+        return values
+
+
 _TEST_DATA = [
     {"question": "What is 2+2?", "answer": "lol"},
     {"question": "What is 3+3?", "answer": "not-lol"},
@@ -69,7 +84,7 @@ def _write_run_and_get_results_json(tmp_path: Path) -> Path:
     task_dict = task_manager.load(["solo_leaf"])
 
     random.seed(0)
-    lm = DummyLM()
+    lm = _EvidencedDummyLM()
     output_path = tmp_path / "output"
     evaluation_tracker = EvaluationTracker(output_path=str(output_path))
 

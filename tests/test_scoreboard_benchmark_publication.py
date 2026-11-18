@@ -115,6 +115,7 @@ def _publish_config(tasks: dict[str, dict] | None = None) -> PublicationConfig:
         retry_delay=0,
         rerun_reason=None,
         dry_run=True,
+        is_preview=False,
     )
 
 
@@ -197,6 +198,7 @@ def test_standalone_benchmark_produces_score_with_real_metric(tmp_path):
         "data_version": "G1j",
         "param_size": "1.5b",
         "ctx_len": 4096,
+        "is_preview": False,
     }
     assert score["cot_mode"] == "NoCoT"
     assert score["score"] == 0.25
@@ -301,13 +303,35 @@ def test_rwkv_model_parses_name_with_explicit_ctx_len():
         "data_version": "G1j",
         "param_size": "1.5b",
         "ctx_len": 4096,
+        "is_preview": False,
     }
     assert _rwkv_model("rwkv7-g1i-1.5b-20260805-ctx16384", 16384) == {
         "arch_version": "rwkv7",
         "data_version": "G1i",
         "param_size": "1.5b",
         "ctx_len": 16384,
+        "is_preview": False,
     }
+    assert _rwkv_model("rwkv7-g1l-1.5b", 32768) == {
+        "arch_version": "rwkv7",
+        "data_version": "G1l",
+        "param_size": "1.5b",
+        "ctx_len": 32768,
+        "is_preview": False,
+    }
+
+
+def test_publication_config_controls_preview_identity():
+    config = PublicationConfig.from_mapping(
+        {
+            "base_url": "https://scoreboard.example",
+            "cot_mode": "NoCoT",
+            "dry_run": True,
+            "is_preview": True,
+        }
+    )
+
+    assert config.is_preview is True
 
 
 def test_weight_ctx_len_reads_the_weight_revision_not_the_eval_budget():
@@ -399,6 +423,7 @@ def test_build_score_reads_ctx_from_metadata_weight_revision(tmp_path):
         "data_version": "G1j",
         "param_size": "1.5b",
         "ctx_len": 16384,
+            "is_preview": False,
     }
 
 
@@ -564,6 +589,21 @@ def test_detail_answer_falls_back_to_raw_completion_without_filtered_resps():
     assert detail["answer"] == "4"
 
 
+def test_unusable_filtered_answer_is_failed_not_wrong():
+    row = _generative_row(
+        answer="<think>unfinished",
+        target="4",
+        evidence_text="<think>unfinished",
+        filtered_answer="",
+    )
+    row["filtered_resps"] = [""]
+    detail, outcome, _truncated = _detail(row, "exact_match")
+
+    assert outcome == "failed"
+    assert detail["answer"] == "-"
+    assert detail["is_passed"] is False
+
+
 def test_samples_cap_is_shared_across_leaves_of_one_benchmark(tmp_path):
     """A benchmark's per-outcome cap must apply across ALL of its leaves
     combined, not be re-applied independently per leaf. Otherwise a
@@ -672,41 +712,22 @@ def test_upload_duplicate_score_with_rerun_reason_expires_and_reuploads(
     assert receipt["score_id"] == 99
 
 
-def test_upload_retries_with_benchmark_name_for_an_older_server(monkeypatch):
-    """A scoreboard revision that predates `Score.benchmark_id` keys an upload
-    by the benchmark's name and rejects a payload without one.
-
-    The publisher registers the benchmark by id, so it has to notice that
-    rejection and re-send the same score with the name attached -- otherwise
-    every run against such a deployment fails to publish.
-    """
+def test_upload_rejects_name_only_server_before_ambiguous_write(monkeypatch):
+    """A benchmark name is insufficient to select its field/sample contract."""
     publisher = _publisher(monkeypatch, rerun_reason=None)
     payloads = []
 
     def fake_urlopen(request, timeout=None):
         payloads.append(json.loads(request.data.decode()))
-        if len(payloads) == 1:
-            raise _http_error(
-                "missing",
-                status=422,
-                detail=[
-                    {
-                        "type": "missing",
-                        "loc": ["body", "benchmark_name"],
-                        "msg": "Field required",
-                    }
-                ],
-            )
-        return _fake_response({"success": True, "score_id": 77})
+        raise _http_error(
+            "missing", status=422,
+            detail=[{"type": "missing", "loc": ["body", "benchmark_name"], "msg": "Field required"}],
+        )
 
     monkeypatch.setattr("lm_eval.loggers.scoreboard.urlopen", fake_urlopen)
-
-    receipt = publisher._upload({"benchmark_id": 1}, benchmark_name="mmlu")
-
-    assert receipt["score_id"] == 77
-    assert "benchmark_name" not in payloads[0]
-    assert payloads[1]["benchmark_name"] == "mmlu"
-    assert payloads[1]["benchmark_id"] == 1
+    with pytest.raises(ScoreboardError, match="cannot guarantee benchmark_id/field identity"):
+        publisher._upload({"benchmark_id": 1}, benchmark_name="mmlu")
+    assert payloads == [{"benchmark_id": 1}]
 
 
 def _fake_response(payload: dict):
@@ -903,6 +924,60 @@ def test_publication_uses_actual_profile_over_task_sampling_metadata():
     assert sampling["max_generated_tokens"] == 16
 
 
+def test_multi_leaf_sampling_uses_shared_native_or_generation_contract():
+    from lm_eval.loggers.scoreboard import (
+        _sampling_config,
+        _shared_sampling_task_config,
+    )
+
+    results = {"config": {"model_args": {}, "sampling_config": dict(_MODEL_ARGS)}}
+    native_leaves = {
+        name: {
+            "configs": {
+                name: {"output_type": "multiple_choice", "generation_kwargs": None}
+            }
+        }
+        for name in ("leaf_a", "leaf_b")
+    }
+    native_sampling = _sampling_config(
+        {
+            "config": {
+                "model_args": {},
+                "sampling_config": dict(_MODEL_ARGS),
+                "evaluation_protocol": "rwkv-loglikelihood-v1",
+            }
+        },
+        _shared_sampling_task_config(native_leaves),
+        {},
+        {},
+    )
+    assert native_sampling["max_generated_tokens"] == 1
+    assert native_sampling["request_type"] == "loglikelihood"
+    assert native_sampling["prompt_template"] == "native"
+
+    generation_leaves = {
+        name: {
+            "configs": {
+                name: {
+                    "output_type": "generate_until",
+                    "generation_kwargs": {"max_gen_toks": 64, "until": ["\n"]},
+                }
+            }
+        }
+        for name in ("leaf_a", "leaf_b")
+    }
+    generation_sampling = _sampling_config(
+        results,
+        _shared_sampling_task_config(generation_leaves),
+        {},
+        {"prompt_template": "assistant"},
+    )
+    assert generation_sampling["max_generated_tokens"] == 64
+    assert generation_sampling["request_type"] == "generate_until"
+    assert generation_sampling["prompt_template"] == "assistant"
+    assert generation_sampling["stop"] == ["\n"]
+
+
 @pytest.mark.parametrize("name", ["rwkv7-x1j-1.5b", "rwkv7-g2j-1.5b"])
 def test_rwkv_model_rejects_incorrect_data_version_prefix(name):
     with pytest.raises(ScoreboardError, match="data_version"):
@@ -951,6 +1026,24 @@ def test_upload_conflict_after_expire_is_bounded(monkeypatch):
     with pytest.raises(ScoreboardError, match="409"):
         publisher._upload({"benchmark_id": 1})
     assert len(expirations) == 1
+
+
+def test_upload_rejects_and_expires_wrong_benchmark_identity(monkeypatch):
+    publisher = _publisher(monkeypatch, rerun_reason=None)
+    expirations = []
+
+    def send(request, timeout=None):
+        if request.full_url.endswith("/api/expire"):
+            expirations.append(json.loads(request.data.decode()))
+            return _fake_response({"success": True})
+        return _fake_response(
+            {"success": True, "score_id": 77, "benchmark_id": 12}
+        )
+
+    monkeypatch.setattr("lm_eval.loggers.scoreboard.urlopen", send)
+    with pytest.raises(ScoreboardError, match="attached the upload to benchmark_id 12"):
+        publisher._upload({"benchmark_id": 37})
+    assert expirations == [{"score_id": 77}]
 
 
 def test_publisher_preserves_benchmarks_macro_average(tmp_path):
@@ -1011,7 +1104,7 @@ def test_rwkv_remote_wire_to_scoreboard_with_open_thinking(tmp_path, monkeypatch
         path.write_text(path.read_text().replace("output_type: generate_until", "output_type: multiple_choice\ndoc_to_choice: choices").replace("metric: exact_match", "metric: acc"))
     monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *a, **k: Tokenizer())
     monkeypatch.setenv("RWKV_API_KEY", "unit-test")
-    def two_rollouts(tasks, _groups, _benchmark_map, *, limited=False):
+    def two_rollouts(tasks, _groups, _benchmark_map, *, limited=False, sampled_benchmarks=None):
         assert not limited
         return {
             name: AvgAtKPlan(
@@ -1147,7 +1240,7 @@ def test_no_think_native_task_to_scoreboard_and_partial_resume(tmp_path, monkeyp
     def run():
         return evaluator.simple_evaluate(
             model="rwkv7-remote", model_args={"model": "rwkv7-g1j-1.5b", "tokenizer": "unit-tokenizer",
-                "base_url": "http://localhost:8000/v1/completions", "rwkv_generation_prompt": "no_think",
+                "base_url": "http://localhost:8000/v1/completions",
                 "max_length": 4096, "max_retries": 1},
             tasks=["native_leaf"], task_manager=TaskManager(include_path=str(fixtures), include_defaults=False),
             apply_chat_template=True, fewshot_as_multiturn=True, log_samples=True, bootstrap_iters=0,
@@ -1180,7 +1273,8 @@ def test_no_think_native_task_to_scoreboard_and_partial_resume(tmp_path, monkeyp
             assert score["sampling_config"]["request_type"] == "loglikelihood"
             detail = score["passed_details"][0]
             assert detail["answer"] == detail["ground_truth"] == "multi token dogs"
-            assert detail["messages"][0]["content"] == "Which pet?\nAnswer:  multi token dogs"
+            assert detail["messages"][0]["content"] == "Which pet?\nAnswer:"
+            assert detail["messages"][1]["content"] == "  multi token dogs"
             # A correct protocol label cannot make historical response
             # encodings publishable without actual HTTP input evidence.
             rows[0]["response_evidence"] = []
@@ -1315,3 +1409,101 @@ def test_mixed_leaf_k_publishes_an_integer_avg_k(tmp_path):
     assert benchmark_info["num_samples"] == 130
     # (100 * 2 + 30 * 8) / 130 = 3.38 completions per doc
     assert benchmark_info["avg_k"] == 3
+
+
+def test_automatic_mixed_modes_publish_each_actual_profile(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    class Tokenizer:
+        pad_token_id = eos_token_id = bos_token_id = 0
+        eos_token = "<eos>"
+        chat_template = "{% for m in messages %}{{m.role}}: {{m.content}}\n\n{% endfor %}{% if add_generation_prompt %}Assistant: {% if rwkv_generation_prompt == 'open_think' %}<think{% else %}<think></think>\n{% endif %}{% endif %}"
+
+        def __call__(self, values, **kwargs):
+            encode = lambda value: [ord(char) for char in value]
+            return SimpleNamespace(input_ids=encode(values) if isinstance(values, str) else [encode(value) for value in values])
+
+        def batch_decode(self, values, **kwargs):
+            return ["".join(chr(token) for token in value) for value in values]
+
+    fixtures = tmp_path / "fixtures"
+    names = ["native_leaf", "fake_leaf", "thinking_leaf", "direct_leaf"]
+    data = _write_data_and_leaves(fixtures, [(name, "exact_match") for name in names])
+    data.write_text(json.dumps([{"question": "Which pet?", "choices": ["cats", "dogs"], "answer": 1}]))
+    path = fixtures / "native_leaf.yaml"
+    path.write_text(path.read_text().replace("output_type: generate_until", "output_type: multiple_choice\ndoc_to_choice: choices").replace("metric: exact_match", "metric: acc"))
+    monkeypatch.setattr("lm_eval.api.benchmark.read_benchmark_modes", lambda: {
+        "default": "no_think", "fake_leaf": "fake_think", "thinking_leaf": "open_think",
+    })
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *a, **k: Tokenizer())
+    monkeypatch.setenv("RWKV_API_KEY", "unit-test")
+    sent = []
+
+    def post(url, *, json, **kwargs):
+        tokens = json["prompt"][0]
+        prompt = "".join(chr(token) for token in tokens)
+        sent.append((prompt, json))
+        response = Mock(ok=True)
+        if json.get("echo"):
+            assert "<think" not in prompt
+            value = -0.01 if prompt.endswith("dogs") else -1.0
+            choice = {"text": "", "finish_reason": "length", "logprobs": {
+                "token_logprobs": [None] + [value] * (len(tokens) - 1) + [-999],
+                "top_logprobs": [None] + [{"top": -0.01}] * len(tokens)}}
+        else:
+            assert json["stop"] == ["<eos>", "\nUser:"]
+            if json["top_p"] == 1.0:
+                assert "<think" not in prompt
+                text = "1"
+            elif json["top_p"] == 0.28:
+                assert prompt.endswith("<think></think>\n")
+                text = "1"
+            else:
+                assert json["top_p"] == 0.76
+                assert prompt.endswith("Assistant: <think")
+                text = ">reasoning</think>1"
+            choice = {"text": text, "finish_reason": "stop"}
+        response.json.return_value = {"choices": [{"index": 0, **choice}]}
+        return response
+
+    monkeypatch.setattr("lm_eval.models.api_models.requests.post", post)
+    published = {}
+
+    def callback(task_name, artifact_paths):
+        document = json.loads(Path(artifact_paths["results"]).read_text())
+        # No caller-supplied mode; every score must derive it from its artifact.
+        config = PublicationConfig.from_mapping({"base_url": "https://scoreboard.example"})
+        published[task_name] = build_score(document, config)
+        from dataclasses import replace
+        # A stale caller label cannot relabel an actual execution.
+        assert build_score(document, replace(config, cot_mode="FakeCoT"))[1]["cot_mode"] == published[task_name][1]["cot_mode"]
+        if task_name == "native_leaf":
+            invalid = json.loads(json.dumps(document))
+            invalid["config"]["model_args"]["rwkv_generation_prompt"] = "open_think"
+            with pytest.raises(ScoreboardError, match="conflicting actual RWKV modes"):
+                build_score(invalid, config)
+        return {"publication": "validated", "uploaded": False}
+
+    results = evaluator.simple_evaluate(
+        model="rwkv7-remote", model_args={"model": "rwkv7-g1j-1.5b", "tokenizer": "unit-tokenizer",
+            "base_url": "http://localhost:8000/v1/completions", "max_length": 4096, "max_retries": 1},
+        tasks=names, task_manager=TaskManager(include_path=str(fixtures), include_defaults=False),
+        apply_chat_template=True, limit=1, log_samples=True, bootstrap_iters=0,
+        metadata={"weight_revision": "rwkv7-g1j-1.5b-ctx4096"},
+        evaluation_tracker=EvaluationTracker(output_path=str(tmp_path / "run")), task_callback=callback,
+        benchmark_map={name: BenchmarkSpec(name=name, field="reasoning", strategy="standalone", leaf_task_names=(name,)) for name in names},
+    )
+    assert set(published) == set(names)
+    for name, mode in zip(names, ["NoCoT", "FakeCoT", "CoT", "NoCoT"], strict=True):
+        info, score = published[name]
+        assert info["field"] == "reasoning"
+        assert score["cot_mode"] == mode
+        assert score["score"] == 1.0
+        assert score["model"]["ctx_len"] == 4096
+        sampling = score["sampling_config"]
+        assert sampling["request_type"] == ("loglikelihood" if name == "native_leaf" else "generate_until")
+        assert sampling["prompt_template"] == ("native" if name == "native_leaf" else "assistant")
+        assert sampling["max_generated_tokens"] == (1 if name == "native_leaf" else 32)
+        assert results["config"]["task_execution"][name]["metadata"]["cot_mode"] == mode
+    assert len(sent) == 5

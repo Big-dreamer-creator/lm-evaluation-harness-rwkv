@@ -40,7 +40,7 @@ class Publish(SubCommand):
                 notes:
                   • --config must point at a TOML/YAML file containing a [publication]
                     table -- the same table used by `lm-eval run`'s live publication
-                    path (base_url, token_env, cot_mode, [publication.tasks.<name>]).
+                    path (base_url, token_env, [publication.tasks.<name>]); RWKV modes come from artifacts.
                     The benchmark field is read from the saved artifact's
                     benchmark.field, not inferred from its name or supplied here.
                   • If an older artifact does not record weight_revision in its
