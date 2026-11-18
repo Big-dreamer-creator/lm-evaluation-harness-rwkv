@@ -15,7 +15,13 @@ import numpy as np
 
 import lm_eval.api.model
 import lm_eval.api.registry
-from lm_eval.api.benchmark import AvgAtKPlan, plan_avg_at_k
+from lm_eval.api.benchmark import (
+    AvgAtKPlan,
+    benchmark_leaves,
+    plan_avg_at_k,
+    plan_benchmark_samples,
+    rwkv_task_mode,
+)
 from lm_eval.api.benchmark_scheduler import (
     order_benchmarks,
 )
@@ -32,6 +38,7 @@ from lm_eval.api.filter import FilterEnsemble
 from lm_eval.api.metrics import aggregate_benchmark_fallback, mean
 from lm_eval.caching.cache import delete_cache
 from lm_eval.defaults import DEFAULT_OTHER_SEED, DEFAULT_RANDOM_SEED, LMEVAL_HASHMM
+from lm_eval.models.api_models import ContextLengthExhausted
 from lm_eval.models.rwkv_choice import (
     TRUNCATED_FINISH_REASONS,
     rollout_encodings,
@@ -261,6 +268,32 @@ def _log_avg_k_plans(plans: dict[str, AvgAtKPlan]) -> None:
         )
 
 
+def _avg_at_k_candidate_tasks(loaded_tasks: dict[str, Task], lm: LM) -> dict[str, Task]:
+    """Tasks eligible for repeated sampling under their execution mode."""
+    deterministic_likelihood = (
+        getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
+        or getattr(lm, "RWKV_TASK_MODES", False)
+    )
+    return {
+        name: task
+        for name, task in loaded_tasks.items()
+        if not (
+            deterministic_likelihood
+            and task.OUTPUT_TYPE
+            in {"multiple_choice", "loglikelihood", "loglikelihood_rolling"}
+        )
+        and (
+            rwkv_task_mode(
+                name,
+                task.OUTPUT_TYPE,
+                (task.config.metadata or {}).get("rwkv_mode_selectors", ()),
+            ) != "no_think"
+            if getattr(lm, "RWKV_TASK_MODES", False)
+            else getattr(lm, "rwkv_generation_prompt", None) != "no_think"
+        )
+    }
+
+
 def _install_avg_at_k_patch(
     task_obj: Task, lm: LM, k: int, metric_name: str
 ) -> None:
@@ -390,6 +423,46 @@ def _install_avg_at_k_patch(
     task_obj.process_results = patched
 
 
+def _configure_rwkv_task(lm, task):
+    """Prototype: per-task evaluator overrides and RWKV get_model_info."""
+    if getattr(lm, "RWKV_TASK_MODES", False):
+        lm.configure_task(task)
+        task._rwkv_execution_context = _rwkv_task_context(lm, {}, task)["config"]
+
+
+def _rwkv_task_context(lm, context, task=None):
+    """Persist the active execution profile, rather than the run's initial mode."""
+    if not getattr(lm, "RWKV_TASK_MODES", False):
+        return context or {}
+    config = dict((context or {}).get("config") or {})
+    mode = lm.rwkv_generation_prompt
+    native_likelihood = getattr(lm, "_rwkv_native_likelihood_task", False)
+    config["model_args"] = {
+        **(config.get("model_args") or {}), "rwkv_generation_prompt": mode,
+        "rwkv_prompt_template": lm.rwkv_prompt_template,
+    }
+    config["metadata"] = {
+        **(config.get("metadata") or {}),
+        "cot_mode": {"no_think": "NoCoT", "fake_think": "FakeCoT", "open_think": "CoT"}[mode],
+        "prompt_template": "native" if native_likelihood else lm.rwkv_prompt_template,
+    }
+    config["evaluation_protocol"] = lm.EVALUATION_PROTOCOL_VERSION
+    config.update(lm.get_model_info())
+    if not native_likelihood:
+        stops = [lm.PROMPT_STOPS[lm.rwkv_prompt_template]]
+        if task is not None and mode == "no_think":
+            until = (task.config.generation_kwargs or {}).get("until") or []
+            stops = [*([until] if isinstance(until, str) else until), *stops]
+        config["sampling_config"]["stop"] = list(dict.fromkeys(
+            [*([lm.eos_string] if lm.eos_string else []), *stops]
+        ))
+    if native_likelihood:
+        config["sampling_config"]["stop"] = []
+    config["sampling_config"]["declared_context_length"] = lm.max_length
+    config["rwkv_task_modes"] = True
+    return {**(context or {}), "config": config}
+
+
 @positional_deprecated
 def simple_evaluate(
     model: str | LM,
@@ -404,6 +477,7 @@ def simple_evaluate(
     rewrite_requests_cache: bool = False,
     delete_requests_cache: bool = False,
     limit: int | float | None = None,
+    limit_scope: str = "task",
     samples: dict[str, list[int]] | None = None,
     bootstrap_iters: int = 100000,
     check_integrity: bool = False,
@@ -455,6 +529,9 @@ def simple_evaluate(
         limit (int | float | None): Limit the number of examples per task (only
             use this for testing). If <1, limit is a percentage of the total
             number of examples.
+        limit_scope (str): Apply ``limit`` per leaf task (``"task"``, native
+            lm-eval behavior) or once per configured benchmark selector
+            (``"benchmark"``).
         samples (dict | None): Dictionary indicating which examples should be
             tested in each task, e.g.,
             {"mmlu_astronomy": [0, 3, 6], "mmlu_anatomy": [1, 4, 7, 10]}.
@@ -508,6 +585,13 @@ def simple_evaluate(
         raise ValueError(
             "Either 'limit' or 'samples' must be None, but both are not None."
         )
+    if limit_scope not in {"task", "benchmark"}:
+        raise ValueError("limit_scope must be one of: benchmark, task")
+    if limit_scope == "benchmark":
+        if limit is None:
+            raise ValueError("limit_scope=benchmark requires limit")
+        if samples is not None:
+            raise ValueError("limit_scope=benchmark cannot be combined with samples")
 
     _NEEDS_CHAT_TEMPLATE = ("inst", "chat")
     if (
@@ -617,7 +701,9 @@ def simple_evaluate(
     # performs final result aggregation / I/O.
     cache_rank = lm.rank or int(os.environ.get("LOCAL_RANK", "0"))
     if use_cache is not None:
-        if getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False):
+        if getattr(lm, "RWKV_TASK_MODES", False):
+            use_cache += "_rwkv-task-modes-v1"
+        elif getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False):
             use_cache += "_" + lm.EVALUATION_PROTOCOL_VERSION
         eval_logger.info(
             f"Using cache at {use_cache + '_rank' + str(cache_rank) + '.db'}"
@@ -651,11 +737,13 @@ def simple_evaluate(
         task_manager = TaskManager(metadata=metadata)
 
     # Load tasks - returns {"tasks":.., "groups":..}
-    if getattr(lm, "rwkv_generation_prompt", None) == "no_think":
+    if (getattr(lm, "RWKV_TASK_MODES", False)
+            or getattr(lm, "rwkv_generation_prompt", None) == "no_think"):
         task_metadata = task_manager._factory._meta
         task_manager._factory._meta = {
             **task_metadata,
             "rwkv_native_loglikelihood": True,
+            "rwkv_task_modes": getattr(lm, "RWKV_TASK_MODES", False),
         }
         try:
             loaded = task_manager.load(tasks)
@@ -667,34 +755,59 @@ def simple_evaluate(
     # Log selected tasks with hierarchy
     _log_selected_tasks(loaded["tasks"], loaded["groups"], task_manager)
 
+    sampled_benchmarks: set[str] = set()
+    if limit_scope == "benchmark":
+        for benchmark_name, leaves in benchmark_leaves(
+            loaded["tasks"], loaded["groups"], benchmark_map
+        ).items():
+            if sum(len(loaded["tasks"][leaf].eval_docs) for leaf in leaves) > int(limit):
+                sampled_benchmarks.add(benchmark_name)
+
     # avg@k rollout budget: one `k` per benchmark, sized off the documents all
     # of that benchmark's leaves add up to (not off a single leaf, which
     # multiplied a many-subtask benchmark's own question count by its
     # per-leaf `k`). Computed up front so every leaf of a benchmark samples
     # the same `k` times per doc.
     supports_avg_at_k = getattr(lm, "SUPPORTS_AVG_AT_K", False)
-    native_likelihood = getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
     avg_k_plans = (
         plan_avg_at_k(
-            {name: task for name, task in loaded["tasks"].items()
-             if not (native_likelihood and task.OUTPUT_TYPE == "multiple_choice")},
+            _avg_at_k_candidate_tasks(loaded["tasks"], lm),
             loaded["groups"],
             benchmark_map,
-            limited=limit is not None or samples is not None,
+            limited=(
+                limit_scope != "benchmark"
+                and (limit is not None or samples is not None)
+            ),
+            sampled_benchmarks=sampled_benchmarks,
         )
         if supports_avg_at_k
         else {}
     )
     if avg_k_plans:
-        if limit is not None or samples is not None:
+        if limit_scope == "benchmark" and sampled_benchmarks:
+            eval_logger.info(
+                "avg@k: benchmark-scoped sampling pins sampled selectors to "
+                "k=1; complete selectors below the sample cap retain native "
+                "avg@k sizing: %s",
+                ", ".join(sorted(sampled_benchmarks)),
+            )
+        elif limit is not None or samples is not None:
             eval_logger.info(
                 "avg@k: --limit or --samples is set, every benchmark runs at "
                 "k=1 (a partial run is a smoke test, not an avg@k measurement)"
             )
         _log_avg_k_plans(avg_k_plans)
+    elif supports_avg_at_k:
+        eval_logger.warning(
+            "avg@k is supported by this backend, but no benchmark has a "
+            "generative leaf eligible for independent rollouts; deterministic "
+            "likelihood tasks remain k=1"
+        )
 
     # Apply config overrides to tasks
     for task_name, task_obj in loaded["tasks"].items():
+        _configure_rwkv_task(lm, task_obj)
+        native_likelihood = getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
         if task_obj.get_config("output_type") == "generate_until":
             if gen_kwargs is not None:
                 task_obj.set_config(
@@ -783,6 +896,7 @@ def simple_evaluate(
             "device": device,
             "gen_kwargs": gen_kwargs,
             "limit": limit,
+            "limit_scope": limit_scope,
             "samples": samples,
             "max_length": _callback_model_args.get("max_length"),
             "metadata": dict(metadata or {}),
@@ -798,6 +912,7 @@ def simple_evaluate(
         lm=lm,
         task_dict=loaded,
         limit=limit,
+        limit_scope=limit_scope,
         samples=samples,
         cache_requests=cache_requests,
         rewrite_requests_cache=rewrite_requests_cache,
@@ -848,6 +963,7 @@ def simple_evaluate(
                 "device": device,
                 "use_cache": use_cache,
                 "limit": limit,
+                "limit_scope": limit_scope,
                 "bootstrap_iters": bootstrap_iters,
                 "gen_kwargs": gen_kwargs,
                 "random_seed": random_seed,
@@ -856,6 +972,12 @@ def simple_evaluate(
                 "fewshot_seed": fewshot_random_seed,
             }
         )
+        if getattr(lm, "RWKV_TASK_MODES", False):
+            results["config"].pop("sampling_config", None)
+            results["config"]["task_execution"] = {
+                name: task._rwkv_execution_context
+                for name, task in loaded["tasks"].items()
+            }
         results["git_hash"] = get_git_commit_hash()
         results["date"] = start_date
         add_env_info(results)  # additional environment info to results
@@ -870,6 +992,7 @@ def evaluate(
     lm: LM,
     task_dict: TaskDict | _NestedDict,
     limit: int | None = None,
+    limit_scope: str = "task",
     samples: dict[str, list[int]] | None = None,
     cache_requests: bool = False,
     rewrite_requests_cache: bool = False,
@@ -895,6 +1018,8 @@ def evaluate(
             'tasks', 'groups', and 'group_map' entries.
         limit (int | None): Limit the number of examples per task (only use this
             for testing).
+        limit_scope (str): Apply ``limit`` per leaf task (``"task"``) or once
+            per configured benchmark selector (``"benchmark"``).
         samples (dict | None): Dictionary indicating which examples should be
             tested in each task, e.g.,
             {"mmlu_astronomy": [0, 3, 6], "mmlu_anatomy": [1, 4, 7, 10]}.
@@ -929,12 +1054,15 @@ def evaluate(
         raise ValueError(
             "Either 'limit' or 'samples' must be None, but both are not None."
         )
+    if limit_scope not in {"task", "benchmark"}:
+        raise ValueError("limit_scope must be one of: benchmark, task")
+    if limit_scope == "benchmark":
+        if limit is None:
+            raise ValueError("limit_scope=benchmark requires limit")
+        if samples is not None:
+            raise ValueError("limit_scope=benchmark cannot be combined with samples")
     if samples is not None:
         eval_logger.info(f"Evaluating examples for tasks {list(samples.keys())}")
-    # stores the amount to pad out reqs per req. type so that
-    # number of fwd passes per distributed rank is equal
-    task_padding_requests: dict[str, dict[str, int]] = {}
-
     # Initialize groups and tasks
     # handle back_comp. Assume if "tasks" not present, then using old nested.
     if "tasks" not in task_dict:
@@ -942,6 +1070,45 @@ def evaluate(
     else:
         task_dict = cast("TaskDict", task_dict)
         groups, eval_tasks = task_dict.get("groups", {}), task_dict.get("tasks", {})
+
+    effective_samples = samples
+    sampled_benchmarks: set[str] = set()
+    if limit_scope == "benchmark":
+        if benchmark_map is None:
+            raise ValueError(
+                "limit_scope=benchmark requires tasks selected through "
+                "benchmark.toml"
+            )
+        effective_samples, selected_leaf_names = plan_benchmark_samples(
+            eval_tasks,
+            groups,
+            benchmark_map,
+            int(limit),
+        )
+        for benchmark_name, leaves in benchmark_leaves(
+            eval_tasks, groups, benchmark_map
+        ).items():
+            original_docs = sum(
+                len(eval_tasks[leaf].eval_docs) for leaf in leaves
+            )
+            selected_docs = sum(
+                len(effective_samples.get(leaf, [])) for leaf in leaves
+            )
+            if selected_docs < original_docs:
+                sampled_benchmarks.add(benchmark_name)
+        selected_leaf_set = set(selected_leaf_names)
+        eval_tasks = {
+            name: task
+            for name, task in eval_tasks.items()
+            if name in selected_leaf_set
+        }
+        eval_logger.info(
+            "Benchmark-scoped limit=%s: selected %d leaf tasks with %d total "
+            "documents",
+            limit,
+            len(eval_tasks),
+            sum(len(indices) for indices in effective_samples.values()),
+        )
 
     # Group leaf tasks by the benchmark they were requested under, so that
     # scoreboard publication happens once per benchmark (as soon as its own
@@ -993,6 +1160,7 @@ def evaluate(
     # 2.are we running multimodal task <-> non-multimodal model class, or vice-versa.
     incompatible_tasks = []
     for task_name, task in eval_tasks.items():
+        _configure_rwkv_task(lm, task)
         if (getattr(lm, "rwkv_generation_prompt", None) == "no_think"
                 and not getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
                 and (task.OUTPUT_TYPE == "multiple_choice"
@@ -1025,51 +1193,8 @@ def evaluate(
     limit_arg = limit
     limits = []
     for task_name, task in eval_tasks.items():
-        limit = get_sample_size(task, limit_arg)
-        limits.append(limit)
-        native_likelihood = (
-            getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
-            and task.OUTPUT_TYPE == "multiple_choice"
-        )
-        task.build_all_requests(
-            limit=limit,
-            samples=samples.get(task_name, None) if samples is not None else samples,
-            rank=lm.rank,
-            world_size=lm.world_size,
-            cache_requests=cache_requests,
-            rewrite_requests_cache=rewrite_requests_cache,
-            system_instruction=system_instruction,
-            apply_chat_template=bool(apply_chat_template) and not native_likelihood,
-            fewshot_as_multiturn=fewshot_as_multiturn and not native_likelihood,
-            chat_template=getattr(lm, "apply_chat_template", None)
-            if apply_chat_template and not native_likelihood
-            else None,
-            tokenizer_name=getattr(lm, "tokenizer_name", "")
-            if apply_chat_template and not native_likelihood
-            else "",
-        )
-        eval_logger.debug(
-            f"Task: {task_name}; number of requests on this rank: {len(task.instances)}"
-        )
-        if write_out:
-            print_writeout(task)
-        if lm.world_size > 1:
-            import torch
-
-            instances_rnk = torch.tensor(
-                len(task._instances) if task._instances else 0, device=lm.device
-            )
-            gathered_item = lm.all_gather(instances_rnk).cpu().detach().numpy().tolist()
-            # "multiple_choice" task types dispatch (several) "loglikelihood" request types
-            reqtype = (
-                "loglikelihood"
-                if task.OUTPUT_TYPE == "multiple_choice"
-                else task.OUTPUT_TYPE
-            )
-            # compute number of pseudo-batches to pad with (FSDP/DDP require even batches among ranks)
-            numpad = max(gathered_item) - gathered_item[lm.rank]
-            # todo: may not account for padding in cases like SquadV2 which has multiple req types
-            task_padding_requests[task_name] = {reqtype: numpad}
+        _configure_rwkv_task(lm, task)
+        limits.append(get_sample_size(task, limit_arg))
 
     RANK = lm.rank
     WORLD_SIZE = lm.world_size
@@ -1078,6 +1203,24 @@ def evaluate(
         lm, "_supports_checkpoint_items", False
     )
     model_fp = compute_model_fingerprint(lm) if checkpoint_capable else None
+    # Large campaign summaries must not materialize every prompt in every
+    # task at once. RWKV remote opts into bounded windows: each window is
+    # built only when it is about to run and is released after scoring.
+    # Distributed runs keep the native all-at-once path below because their
+    # request/padding symmetry is established across ranks for one dispatch.
+    stream_request_windows = bool(
+        WORLD_SIZE == 1
+        and getattr(lm, "STREAM_EVALUATION_CHUNKS", False)
+        and not cache_requests
+    )
+    stream_samples = bool(
+        stream_request_windows
+        and log_samples
+        and evaluation_tracker is not None
+        and getattr(evaluation_tracker, "output_path", None)
+        and not getattr(evaluation_tracker, "push_samples_to_hub", False)
+    )
+    streamed_sample_paths: dict[str, str] = {}
 
     def run_requests(
         task_requests: dict[str, list[Any]],
@@ -1127,88 +1270,158 @@ def evaluate(
             if WORLD_SIZE > 1:
                 lm.barrier()
 
-    def response_evidence(responses: list[Any]) -> list[dict[str, Any]]:
-        """Fields Scoreboard consumes from a raw model response.
+    def _requests_per_document(task: Task) -> int:
+        """Requests one document dispatches in this task's current mode.
 
-        Must run here, on the live response objects, before evaluation_tracker
-        serializes ``resps`` to plain strings and this data is gone for good.
+        Repeated rollouts and multiple-choice choices are counted because they
+        each become a separate HTTP request (and therefore retain their own
+        prompt/response graph until the window is released).
         """
-        evidence = []
-        for response in responses:
-            raw_response = getattr(response, "raw_response", None)
-            if raw_response is None:
-                continue
-            choice = next(iter(raw_response.get("choices") or []), {})
-            message = choice.get("message") or {}
-            # `raw_response` is the entire HTTP response body -- whenever more
-            # than one prompt was batched into that one call (batch_size > 1),
-            # its `choices` list holds every batched completion, not just this
-            # `response`'s own. Blindly reading `choices[0]` would then
-            # silently attribute a different request's completion to this one.
-            # `response` itself already carries its own, correctly-indexed
-            # text (`_RWKVCompletion` *is* that text as a `str`;
-            # `RWKVLoglikelihoodResponse.text` forwards it from the specific
-            # generation it was derived from) -- prefer that, and only fall
-            # back to re-deriving from `choice` for response types that don't
-            # carry it.
-            text = str(response) if isinstance(response, str) else getattr(response, "text", None)
-            if text is None:
-                text = choice.get("text") or message.get("content")
-            entry = {
-                "text": text,
-                "prompt": getattr(response, "prompt", None),
-                "tool_calls": message.get("tool_calls") or [],
-                "finish_reason": getattr(response, "finish_reason", None)
-                or choice.get("finish_reason"),
-                "truncated": bool(getattr(response, "truncated", False)),
-                "output_token_ids": getattr(response, "output_token_ids", None) or [],
-            }
-            if getattr(response, "request_type", None) == "loglikelihood":
-                entry.update({
-                    "request_type": "loglikelihood",
-                    "request_url": lm.base_url,
-                    "prompt_token_ids": response.prompt_token_ids,
-                    "finish_reason": None,
-                    "loglikelihood": response[0],
-                    "raw_response": raw_response,
-                    "max_tokens": 1,
-                    "declared_context_length": lm.max_length,
-                    "prompt_template": "native",
-                })
-            # Only `RWKVLoglikelihoodResponse` (the avg@k generative
-            # multiple_choice path) sets `unparsed`/`parsed_answer` at all --
-            # a plain generate_until completion (`_RWKVCompletion`, a bare
-            # `str`) never does, so `hasattr` (not `getattr(..., default)`)
-            # is what actually tells the two cases apart.
-            elif hasattr(response, "unparsed"):
-                entry["parsed_answer"] = getattr(response, "parsed_answer", None)
-                entry["unparsed"] = bool(response.unparsed)
-            evidence.append(entry)
-        return evidence
+        requests_per_doc = max(1, int(task.config.repeats or 1))
+        if task.OUTPUT_TYPE == "multiple_choice" and task.eval_docs:
+            try:
+                requests_per_doc *= max(1, len(task.doc_to_choice(task.eval_docs[0])))
+            except Exception:  # noqa: BLE001 - choice formatting is task-owned
+                eval_logger.debug(
+                    "Could not count choices for %s; using one request per doc",
+                    task.config.task,
+                )
+        return requests_per_doc
 
-    def finish_benchmark(
+    def _request_window_documents(task: Task, requests_per_doc: int) -> int:
+        """Documents to materialize in one window.
+
+        Keep roughly one endpoint concurrency window of requests alive rather
+        than the entire leaf. The byte budget below may shrink this further
+        for long-context documents.
+        """
+        target_requests = max(1, int(getattr(lm, "_concurrent", 1)))
+        return max(1, target_requests // requests_per_doc)
+
+    def _document_request_bytes(
+        task: Task, doc: Any, requests_per_doc: int
+    ) -> int:
+        """Approximate UTF-8 bytes a document contributes to a window.
+
+        This deliberately measures the native prompt text rather than the
+        serialized dataset row: dataset rows can include unused answer fields,
+        while the prompt is what the harness retains as request text and then
+        tokenizes. A small fixed framing overhead keeps many tiny requests from
+        escaping the budget entirely.
+        """
+        try:
+            text = task.doc_to_text(doc)
+        except Exception:  # noqa: BLE001 - prompt construction is task-owned
+            text = ""
+        size = len(str(text).encode("utf-8"))
+        if task.OUTPUT_TYPE == "multiple_choice":
+            try:
+                size += sum(
+                    len(str(choice).encode("utf-8"))
+                    for choice in task.doc_to_choice(doc)
+                )
+            except Exception:  # noqa: BLE001 - choice formatting is task-owned
+                pass
+        else:
+            try:
+                size += len(str(task.doc_to_target(doc)).encode("utf-8"))
+            except Exception:  # noqa: BLE001 - target formatting is task-owned
+                pass
+        return max(1, size + 256) * max(1, requests_per_doc)
+
+    def _iter_document_windows(
+        task: Task, task_name: str, task_limit: int | None
+    ):
+        indices = (
+            effective_samples.get(task_name, None)
+            if effective_samples is not None
+            else None
+        )
+        requests_per_doc = _requests_per_document(task)
+        window_size = _request_window_documents(task, requests_per_doc)
+        window_max_bytes = getattr(lm, "STREAM_WINDOW_MAX_PROMPT_BYTES", None)
+        window: list[tuple[int, Any]] = []
+        window_bytes = 0
+        for doc_id, doc in task.doc_iterator(
+            rank=RANK,
+            limit=task_limit,
+            world_size=WORLD_SIZE,
+            samples=indices,
+        ):
+            doc_bytes = _document_request_bytes(task, doc, requests_per_doc)
+            if window and (
+                len(window) >= window_size
+                or (
+                    window_max_bytes is not None
+                    and window_bytes + doc_bytes > window_max_bytes
+                )
+            ):
+                eval_logger.debug(
+                    "Task %s streaming window: docs=%d prompt_bytes=%d "
+                    "(limits docs=%d bytes=%s)",
+                    task_name,
+                    len(window),
+                    window_bytes,
+                    window_size,
+                    window_max_bytes,
+                )
+                yield window
+                window = []
+                window_bytes = 0
+            window.append((doc_id, doc))
+            window_bytes += doc_bytes
+        if window:
+            eval_logger.debug(
+                "Task %s streaming window: docs=%d prompt_bytes=%d "
+                "(limits docs=%d bytes=%s)",
+                task_name,
+                len(window),
+                window_bytes,
+                window_size,
+                window_max_bytes,
+            )
+            yield window
+
+    def _request_build_kwargs(task: Task) -> dict[str, Any]:
+        native_likelihood = (
+            getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
+            and task.OUTPUT_TYPE == "multiple_choice"
+        )
+        return {
+            "system_instruction": system_instruction,
+            "apply_chat_template": bool(apply_chat_template) and not native_likelihood,
+            "fewshot_as_multiturn": fewshot_as_multiturn and not native_likelihood,
+            "chat_template": (
+                getattr(lm, "apply_chat_template", None)
+                if apply_chat_template and not native_likelihood
+                else None
+            ),
+        }
+
+    def _process_document_requests(
         task_name: str,
         acc: ResultAcc,
-        limit: int | None,
+        docs_by_id: dict[int, Any],
     ) -> None:
+        """Filter and score one already-run request window."""
         task = acc["task"]
         task.apply_filters()
+        if not task.instances:
+            return
         instances_by_doc_id = defaultdict(list)
         for instance in task.instances:
             instances_by_doc_id[instance.doc_id].append(instance)
         for instances in instances_by_doc_id.values():
             instances.sort(key=lambda x: x.idx)
-        for filter_key in task.instances[0].filtered_resps:
-            indices = samples.get(task_name, None) if samples is not None else None
-            doc_iterator = task.doc_iterator(
-                rank=RANK,
-                limit=limit,
-                world_size=WORLD_SIZE,
-                samples=indices,
-            )
-            docs_in_filter = 0
-            for doc_id, doc in doc_iterator:
-                docs_in_filter += 1
+
+        indices = (
+            effective_samples.get(task_name, None)
+            if effective_samples is not None
+            else None
+        )
+        filter_keys = list(task.instances[0].filtered_resps)
+        for filter_key in filter_keys:
+            for doc_id, doc in docs_by_id.items():
                 doc_id_true = indices[doc_id] if indices else doc_id
                 document_requests = instances_by_doc_id[doc_id]
                 # Read by the avg@k process_results patch (see
@@ -1273,15 +1486,98 @@ def evaluate(
                         acc["raw_metrics"][(metric, filter_key)].extend(value)
                     else:
                         acc["raw_metrics"][(metric, filter_key)].append(value)
-            # Every filter scores the same doc set, so the largest count is
-            # the number of docs actually evaluated (``n-samples.effective``
-            # and the results' ``n_samples``). Taken from the docs themselves
-            # rather than from any metric's value list: per-metric lists are
-            # legitimately shorter than the doc count (an avg@k metric only
-            # covers docs that reported it), which is what made the published
-            # sample count disagree with the evaluated doc count.
-            acc["n_docs"] = max(acc["n_docs"], docs_in_filter)
 
+        # Every filter scores the same window. ``n_docs`` is a document
+        # count, not a metric-value count, so add it once per window.
+        acc["n_docs"] += len(docs_by_id)
+        if stream_samples and acc["logged_samples"]:
+            samples_path = evaluation_tracker.save_results_samples(
+                task_name,
+                acc["logged_samples"],
+                append=task_name in streamed_sample_paths,
+            )
+            if samples_path is None:
+                raise OSError(f"Could not persist sample window for {task_name}")
+            streamed_sample_paths[task_name] = samples_path
+            acc["logged_samples"].clear()
+
+    def _release_task_requests(task: Task) -> None:
+        """Drop this window's prompt/response graph before building the next."""
+        task._instances = []
+        for attr in ("_avg_k_current_doc_id", "_avg_k_current_responses"):
+            if hasattr(task, attr):
+                delattr(task, attr)
+
+    def response_evidence(responses: list[Any]) -> list[dict[str, Any]]:
+        """Fields Scoreboard consumes from a raw model response.
+
+        Must run here, on the live response objects, before evaluation_tracker
+        serializes ``resps`` to plain strings and this data is gone for good.
+        """
+        evidence = []
+        for response in responses:
+            raw_response = getattr(response, "raw_response", None)
+            if raw_response is None:
+                continue
+            choice = next(iter(raw_response.get("choices") or []), {})
+            message = choice.get("message") or {}
+            # `raw_response` is the entire HTTP response body -- whenever more
+            # than one prompt was batched into that one call (batch_size > 1),
+            # its `choices` list holds every batched completion, not just this
+            # `response`'s own. Blindly reading `choices[0]` would then
+            # silently attribute a different request's completion to this one.
+            # `response` itself already carries its own, correctly-indexed
+            # text (`_RWKVCompletion` *is* that text as a `str`;
+            # `RWKVLoglikelihoodResponse.text` forwards it from the specific
+            # generation it was derived from) -- prefer that, and only fall
+            # back to re-deriving from `choice` for response types that don't
+            # carry it.
+            text = str(response) if isinstance(response, str) else getattr(response, "text", None)
+            if text is None:
+                text = choice.get("text") or message.get("content")
+            entry = {
+                "text": text,
+                "prompt": getattr(response, "prompt", None),
+                "tool_calls": message.get("tool_calls") or [],
+                "finish_reason": getattr(response, "finish_reason", None)
+                or choice.get("finish_reason"),
+                "truncated": bool(getattr(response, "truncated", False)),
+                "output_token_ids": getattr(response, "output_token_ids", None) or [],
+            }
+            if getattr(response, "request_type", None) == "loglikelihood":
+                entry.update({
+                    "request_type": "loglikelihood",
+                    "request_url": lm.base_url,
+                    "prompt_token_ids": response.prompt_token_ids,
+                    "finish_reason": None,
+                    "loglikelihood": response[0],
+                    "raw_response": raw_response,
+                    "max_tokens": 1,
+                    "declared_context_length": lm.max_length,
+                    "prompt_template": "native",
+                })
+            elif getattr(response, "request_type", None) == "generate_until":
+                entry.update({
+                    "request_type": "generate_until",
+                    "request_url": getattr(response, "request_url", None) or lm.base_url,
+                })
+            # Only `RWKVLoglikelihoodResponse` (the avg@k generative
+            # multiple_choice path) sets `unparsed`/`parsed_answer` at all --
+            # a plain generate_until completion (`_RWKVCompletion`, a bare
+            # `str`) never does, so `hasattr` (not `getattr(..., default)`)
+            # is what actually tells the two cases apart.
+            elif hasattr(response, "unparsed"):
+                entry["parsed_answer"] = getattr(response, "parsed_answer", None)
+                entry["unparsed"] = bool(response.unparsed)
+            evidence.append(entry)
+        return evidence
+
+    def finish_benchmark(
+        task_name: str,
+        acc: ResultAcc,
+        limit: int | None,
+    ) -> None:
+        task = acc["task"]
         if WORLD_SIZE > 1:
             if log_samples:
                 all_samples = lm.gather_object(
@@ -1317,21 +1613,21 @@ def evaluate(
                 if rollout_stats:
                     task._rollout_stats = rollout_stats
 
-        if RANK == 0 and (task_callback is not None or checkpoint_store is not None):
+        if RANK == 0:
             aggregated_metrics, sample_len = _compute_task_aggregations(
                 task, acc["raw_metrics"], bootstrap_iters, acc["n_docs"]
             )
             task_config = dict(task.dump_config())
+            final_metrics = {
+                "name": task_name,
+                "alias": task_config.get("task_alias", task_name),
+                "sample_len": sample_len,
+                **aggregated_metrics,
+            }
+            acc["metrics"] = final_metrics
             callback_results = {
-                **(task_callback_context or {}),
-                "results": {
-                    task_name: {
-                        "name": task_name,
-                        "alias": task_config.get("task_alias", task_name),
-                        "sample_len": sample_len,
-                        **aggregated_metrics,
-                    }
-                },
+                **_rwkv_task_context(lm, task_callback_context, task),
+                "results": {task_name: final_metrics},
                 "configs": {task_name: task_config},
                 "versions": {task_name: task.VERSION},
                 "n-samples": {
@@ -1342,10 +1638,19 @@ def evaluate(
                 },
             }
             artifact_paths = None
-            if evaluation_tracker is not None:
+            if evaluation_tracker is not None and (
+                task_callback is not None or checkpoint_store is not None or stream_samples
+            ):
                 try:
                     artifact_paths = evaluation_tracker.save_task_artifacts(
-                        task_name, callback_results, acc["logged_samples"]
+                        task_name,
+                        callback_results,
+                        acc["logged_samples"],
+                        **(
+                            {"samples_path": streamed_sample_paths[task_name]}
+                            if task_name in streamed_sample_paths
+                            else {}
+                        ),
                     )
                 except (OSError, TypeError, ValueError) as error:
                     eval_logger.warning(
@@ -1370,6 +1675,14 @@ def evaluate(
                 tracker["remaining"] -= 1
                 if tracker["remaining"] == 0:
                     _finish_and_publish_benchmark(bname)
+            # Once the samples are safely on disk, the final aggregate result
+            # only needs the metrics above. Keeping every document, prompt and
+            # response until the end of a 23-benchmark campaign is what made
+            # the process grow with the whole run rather than one window.
+            if stream_samples and artifact_paths and artifact_paths.get("samples"):
+                acc["logged_samples"].clear()
+            acc["raw_metrics"].clear()
+        _release_task_requests(task)
         if WORLD_SIZE > 1:
             lm.barrier()
 
@@ -1425,7 +1738,7 @@ def evaluate(
             checkpoint_store.start_benchmark(bname, fingerprint)
 
         results_doc = {
-            **(task_callback_context or {}),
+            **_rwkv_task_context(lm, task_callback_context, eval_tasks[leaves[-1]]),
             "benchmark": {"name": bname, "field": spec.field},
             "results": {bname: aggregated},
             "configs": (
@@ -1496,19 +1809,106 @@ def evaluate(
     def _run_one_task(
         task_name: str, acc: ResultAcc, task_limit: int | None
     ) -> None:
+        nonlocal model_fp
+        task = acc["task"]
+        _configure_rwkv_task(lm, task)
+        if checkpoint_capable:
+            model_fp = compute_model_fingerprint(lm)
         task_fingerprint = None
         if checkpoint_store is not None:
-            task_fingerprint = compute_task_fingerprint(dict(acc["task"].dump_config()))
+            task_fingerprint = compute_task_fingerprint(dict(task.dump_config()))
             checkpoint_store.start_benchmark(task_name, task_fingerprint)
-        benchmark_requests = defaultdict(list)
-        for instance in acc["task"].instances:
-            benchmark_requests[instance.request_type].append(instance)
-        run_requests(
-            benchmark_requests,
-            task_padding_requests.get(task_name, {}),
-            task_name=task_name,
-            task_fingerprint=task_fingerprint,
-        )
+
+        def requests_by_type() -> dict[str, list[Any]]:
+            grouped = defaultdict(list)
+            for instance in task.instances:
+                grouped[instance.request_type].append(instance)
+            return grouped
+
+        if not stream_request_windows:
+            native_likelihood = (
+                getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
+                and task.OUTPUT_TYPE == "multiple_choice"
+            )
+            task.build_all_requests(
+                limit=task_limit,
+                samples=(
+                    effective_samples.get(task_name, None)
+                    if effective_samples is not None
+                    else effective_samples
+                ),
+                rank=lm.rank,
+                world_size=lm.world_size,
+                cache_requests=cache_requests,
+                rewrite_requests_cache=rewrite_requests_cache,
+                system_instruction=system_instruction,
+                apply_chat_template=bool(apply_chat_template) and not native_likelihood,
+                fewshot_as_multiturn=fewshot_as_multiturn and not native_likelihood,
+                chat_template=getattr(lm, "apply_chat_template", None)
+                if apply_chat_template and not native_likelihood
+                else None,
+                tokenizer_name=getattr(lm, "tokenizer_name", "")
+                if apply_chat_template and not native_likelihood
+                else "",
+            )
+            eval_logger.debug(
+                "Task: %s; number of requests on this rank: %d",
+                task_name,
+                len(task.instances),
+            )
+            if write_out:
+                print_writeout(task)
+            padding: dict[str, int] = {}
+            if WORLD_SIZE > 1:
+                import torch
+
+                instances_rnk = torch.tensor(
+                    len(task._instances) if task._instances else 0, device=lm.device
+                )
+                gathered_item = lm.all_gather(instances_rnk).cpu().detach().numpy().tolist()
+                reqtype = (
+                    "loglikelihood"
+                    if task.OUTPUT_TYPE == "multiple_choice"
+                    else task.OUTPUT_TYPE
+                )
+                padding[reqtype] = max(gathered_item) - gathered_item[lm.rank]
+            run_requests(
+                requests_by_type(),
+                padding,
+                task_name=task_name,
+                task_fingerprint=task_fingerprint,
+            )
+            docs_by_id = {}
+            for instance in task.instances:
+                docs_by_id.setdefault(instance.doc_id, instance.doc)
+            _process_document_requests(task_name, acc, docs_by_id)
+            return
+
+        build_kwargs = _request_build_kwargs(task)
+        first_window = True
+        window_docs = 0
+        for documents in _iter_document_windows(task, task_name, task_limit):
+            task.build_requests_for_documents(documents, **build_kwargs)
+            eval_logger.debug(
+                "Task: %s; window requests=%d docs=%d",
+                task_name,
+                len(task.instances),
+                len(documents),
+            )
+            if write_out and first_window:
+                print_writeout(task)
+            run_requests(
+                requests_by_type(),
+                {},
+                task_name=task_name,
+                task_fingerprint=task_fingerprint,
+            )
+            _process_document_requests(task_name, acc, dict(documents))
+            window_docs += len(documents)
+            _release_task_requests(task)
+            first_window = False
+        if window_docs == 0:
+            raise ValueError(f"{task_name}: build_requests() did not find any docs!")
 
     # Group leaf tasks into schedulable units: every leaf of a benchmark group
     # runs as one unit so they still aggregate/publish together once all their
@@ -1537,19 +1937,49 @@ def evaluate(
     else:
         ordered_benchmarks = list(schedule_units)
 
+    skipped_benchmarks: dict[str, str] = {}
     for bname in ordered_benchmarks:
-        for task_name, acc, task_limit in schedule_units[bname]:
-            _run_one_task(task_name, acc, task_limit)
-            finish_benchmark(task_name, acc, task_limit)
+        try:
+            for task_name, acc, task_limit in schedule_units[bname]:
+                _run_one_task(task_name, acc, task_limit)
+                finish_benchmark(task_name, acc, task_limit)
+        except ContextLengthExhausted as error:
+            # A context-overflowing prompt cannot be shortened without
+            # changing the benchmark. Keep already-completed benchmark
+            # artifacts, omit this selector from this run's result, and let
+            # later selectors continue instead of aborting the whole batch.
+            skipped_benchmarks[bname] = str(error)
+            eval_logger.warning(
+                "Skipping benchmark %s: %s",
+                bname,
+                error,
+            )
+            for task_name, _acc, _task_limit in schedule_units[bname]:
+                eval_results_acc.pop(task_name, None)
 
     if RANK == 0:
+        if skipped_benchmarks:
+            eval_logger.warning(
+                "Skipped benchmarks: %s",
+                ", ".join(sorted(skipped_benchmarks)),
+            )
         res = _process_results(eval_results_acc, groups, bootstrap_iters)
 
         samples = None
         if log_samples:
-            samples = res.samples
-            if LMEVAL_HASHMM and hasattr(lm, "MULTIMODAL"):
-                samples = hash_dict_images(samples)
+            if stream_samples:
+                # Successful tasks were streamed to their own sample files.
+                # Keep only a failed-to-persist task's samples for the caller's
+                # fallback save instead of re-materializing the campaign.
+                samples = {
+                    name: acc["logged_samples"]
+                    for name, acc in eval_results_acc.items()
+                    if acc["logged_samples"]
+                } or None
+            else:
+                samples = res.samples
+                if LMEVAL_HASHMM and hasattr(lm, "MULTIMODAL"):
+                    samples = hash_dict_images(samples)
 
         return res._to_eval_results(samples=samples)
     else:

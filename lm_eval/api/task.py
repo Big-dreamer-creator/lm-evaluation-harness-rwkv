@@ -333,32 +333,16 @@ class Task(abc.ABC):
             doc_id_docs,
             total=num_docs,
         ):
-            # sample fewshot context #TODO: need to offset doc_id by rank now!
-            fewshot_ctx = self.fewshot_context(
-                doc,
-                num_fewshot=0
-                if self.config.num_fewshot is None
-                else self.config.num_fewshot,
-                system_instruction=system_instruction,
-                apply_chat_template=apply_chat_template,
-                fewshot_as_multiturn=fewshot_as_multiturn,
-                chat_template=chat_template,
-                gen_prefix=self.doc_to_prefix(doc),
+            instances.append(
+                self._construct_instance_group(
+                    doc_id,
+                    doc,
+                    system_instruction=system_instruction,
+                    apply_chat_template=apply_chat_template,
+                    fewshot_as_multiturn=fewshot_as_multiturn,
+                    chat_template=chat_template,
+                )
             )
-
-            # TODO: we should override self.config.repeats if doing greedy gen so users don't waste time+compute
-            inst = self.construct_requests(
-                doc=doc,
-                ctx=fewshot_ctx,
-                metadata=(self.config["task"], doc_id, self.config.repeats),
-                apply_chat_template=apply_chat_template,
-                chat_template=chat_template,
-            )
-
-            if not isinstance(inst, list):
-                inst = [inst]
-
-            instances.append(inst)
 
         # now flatten, this is to allow slicing to work with pickles
 
@@ -377,6 +361,75 @@ class Task(abc.ABC):
 
         if cache_requests and (not cached_instances or rewrite_requests_cache):
             save_to_cache(file_name=cache_key, obj=instances)
+
+    def _construct_instance_group(
+        self,
+        doc_id: int,
+        doc: dict,
+        *,
+        system_instruction: str | None = None,
+        apply_chat_template: bool = False,
+        fewshot_as_multiturn: bool = False,
+        chat_template: Callable | None = None,
+    ) -> list[Instance]:
+        """Build every request for one already-selected document."""
+        # sample fewshot context #TODO: need to offset doc_id by rank now!
+        fewshot_ctx = self.fewshot_context(
+            doc,
+            num_fewshot=0
+            if self.config.num_fewshot is None
+            else self.config.num_fewshot,
+            system_instruction=system_instruction,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            chat_template=chat_template,
+            gen_prefix=self.doc_to_prefix(doc),
+        )
+
+        # TODO: we should override self.config.repeats if doing greedy gen so users don't waste time+compute
+        inst = self.construct_requests(
+            doc=doc,
+            ctx=fewshot_ctx,
+            metadata=(self.config["task"], doc_id, self.config.repeats),
+            apply_chat_template=apply_chat_template,
+            chat_template=chat_template,
+        )
+
+        return inst if isinstance(inst, list) else [inst]
+
+    def build_requests_for_documents(
+        self,
+        doc_id_docs: Iterable[tuple[int, Any]],
+        *,
+        system_instruction: str | None = None,
+        apply_chat_template: bool = False,
+        fewshot_as_multiturn: bool = False,
+        chat_template: Callable | None = None,
+    ) -> None:
+        """Build only the supplied documents' requests.
+
+        ``build_all_requests`` is the native full-split entry point. This
+        companion lets the evaluator materialize one bounded scheduling
+        window at a time after it has already selected the documents for this
+        rank, so a long benchmark does not keep every prompt resident at once.
+        It deliberately bypasses request caching; callers that enable the
+        native request cache continue to use ``build_all_requests``.
+        """
+        instances = []
+        for doc_id, doc in doc_id_docs:
+            instances.extend(
+                self._construct_instance_group(
+                    doc_id,
+                    doc,
+                    system_instruction=system_instruction,
+                    apply_chat_template=apply_chat_template,
+                    fewshot_as_multiturn=fewshot_as_multiturn,
+                    chat_template=chat_template,
+                )
+            )
+        self._instances = instances
+        if len(self._instances) == 0:
+            raise ValueError("task.build_requests_for_documents() did not find any docs!")
 
     @abc.abstractmethod
     def construct_requests(self, doc, ctx, **kwargs):

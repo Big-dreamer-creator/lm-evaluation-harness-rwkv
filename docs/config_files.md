@@ -79,16 +79,16 @@ arguments. Unknown fields fail before model or dataset initialization.
 | `weight_revision` | string | unset | Full served weight filename stem, including the release date and `ctx<N>` (e.g. `rwkv7-g1j-1.5b-20260831-ctx16384`); recorded in run metadata and used by scoreboard publication to derive `ctx_len` without putting it in the API-facing `model_name` |
 | `base_url` | string | required | HTTP(S) endpoint, always `/v1/completions` |
 | `benchmarks` | list | required | Unique public benchmark names; configured order is the stable tie-break for the runtime ascending-pending-rollout order |
-| `benchmark_config` | string | `configs/benchmarks.toml` | Explicit top-level field-to-selector mapping; relative paths are resolved from the run config |
+| `benchmark_config` | string | `lm_eval/config/benchmarks.toml` | Explicit top-level field-to-selector mapping; relative paths are resolved from the run config |
 | `output_dir` | string | required | Result directory (top level for a single-model file, per `[[models]]` entry for a campaign) |
 | `max_length` | int | required | Positive service context limit |
-| `max_gen_toks` | int | `8192` | Remote RWKV choice-generation output budget; preserve the full input and reduce output to the remaining context window |
+| `max_gen_toks` | int | `8192` | Remote RWKV choice-generation output budget; sent to the backend unchanged regardless of prompt length -- it is a completion length, not a total-context budget, and is never shrunk by subtracting prompt tokens |
 | `batch_size` | int | `1` | lm-eval request batch size |
 | `max_num_seqs` | int | required | Served endpoint's own `--max-num-seqs`; the evaluator's request concurrency is derived from it |
 | `device` | string | `"cpu"` | Evaluation-side device |
 | `rwkv_profile` | table | required | Complete RWKV execution profile |
 | `rwkv_profile.prompt_template` | string | required | Official RWKV template mode |
-| `rwkv_profile.generation_prompt` | string | required | `no_think`, `fake_think`, or `open_think` |
+| `rwkv_profile.generation_prompt` | string | deprecated | Ignored with a warning; each RWKV task selects its mode |
 | `rwkv_profile.wkv_mode` | string | required | Recorded server WKV mode |
 | `models` | array of tables | unset | The model ladder of a campaign; see [One file per benchmark set](#one-file-per-benchmark-set) |
 | `model_overrides` | table | `{}` | Versioned fields forced onto every `[[models]]` entry last; the launch-time overlay hook |
@@ -97,12 +97,14 @@ arguments. Unknown fields fail before model or dataset initialization.
 | `log_samples` | bool | `true` | Save inputs and model outputs |
 | `seed` | list[int] | `[0,1234,1234,1234]` | Four lm-eval random seeds |
 | `limit` | number | unset | Smoke-only sample limit |
+| `limit_scope` | string | `task` | Apply `limit` per leaf task (`task`, native lm-eval behavior) or once per configured benchmark selector (`benchmark`) |
+| `skip_benchmarks` | list[string] | `[]` | Configured selectors to omit before task loading; useful when a canonical dataset or runtime is unavailable |
 | `use_cache` | string | unset | Response cache path |
 | `weight_revision` | string | unset | Exact weight identity, including `ctx<number>` for Scoreboard; separate from the evaluation's `max_length` |
 
 ### Benchmark fields
 
-Benchmark domains are configured only in `configs/benchmarks.toml`. Each
+Benchmark domains are configured only in `lm_eval/config/benchmarks.toml`. Each
 top-level key is one supported field and its array contains opaque benchmark
 selectors:
 
@@ -123,9 +125,76 @@ Scoreboard publication. `[publication.tasks.<selector>.field]` is no longer a
 source of truth; when present for compatibility, it may only agree with the
 saved field and cannot override it.
 
+`[publication].is_preview` is the explicit Scoreboard model-identity flag. It
+defaults to `false`; set it to `true` only for a preview release. Producer
+clients must not infer this flag from the data-version label.
+
+`limit_scope = "benchmark"` gives every configured selector one shared
+document budget. When a selector expands to more leaf tasks than the budget,
+the first and last leaf tasks are included with the remaining leaves spread
+evenly across the selector. Selected leaves receive deterministic leading
+document indices in round-robin order. This is an explicitly sampled score,
+not full benchmark coverage; omitting the field preserves lm-eval's native
+per-leaf `limit` behavior.
+
+`skip_benchmarks` is an operational exclusion list. Its entries must also
+appear in `benchmarks`; skipped selectors are absent from results and
+publication rather than being scored with substituted or truncated inputs.
+Skip decisions are excluded from checkpoint fingerprints so an interrupted run
+can resume without discarding completed rollouts.
+
 ### Remote RWKV evaluation protocol
 
-For `rwkv_profile.generation_prompt = "no_think"`, multiple-choice tasks use
+RWKV mode selection follows `RWKVLightevalTask.cot_mode` and
+`RWKVLightevalTaskConfig` in `lighteval-rwkv`. The local prototypes are
+`TaskFactory._build_task`, the evaluator's per-task override loop, and
+`RWKV7Remote.__init__` / `get_model_info`.
+
+The executable task contract is:
+
+- The RWKV factory applies existing `metadata.rwkv_no_think` task variants before
+  constructing the native Task. Native `multiple_choice` / likelihood tasks
+  select `no_think`; actual `Instance.request_type` remains `loglikelihood`.
+- `lm_eval/config/benchmark_modes.toml` is the authoritative RWKV mode inventory.
+  Its `no_think`, `fake_think`, and `open_think` sections list benchmark selectors;
+  `default` handles unlisted tasks. Native TaskManager expands group/tag selectors,
+  and an exact leaf entry overrides its enclosing selectors. Generative tasks
+  retain direct-answer `no_think` unless explicitly listed otherwise. Task YAML
+  and run metadata no longer select the mode. This does not turn generation into likelihood.
+- Dataset versions, fields, splits, targets, choices, scoring functions,
+  aggregation and task generation budgets retain their existing definitions.
+  No benchmark is added by this change. Native non-RWKV task loading is unchanged.
+- The evaluator activates the task profile before request construction and again
+  before dispatch. This controls chat rendering, stops, fixed sampling presets,
+  final-answer filtering, avg@k eligibility and checkpoint model fingerprints.
+  Direct-answer NoCoT generation stays `generate_until` with its native stops
+  and budgets, and is excluded from automatic avg@k planning. Only CoT/FakeCoT
+  generation remains eligible for RWKV automatic repeated sampling. Native
+  multiple-choice and likelihood tasks stay deterministic sequence scoring and
+  are excluded because they have no independent samples to average. NoCoT does
+  not imply loglikelihood for open-ended QA.
+- Each leaf and benchmark artifact records its actual mode, protocol, sampling
+  parameters and template. The complete run records `config.task_execution`;
+  one global sampling block cannot describe a mixed run. Mixed-mode benchmark
+  leaves cannot be published as one mode.
+- Publication derives `cot_mode` from saved execution artifacts, regardless of an
+  obsolete `publication.cot_mode`. The field/category still comes exclusively
+  from `BenchmarkSpec.field` / saved `benchmark.field`, and model identity still
+  comes from the saved model and exact weight revision. Historical artifacts
+  retain their existing protocol checks; their modes are never guessed from a
+  newly edited run config.
+- Legacy versioned presets may contain `rwkv_profile.generation_prompt`, but it
+  is ignored with a warning. Maintained presets omit it and `publication.cot_mode`.
+  Explicit low-level adapter construction remains compatible for historical
+  replay; normal versioned runs use task modes. Local coding owns its CoT mode.
+
+Acceptance requires the hermetic HTTP/mixed-mode/publication/resume regressions
+and ten-question 1.5B + 2.9B smoke artifacts with actual LOGPROBS / GENERATIVE
+logs before production publication. Missing endpoint manifests or credentials do
+not count as successful live validation.
+
+
+RWKV multiple-choice tasks automatically select NoCoT and use
 native `multiple_choice` requests and real sequence loglikelihoods from
 `/v1/completions`. The matching `tokenizer_name` is mandatory and requests
 send Token IDs. Native task prompts take precedence over the global chat
@@ -156,6 +225,23 @@ The full input is preserved. `max_gen_toks` defaults to 8192 for choice rollouts
 set it explicitly when comparing models with different reasoning lengths.
 A prompt that exhausts the context window aborts rather than receiving a score
 for an empty completion. Multi-leaf benchmarks share one avg@k sizing budget.
+The evaluator materializes one request window at a time. That window is bounded
+by the endpoint concurrency pool and by `STREAM_WINDOW_MAX_PROMPT_BYTES`
+(2 MiB of native prompt text in `RWKV7Remote`), so a long-context leaf cannot
+retain the entire pool's prompt strings and token IDs before dispatch.
+With local sample output enabled, each completed window is appended to the
+task's JSONL file before its sample objects are released. Task finalization
+reuses that file without loading or rewriting earlier windows. A write failure
+stops evaluation before publication; checkpointed responses remain available
+for replay. Distributed execution, request caching, and Hugging Face sample
+uploads retain the existing sample-saving path. Metric inputs remain resident
+until task aggregation because task-defined aggregators may need every value.
+This reuses `EvaluationTracker.save_results_samples` serialization and
+`save_task_artifacts` metadata writing; the default overwrite behavior remains
+unchanged for callers outside windowed evaluation. The hermetic long-prompt
+regression uses 256 documents with 32 KiB questions and checks that the windowed
+Python allocation peak stays below half the native path's peak. This measures
+producer allocations, not server memory or production process RSS.
 
 The protocol identity is `rwkv-generative-v2`. Use a separate output/checkpoint
 directory for runs made before this version. Old raw answers need a versioned
@@ -212,7 +298,6 @@ log_samples = true
 
 [rwkv_profile]
 prompt_template = "assistant"
-generation_prompt = "open_think"
 wkv_mode = "fp32io16"
 
 [[models]]
@@ -345,9 +430,8 @@ belong in each task YAML and are rejected by the versioned global schema. Each
 `benchmarks` entry is a native lm-eval-harness task, group, or tag name,
 resolved directly by `TaskManager` — there is no RWKV-specific adapter or
 renaming layer. The `rwkv_profile` table selects only the official model
-template and RWKV generation profile; sampling parameters (temperature,
-top_p/top_k, penalties) always come from that profile and cannot be
-overridden by task YAML. The Python CLI runner only loads this configuration,
+template and declared server WKV mode. Tasks select the fixed RWKV generation
+profile; individual temperature, top_p/top_k and penalty overrides remain unsupported. The Python CLI runner only loads this configuration,
 selects the model adapter, and executes lm-eval; it contains no
 benchmark-specific strategy.
 
@@ -380,3 +464,46 @@ lm-eval validate --tasks my_task --include_path /path/to/tasks
 3. **Separate concerns**: Create different configs for different model families or task sets
 4. **Version control**: Commit config files alongside results for reproducibility
 5. **Use comments**: TOML and YAML support `#` comments to document your choices
+
+### Native mode audit (2026-11-13)
+
+Mode selection must follow the selected benchmark variant rather than assuming
+all generation is CoT. The upstream [DROP task](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/drop/default.yaml)
+uses direct answers and EM/F1; [XQuAD](https://github.com/google-deepmind/xquad)
+uses SQuAD-style extractive answers, and its [upstream task](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/xquad/xquad_common_yaml)
+stops at newline with greedy generation. Therefore DROP/XQuAD remain NoCoT
+generation with the existing 64-token budget, extraction and scorer. No budget
+is enlarged to accommodate reasoning. Other native direct-answer generation
+variants inherit this same policy.
+
+[CRUXEval](https://github.com/facebookresearch/cruxeval) exposes both direct
+and chain-of-thought variants. Only `cruxeval_input_cot` and
+`cruxeval_output_cot` explicitly select `open_think` in the central inventory; the direct variants
+retain `no_think`. Their native prompts, repeats, budgets and metrics are
+preserved. A mixed-mode CRUXEval selector cannot be uploaded as one mode;
+it needs an explicit, separately reviewed publication split.
+
+The publisher refuses a legacy upload API that requires only `benchmark_name`:
+that interface cannot distinguish same-name benchmarks with different fields or
+sample contracts. It must accept the registered `benchmark_id`; no name-only
+retry is sent. This keeps historical rows intact and prevents a correct local
+`reading_comprehension` field from becoming an older `reasoning` row remotely.
+
+Live validation on 2026-11-13 used the current gateway model registry and pool
+capacities (1.5B: 128; 2.9B: 512 + 2048), running both models independently.
+RACE, DROP and XQuAD each populated ten-question artifacts per model; RACE had
+40 real likelihood candidate requests, and each QA benchmark had ten generation
+requests. Resumption restored their completed checkpoints. CRUXEval input/output
+CoT variants each populated ten questions with ten native repeats for both models;
+the original 512/1024-token limits caused substantial truncation, so these are
+protocol validation artifacts, not production acceptance for those variants.
+See `results/task-native-mode-smoke-20261113/validation_summary.json` locally.
+
+The provided test Scoreboard at `127.0.0.1:7862` exposed a name-only upload
+schema. Its first compatibility retry associated RACE with historical benchmark
+id 1 (`reasoning`) instead of newly registered id 29
+(`reading_comprehension`); the publisher detected and expired only that new
+ambiguous score. The fallback has been removed, and a subsequent real API check
+confirmed rejection on HTTP 422 before writing another score. Test-dashboard
+publication acceptance remains blocked until the external deployment supports
+registered benchmark ids. No Scoreboard source or unrelated scores were changed.

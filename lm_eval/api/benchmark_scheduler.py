@@ -36,12 +36,24 @@ def pending_rollouts_for_task(
 ) -> int:
     """Rollouts (repeated ``Instance`` draws) not yet completed for one task.
 
-    A fresh run has no checkpoint data to consult, so the total is read
-    straight out of ``task.instances`` (already populated by
-    ``task.build_all_requests()`` before this is called). Resuming a run
-    subtracts what the checkpoint store already has recorded as completed.
+    Scheduling happens before prompts are materialized (the evaluator builds
+    one bounded request window at a time). Use the already-loaded document
+    count and the task's own request shape for ordering, then subtract what a
+    resumed checkpoint store has already recorded as completed. Once a caller
+    has built requests, prefer the exact instance count.
     """
-    total = sum(instance.repeats for instance in task.instances)
+    instances = getattr(task, "_instances", None) or getattr(task, "instances", None) or []
+    if instances:
+        total = sum(instance.repeats for instance in instances)
+    else:
+        config = getattr(task, "config", None)
+        requests_per_doc = max(1, int(getattr(config, "repeats", 1) or 1))
+        if getattr(task, "OUTPUT_TYPE", None) == "multiple_choice" and getattr(task, "eval_docs", []):
+            try:
+                requests_per_doc *= max(1, len(task.doc_to_choice(task.eval_docs[0])))
+            except Exception:  # noqa: BLE001 - task-owned formatting
+                pass
+        total = len(task.eval_docs) * requests_per_doc
     if checkpoint_store is not None:
         total -= checkpoint_store.count_completed(task_name)
     return max(total, 0)
@@ -65,7 +77,12 @@ def requires_generation(task: "Task") -> bool:
     rollouts are ``generate_until`` requests (open-ended answers, CoT) run
     after tasks that can be scored from fixed continuations.
     """
-    return any(instance.request_type == "generate_until" for instance in task.instances)
+    instances = getattr(task, "_instances", None) or getattr(task, "instances", None) or []
+    if instances:
+        return any(
+            instance.request_type == "generate_until" for instance in instances
+        )
+    return getattr(task, "OUTPUT_TYPE", None) == "generate_until"
 
 
 def order_benchmarks(

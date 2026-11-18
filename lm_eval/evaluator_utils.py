@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from lm_eval.api.metrics import (
     mean,
@@ -35,6 +35,10 @@ class ResultAcc(TypedDict):
     # Number of docs actually evaluated (not a metric's value count -- see
     # `_compute_task_aggregations`).
     n_docs: int
+    # Aggregated metrics retained after `raw_metrics` is released. Streaming
+    # production runs finalize each task as soon as its samples are persisted,
+    # instead of keeping per-document values until the whole campaign ends.
+    metrics: NotRequired[dict[str, Any]]
 
 
 def print_writeout(task: Task) -> None:
@@ -292,21 +296,28 @@ def _collect_results(
     for task_name, acc in eval_results_acc.items():
         task = acc["task"]
 
-        # Compute aggregated metrics
-        # TODO: note: currently assume all metrics are scalar-valued
-        agg_metrics, sample_len = _compute_task_aggregations(
-            task, acc["raw_metrics"], bootstrap_iters, acc.get("n_docs", 0)
-        )
+        if "metrics" in acc:
+            metrics = dict(acc["metrics"])
+            sample_len = metrics["sample_len"]
+        else:
+            # Compute aggregated metrics
+            # TODO: note: currently assume all metrics are scalar-valued
+            agg_metrics, sample_len = _compute_task_aggregations(
+                task, acc["raw_metrics"], bootstrap_iters, acc.get("n_docs", 0)
+            )
 
         # Get task config
         task_config = dict(task.dump_config())
 
-        result.metrics[task_name] = {
-            "name": task_name,
-            "alias": task_config.get("task_alias", task_name),
-            "sample_len": sample_len,
-            **agg_metrics,
-        }
+        if "metrics" in acc:
+            result.metrics[task_name] = metrics
+        else:
+            result.metrics[task_name] = {
+                "name": task_name,
+                "alias": task_config.get("task_alias", task_name),
+                "sample_len": sample_len,
+                **agg_metrics,
+            }
         result.configs[task_name] = task_config
         result.versions[task_name] = task.VERSION
         result.num_fewshot[task_name] = task_config.get("num_fewshot", 0)

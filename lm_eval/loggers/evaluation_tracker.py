@@ -324,11 +324,13 @@ class EvaluationTracker:
         task_name: str,
         results: dict[str, Any],
         samples: list[dict[str, Any]],
+        samples_path: str | None = None,
     ) -> dict[str, str] | None:
         """Persist one completed task for post-evaluation consumers."""
         if not self.output_path:
             return None
-        samples_path = self.save_results_samples(task_name, samples)
+        if samples_path is None:
+            samples_path = self.save_results_samples(task_name, samples)
         if samples_path is None:
             return None
         return self._write_artifact_files(task_name, results, Path(samples_path))
@@ -433,6 +435,7 @@ class EvaluationTracker:
         self,
         task_name: str,
         samples: list[dict[str, Any]],
+        append: bool = False,
     ) -> str | None:
         """Saves the samples results to the output path.
 
@@ -455,7 +458,7 @@ class EvaluationTracker:
 
             file_results_samples = path / f"samples_{task_name}_{self.date_id}.jsonl"
             info_once(eval_logger, f"Saving per-task samples to {path}/*.jsonl")
-            with open(file_results_samples, "w", encoding="utf-8") as f:
+            with open(file_results_samples, "a" if append else "w", encoding="utf-8") as f:
                 for sample in samples:
                     # we first need to sanitize arguments and resps
                     # otherwise we won't be able to load the dataset

@@ -143,7 +143,7 @@ def test_leaf_tasks_never_published_only_benchmark_is(
 
 
 def test_simple_evaluate_writes_run_metadata_into_the_published_artifact(
-    benchmark_fixture_task_manager, recording_callback, tmp_path
+    benchmark_fixture_task_manager, recording_callback, tmp_path, monkeypatch
 ):
     """The published results.json must carry the run metadata.
 
@@ -154,6 +154,19 @@ def test_simple_evaluate_writes_run_metadata_into_the_published_artifact(
     argument there -- both into the live callback context and into the final
     results document.
     """
+    # Prototype: RWKVLoglikelihoodResponse; this fixture must retain its actual
+    # dummy request context instead of asking publication to reconstruct it.
+    original = DummyLM.loglikelihood
+
+    def evidenced_loglikelihood(self, requests, **kwargs):
+        from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
+        return [
+            RWKVLoglikelihoodResponse(ll, greedy, prompt=request.args[0], text=request.args[1],
+                raw_response={"choices": [{"text": request.args[1]}]})
+            for request, (ll, greedy) in zip(requests, original(self, requests, **kwargs), strict=True)
+        ]
+
+    monkeypatch.setattr(DummyLM, "loglikelihood", evidenced_loglikelihood)
     metadata = {
         "model_name": "rwkv7-g1j-1.5b",
         "weight_revision": "rwkv7-g1j-1.5b-20260831-ctx16384",
@@ -294,3 +307,202 @@ def test_already_published_benchmark_skips_callback_but_updates_checkpoint(
     assert len(calls) == 0
     benchmark_row = checkpoint_store.get_benchmark("test_group")
     assert benchmark_row["publish_status"] == "succeeded"
+
+
+def test_streaming_windows_are_bounded_and_samples_are_persisted(
+    benchmark_fixture_task_manager, recording_callback, tmp_path, monkeypatch
+):
+    """RWKV campaigns keep one request window, not every prompt, in memory."""
+    from lm_eval.api.task import Task
+
+    build_windows: list[tuple[str, int]] = []
+    original_build = Task.build_requests_for_documents
+    original_save = EvaluationTracker.save_results_samples
+    saved_windows = []
+
+    def recording_save(self, task_name, samples, **kwargs):
+        saved_windows.append((task_name, len(samples), kwargs.get("append", False)))
+        return original_save(self, task_name, samples, **kwargs)
+
+    monkeypatch.setattr(EvaluationTracker, "save_results_samples", recording_save)
+
+    def recording_build(self, documents, **kwargs):
+        documents = list(documents)
+        build_windows.append((self.config.task, len(documents)))
+        return original_build(self, documents, **kwargs)
+
+    monkeypatch.setattr(Task, "build_requests_for_documents", recording_build)
+
+    task_dict = benchmark_fixture_task_manager.load(["test_group"])
+    lm = DummyLM()
+    lm.STREAM_EVALUATION_CHUNKS = True
+    lm._concurrent = 1
+    tracker = EvaluationTracker(output_path=str(tmp_path / "streamed"))
+
+    results = evaluator.evaluate(
+        lm=lm,
+        task_dict=task_dict,
+        bootstrap_iters=0,
+        log_samples=True,
+        evaluation_tracker=tracker,
+        task_callback=recording_callback,
+        task_callback_context={"config": {"model": "dummy", "model_args": {}}},
+        benchmark_map=_benchmark_map(),
+    )
+
+    # Four choices per doc and one concurrent request -> one doc per window.
+    assert build_windows
+    assert {size for _, size in build_windows} == {1}
+    assert len(saved_windows) == 8
+    assert all(size == 1 for _, size, _ in saved_windows)
+    assert [
+        append for name, _, append in saved_windows if name == "group_task_fs0"
+    ] == [False, True, True, True]
+    assert all(not task._instances for task in task_dict["tasks"].values())
+    assert "samples" not in results
+    assert tracker.saved_sample_tasks >= {"group_task_fs0", "group_task_fs1"}
+    for task_name in ("group_task_fs0", "group_task_fs1"):
+        [sample_path] = (tmp_path / "streamed").glob(
+            f"*/samples_{task_name}_{tracker.date_id}.jsonl"
+        )
+        assert len(sample_path.read_text("utf-8").splitlines()) == 4
+
+    assert results["n-samples"]["group_task_fs0"] == {"original": 4, "effective": 4}
+    assert results["n-samples"]["group_task_fs1"] == {"original": 4, "effective": 4}
+
+
+def test_streaming_windows_respect_the_prompt_byte_budget(
+    benchmark_fixture_task_manager, recording_callback, tmp_path, monkeypatch
+):
+    """Long prompts must not fill the whole endpoint concurrency pool."""
+    from lm_eval.api.task import Task
+
+    build_windows: list[tuple[str, int]] = []
+    original_build = Task.build_requests_for_documents
+
+    def recording_build(self, documents, **kwargs):
+        documents = list(documents)
+        build_windows.append((self.config.task, len(documents)))
+        return original_build(self, documents, **kwargs)
+
+    monkeypatch.setattr(Task, "build_requests_for_documents", recording_build)
+
+    task_dict = benchmark_fixture_task_manager.load(["test_group"])
+    lm = DummyLM()
+    lm.STREAM_EVALUATION_CHUNKS = True
+    # High endpoint concurrency would otherwise allow two docs, but the byte
+    # ceiling permits only one before the window must be dispatched.
+    lm._concurrent = 8
+    lm.STREAM_WINDOW_MAX_PROMPT_BYTES = 1
+    tracker = EvaluationTracker(output_path=str(tmp_path / "byte-budget"))
+
+    evaluator.evaluate(
+        lm=lm,
+        task_dict=task_dict,
+        bootstrap_iters=0,
+        log_samples=True,
+        evaluation_tracker=tracker,
+        task_callback=recording_callback,
+        task_callback_context={"config": {"model": "dummy", "model_args": {}}},
+        benchmark_map=_benchmark_map(),
+    )
+
+    assert build_windows
+    assert {size for _, size in build_windows} == {1}
+
+
+def test_streaming_results_match_native_evaluation(
+    benchmark_fixture_task_manager, tmp_path
+):
+    runs = []
+    for streaming in (False, True):
+        random.seed(42)
+        lm = DummyLM()
+        lm.STREAM_EVALUATION_CHUNKS = streaming
+        lm._concurrent = 1
+        lm.loglikelihood = lambda requests: [
+            (-float(len(str(request.args[1]))), False) for request in requests
+        ]
+        task_dict = benchmark_fixture_task_manager.load(["test_group"])
+        for task in task_dict["tasks"].values():
+            task.set_fewshot_seed(42)
+        tracker = EvaluationTracker(output_path=str(tmp_path / str(streaming)))
+        results = evaluator.evaluate(
+            lm=lm,
+            task_dict=task_dict,
+            bootstrap_iters=0,
+            evaluation_tracker=tracker,
+            task_callback=lambda **kwargs: None,
+            task_callback_context={"config": {"model": "dummy", "model_args": {}}},
+            benchmark_map=_benchmark_map(),
+        )
+        samples = {}
+        for task_name in ("group_task_fs0", "group_task_fs1"):
+            [sample_path] = (tmp_path / str(streaming)).glob(
+                f"*/samples_{task_name}_{tracker.date_id}.jsonl"
+            )
+            samples[task_name] = [
+                json.loads(line) for line in sample_path.read_text("utf-8").splitlines()
+            ]
+        runs.append((results["results"], results["n-samples"], samples))
+    assert runs[0] == runs[1]
+
+
+def test_streaming_stops_on_sample_write_failure(
+    benchmark_fixture_task_manager, recording_callback, tmp_path, monkeypatch
+):
+    def failed_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(EvaluationTracker, "save_results_samples", failed_save)
+    lm = DummyLM()
+    lm.STREAM_EVALUATION_CHUNKS = True
+    lm._concurrent = 1
+    with pytest.raises(OSError, match="disk full"):
+        evaluator.evaluate(
+            lm=lm,
+            task_dict=benchmark_fixture_task_manager.load(["test_group"]),
+            bootstrap_iters=0,
+            evaluation_tracker=EvaluationTracker(output_path=str(tmp_path)),
+            task_callback=recording_callback,
+            benchmark_map=_benchmark_map(),
+        )
+    assert not recording_callback.calls
+
+
+def test_streaming_reduces_long_prompt_peak_memory(
+    benchmark_fixture_task_manager, tmp_path
+):
+    import gc
+    import tracemalloc
+
+    from datasets import Dataset
+
+    peaks = {}
+    for streaming in (False, True):
+        task_dict = benchmark_fixture_task_manager.load(["group_task_fs0"])
+        task = task_dict["tasks"]["group_task_fs0"]
+        task.dataset["test"] = Dataset.from_list([
+            {**_TEST_DATA[0], "question": f"{doc_id}: " + "context " * 4096}
+            for doc_id in range(256)
+        ])
+        lm = DummyLM()
+        lm.STREAM_EVALUATION_CHUNKS = streaming
+        lm._concurrent = 16
+        tracker = EvaluationTracker(output_path=str(tmp_path / str(streaming)))
+        gc.collect()
+        tracemalloc.start()
+        try:
+            evaluator.evaluate(
+                lm=lm,
+                task_dict=task_dict,
+                bootstrap_iters=0,
+                evaluation_tracker=tracker,
+                task_callback=lambda **kwargs: None,
+                task_callback_context={"config": {"model": "dummy", "model_args": {}}},
+            )
+            peaks[streaming] = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+    print(f"Long-prompt Python peak bytes: {peaks}")
+    assert peaks[True] < peaks[False] / 2
