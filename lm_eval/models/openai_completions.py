@@ -183,6 +183,8 @@ class _RWKVCompletion(str):
         value.prompt_token_ids = None
         value.output_token_ids = None
         value.reasoning = None
+        value.request_type = None
+        value.request_url = None
         value.truncated = finish_reason in {"length", "max_tokens"}
         return value
 

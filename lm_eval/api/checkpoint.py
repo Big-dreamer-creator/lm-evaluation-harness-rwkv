@@ -196,6 +196,17 @@ def serialize_response(response: Any) -> str:
                     "seed": getattr(response, "seed", None),
                     "finish_reason": finish_reason,
                     "raw_response": raw_response,
+                    # Dispatched-prompt evidence -- without these, a resumed
+                    # generation round-trips back with `prompt`/`prompt_token_ids`
+                    # reset to None, even though the completion answers fine,
+                    # making the restored rollout invalid for publication.
+                    "prompt": getattr(response, "prompt", None),
+                    "prompt_token_ids": getattr(response, "prompt_token_ids", None),
+                    "output_token_ids": getattr(response, "output_token_ids", None),
+                    "reasoning": getattr(response, "reasoning", None),
+                    "truncated": bool(getattr(response, "truncated", False)),
+                    "request_type": getattr(response, "request_type", None),
+                    "request_url": getattr(response, "request_url", None),
                 },
                 default=str,
                 ensure_ascii=False,
@@ -234,6 +245,13 @@ def deserialize_response(data: str) -> Any:
         value = _RWKVCompletion(payload["text"], payload.get("finish_reason"), raw_response=payload.get("raw_response"))
         value.requires_think_close = bool(payload.get("requires_think_close", False))
         value.seed = payload.get("seed")
+        value.prompt = payload.get("prompt")
+        value.prompt_token_ids = payload.get("prompt_token_ids")
+        value.output_token_ids = payload.get("output_token_ids")
+        value.reasoning = payload.get("reasoning")
+        value.truncated = bool(payload.get("truncated", False))
+        value.request_type = payload.get("request_type")
+        value.request_url = payload.get("request_url")
         return value
     if kind == "str":
         return payload["text"]

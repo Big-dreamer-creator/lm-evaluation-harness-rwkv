@@ -587,6 +587,8 @@ class TemplateAPI(TemplateLM):
             value = _RWKVCompletion(str(value))
         value.seed = (gen_kwargs or {}).get("seed", self._seed)
         value.requires_think_close = getattr(self, "rwkv_generation_prompt", None) == "open_think"
+        value.request_type = "generate_until"
+        value.request_url = self._endpoint_url()
         if sent_prompt is not None:
             value.prompt, value.prompt_token_ids = sent_prompt
         return value
@@ -630,10 +632,16 @@ class TemplateAPI(TemplateLM):
                     response.status_code, response.text
                 )
                 if prompt_tokens is not None:
-                    adjusted = shrink_max_tokens(payload, self.max_length - prompt_tokens)
-                    if adjusted is not None:
-                        payload = adjusted
-                        continue
+                    # `PRESERVE_INPUT_CONTEXT` backends (RWKV) must report an
+                    # over-context prompt as a failure rather than silently
+                    # shrinking the configured completion budget to fit --
+                    # the contract requires the configured generation budget
+                    # to be sent unchanged.
+                    if not getattr(self, "PRESERVE_INPUT_CONTEXT", False):
+                        adjusted = shrink_max_tokens(payload, self.max_length - prompt_tokens)
+                        if adjusted is not None:
+                            payload = adjusted
+                            continue
                     raise ContextLengthExhausted(
                         f"Prompt requires at least {prompt_tokens} input tokens, "
                         f"leaving no positive completion budget within max_length={self.max_length}."
@@ -705,12 +713,18 @@ class TemplateAPI(TemplateLM):
                         response.status, error_text
                     )
                     if prompt_tokens is not None:
-                        adjusted = shrink_max_tokens(
-                            payload, self.max_length - prompt_tokens
-                        )
-                        if adjusted is not None:
-                            payload = adjusted
-                            continue
+                        # `PRESERVE_INPUT_CONTEXT` backends (RWKV) must report
+                        # an over-context prompt as a failure rather than
+                        # silently shrinking the configured completion budget
+                        # to fit -- the contract requires the configured
+                        # generation budget to be sent unchanged.
+                        if not getattr(self, "PRESERVE_INPUT_CONTEXT", False):
+                            adjusted = shrink_max_tokens(
+                                payload, self.max_length - prompt_tokens
+                            )
+                            if adjusted is not None:
+                                payload = adjusted
+                                continue
                         raise ContextLengthExhausted(
                             f"Prompt requires at least {prompt_tokens} input tokens, "
                             f"leaving no positive completion budget within max_length={self.max_length}."
@@ -1032,7 +1046,6 @@ class TemplateAPI(TemplateLM):
         prepared_seeds = []
         if independent:
             counts = {}
-            token_counts = {}
             prepared = []
             for request, key in zip(requests, item_keys, strict=True):
                 args = request.args
@@ -1044,14 +1057,13 @@ class TemplateAPI(TemplateLM):
                 counts[slot] = counts.get(slot, 0) + 1
                 gen["seed"] = int(gen.get("seed", self._seed)) + ordinal
                 prepared_seeds.append(gen["seed"])
-                if strict_context and self.tokenized_requests:
-                    if args[0] not in token_counts:
-                        token_counts[args[0]] = len(self.tok_encode([args[0]], add_special_tokens=self.add_bos_token)[0])
-                    room = self.max_length - token_counts[args[0]]
-                    if room <= 0:
-                        raise ContextLengthExhausted("Prompt exhausts the context window; input was preserved")
-                    cap_key = "max_tokens" if "max_tokens" in gen else "max_gen_toks"
-                    gen[cap_key] = min(int(gen.get(cap_key, self._max_gen_toks)), room)
+                # `strict_context` backends (PRESERVE_INPUT_CONTEXT) must send
+                # the configured generation budget unchanged: it's a completion
+                # length, not a total-context budget, and the inference backend
+                # has its own, separately configured context. Do not infer a
+                # total context limit from this budget or shrink it by a
+                # tokenization preflight here -- an actual over-context prompt
+                # is reported as a failure by the HTTP call below instead.
                 prepared.append(replace(request, arguments=(args[0], gen, *args[2:])))
             requests = prepared
 

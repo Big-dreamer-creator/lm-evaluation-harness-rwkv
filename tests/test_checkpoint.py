@@ -243,6 +243,34 @@ def test_serialize_deserialize_rwkv_completion_roundtrip():
     assert restored.raw_response == {"choices": [{"text": "generated text"}]}
 
 
+def test_serialize_deserialize_rwkv_completion_retains_dispatched_prompt_evidence():
+    """A resumed generation must carry the same dispatched-prompt evidence as a
+    fresh one -- without it, the adapter's own publication contract rejects the
+    restored rollout even though the completion answers fine."""
+    from lm_eval.models.openai_completions import _RWKVCompletion
+
+    response = _RWKVCompletion(
+        "generated text", "length", raw_response={"choices": [{"text": "generated text"}]}
+    )
+    response.prompt = "User: question\nAssistant: <think>"
+    response.prompt_token_ids = [1, 2, 3, 4]
+    response.output_token_ids = [5, 6, 7]
+    response.reasoning = "step one, step two"
+    response.truncated = True
+    response.request_type = "generate_until"
+    response.request_url = "https://api.example/v1/completions"
+
+    restored = deserialize_response(serialize_response(response))
+    assert restored == "generated text"
+    assert restored.prompt == response.prompt
+    assert restored.prompt_token_ids == response.prompt_token_ids
+    assert restored.output_token_ids == response.output_token_ids
+    assert restored.reasoning == response.reasoning
+    assert restored.truncated is True
+    assert restored.request_type == "generate_until"
+    assert restored.request_url == "https://api.example/v1/completions"
+
+
 def test_serialize_deserialize_rwkv_loglikelihood_roundtrip():
     from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
 
