@@ -53,6 +53,25 @@ def test_no_think_mode_still_honors_native_task_stop_sequences():
     assert model.PROMPT_STOPS[model.rwkv_prompt_template] in payload["stop"]
 
 
+def test_generation_response_records_actual_request_evidence():
+    from lm_eval.models.openai_completions import _RWKVCompletion
+
+    model = _build(
+        base_url="https://api.example/v1/completions",
+        rwkv_generation_prompt="no_think",
+    )
+    response = model._annotate_generation(
+        _RWKVCompletion("answer", "stop"),
+        {"max_gen_toks": 64},
+        ("User: question\nAssistant:", [1, 2, 3]),
+    )
+
+    assert response.request_type == "generate_until"
+    assert response.request_url == "https://api.example/v1/completions"
+    assert response.prompt == "User: question\nAssistant:"
+    assert response.prompt_token_ids == [1, 2, 3]
+
+
 def test_remote_independent_seeds_share_one_concurrent_dispatch(monkeypatch):
     model = _build(num_concurrent=4, seed=100)
     captured = []
@@ -71,6 +90,11 @@ def test_remote_independent_seeds_share_one_concurrent_dispatch(monkeypatch):
 
 
 def test_remote_context_budget_preserves_all_prompt_tokens(monkeypatch):
+    # `PRESERVE_INPUT_CONTEXT` backends must send the configured generation
+    # budget unchanged -- it's a completion length, not a total-context
+    # budget, and the backend has its own, separately configured context.
+    # Shrinking it by `max_length - prompt_tokens` here would silently cap a
+    # CoT/FakeCoT reasoning trace well below what was actually requested.
     model = _build(num_concurrent=4, max_length=100)
     model.tokenized_requests = True
     monkeypatch.setattr(model, "tok_encode", lambda texts, **kw: [list(range(len(text))) for text in texts])
@@ -84,7 +108,7 @@ def test_remote_context_budget_preserves_all_prompt_tokens(monkeypatch):
     request = Instance(request_type="generate_until", doc={}, arguments=("q" * 80, {"until": [], "max_gen_toks": 8192}), idx=0)
     model.generate_until([request])
     assert len(captured[0][0][0]) == 80
-    assert captured[0][1][0][1]["max_gen_toks"] == 20
+    assert captured[0][1][0][1]["max_gen_toks"] == 8192
 
 
 def test_remote_checkpoint_identity_includes_prompt_mode():
@@ -882,3 +906,36 @@ def test_no_think_checkpoint_identity_and_transport_evidence(monkeypatch):
     assert restored.raw_response == output
     assert restored.request_type == "loglikelihood"
     assert restored.prompt_token_ids == [65, 66, 67]
+
+
+def test_task_modes_switch_prompt_sampling_protocol_and_invalidate_cue(monkeypatch):
+    from types import SimpleNamespace
+    from lm_eval.evaluator import _configure_rwkv_task, _rwkv_task_context
+
+    monkeypatch.setenv("RWKV_API_KEY", "unit-test")
+    model = _build()
+    monkeypatch.setattr("lm_eval.api.benchmark.read_benchmark_modes", lambda: {
+        "default": "no_think", "fake_fixture": "fake_think", "cot_fixture": "open_think",
+    })
+    assert model.RWKV_TASK_MODES
+    for output_type, metadata, mode in [
+        ("generate_until", {"rwkv_generation_prompt": "fake_think"}, "fake_think"),
+        ("multiple_choice", {}, "no_think"),
+        ("generate_until", {"rwkv_generation_prompt": "open_think"}, "open_think"),
+        ("generate_until", {}, "no_think"),
+        ("multiple_choice", {}, "no_think"),
+    ]:
+        name = {"fake_think": "fake_fixture", "open_think": "cot_fixture"}.get(mode, "fixture")
+        task = SimpleNamespace(OUTPUT_TYPE=output_type, config=SimpleNamespace(metadata=metadata, task=name, generation_kwargs={"until": ["\n"], "max_gen_toks": 64}))
+        model.__dict__["_generation_prompt_cue"] = "old-mode-cue"
+        _configure_rwkv_task(model, task)
+        assert "_generation_prompt_cue" not in model.__dict__
+        assert model.rwkv_generation_prompt == mode
+        assert model.SUPPORTS_LOGLIKELIHOOD == (mode == "no_think")
+        context = _rwkv_task_context(model, {"config": {"metadata": {"weight_revision": "exact-weight"}}})["config"]
+        assert context["metadata"]["weight_revision"] == "exact-weight"
+        assert context["model_args"]["rwkv_generation_prompt"] == mode
+        assert context["metadata"]["prompt_template"] == ("native" if output_type == "multiple_choice" else "assistant")
+        assert context["sampling_config"]["temperature"] == model.SAMPLING_PARAMETERS[mode]["temperature"]
+        assert context["evaluation_protocol"] == model.EVALUATION_PROTOCOL_VERSION
+        assert task._rwkv_execution_context["metadata"]["cot_mode"] == context["metadata"]["cot_mode"]

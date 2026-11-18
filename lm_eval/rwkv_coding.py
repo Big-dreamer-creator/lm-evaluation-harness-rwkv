@@ -118,6 +118,9 @@ class CodingConfig:
                 "coding owns its sample plan and checkpoint; use a separate config without run-only overrides"
             )
         model = EvaluatorConfig._normalize_versioned_config(raw)
+        # This local generative suite owns its mode, just like native RWKV tasks.
+        from lm_eval.api.benchmark import rwkv_task_mode
+        model["model_args"]["rwkv_generation_prompt"] = rwkv_task_mode(TASK, "generate_until")
         if (model.get("publication") or {}).get("enabled"):
             raise ValueError(
                 "Coding results are local artifacts; automatic publication is not supported"

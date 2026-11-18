@@ -107,6 +107,53 @@ def read_benchmark_fields(
     return fields
 
 
+DEFAULT_BENCHMARK_MODES = (
+    Path(__file__).resolve().parent.parent / "config" / "benchmark_modes.toml"
+)
+
+
+def read_benchmark_modes(path: str | Path | None = None) -> dict[str, str]:
+    """Prototype: read_benchmark_fields; one authoritative RWKV mode inventory."""
+    config_path = Path(path or DEFAULT_BENCHMARK_MODES).expanduser().resolve()
+    try:
+        with config_path.open("rb") as stream:
+            raw = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"invalid benchmark modes {config_path}: {error}") from error
+    modes = {"no_think", "fake_think", "open_think"}
+    if set(raw) != {"default", *modes} or raw.get("default") not in modes:
+        raise ValueError(f"{config_path}: invalid mode sections or default")
+    result = {"default": raw["default"]}
+    for mode in sorted(modes):
+        section = raw[mode]
+        if not isinstance(section, dict) or set(section) != {"benchmarks"}:
+            raise ValueError(f"{config_path}: invalid {mode} section")
+        selectors = section["benchmarks"]
+        if not isinstance(selectors, list):
+            raise ValueError(f"{config_path}: {mode}.benchmarks must be a list")
+        for selector in selectors:
+            if not isinstance(selector, str) or not selector.strip() or selector != selector.strip():
+                raise ValueError(f"{config_path}: selectors must be non-empty trimmed strings")
+            if selector in result:
+                raise ValueError(f"{config_path}: duplicate mode selector {selector!r}")
+            result[selector] = mode
+    return result
+
+
+def rwkv_task_mode(task_name: str, output_type: str, selectors=()) -> str:
+    """Prototype: RWKV7Remote.configure_task; request wiring stays authoritative."""
+    modes = read_benchmark_modes()
+    mode = next(
+        (modes[name] for name in (task_name, *reversed(selectors)) if name in modes),
+        modes["default"],
+    )
+    if output_type in {"multiple_choice", "loglikelihood", "loglikelihood_rolling"}:
+        if mode != "no_think":
+            raise ValueError(f"{task_name}: native likelihood requests require no_think")
+        return "no_think"
+    return mode
+
+
 # Rollout budget for the avg@k evaluation mode, mirroring lighteval-rwkv's
 # src/lighteval/models/rwkv/pipeline.py `_evaluation_plan`: pick the
 # power-of-two `k` (samples per doc) whose total rollout count
@@ -213,6 +260,128 @@ def benchmark_leaves(
     return candidates
 
 
+def plan_benchmark_samples(
+    tasks: dict[str, Any],
+    groups: dict[str, Any],
+    benchmark_map: dict[str, BenchmarkSpec],
+    limit: int,
+) -> tuple[dict[str, list[int]], tuple[str, ...]]:
+    """Give every requested benchmark selector at most ``limit`` documents.
+
+    Native lm-eval limits apply independently to every leaf task. That is the
+    wrong scope for a benchmark selector that expands to dozens of leaves.
+    This planner spends one document budget across the selector's leaves:
+
+    * at most ``limit`` leaves are selected, spread across the full selector
+      when it has more leaves than the budget;
+    * selected leaves receive deterministic, evenly spaced document indices,
+      allocated round-robin so the total never exceeds ``limit``;
+    * tasks outside the selected leaves are omitted from the returned task set
+      by the caller, while the benchmark remains one aggregate publication.
+
+    The selected indices are intentionally deterministic. A limited run is a
+    reproducible sample, not an avg@k measurement, and resuming it must select
+    exactly the same documents.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("benchmark-scoped limit must be a positive integer")
+    if not benchmark_map:
+        raise ValueError("benchmark-scoped limit requires a benchmark map")
+
+    allocations: dict[str, list[int]] = {}
+    claimed_by: dict[str, str] = {}
+
+    for benchmark_name, spec in benchmark_map.items():
+        if spec.leaf_task_names is not None:
+            leaves = list(spec.leaf_task_names)
+        else:
+            group_obj = groups.get(benchmark_name)
+            leaves = (
+                [task.task_name for task in group_obj.get_all_tasks(recursive=True)]
+                if group_obj is not None
+                else []
+            )
+
+        leaves = [
+            leaf
+            for leaf in dict.fromkeys(leaves)
+            if leaf in tasks and len(tasks[leaf].eval_docs) > 0
+        ]
+        if not leaves:
+            continue
+
+        for leaf in leaves:
+            owner = claimed_by.setdefault(leaf, benchmark_name)
+            if owner != benchmark_name:
+                raise ValueError(
+                    f"benchmark-scoped limit cannot share leaf {leaf!r} "
+                    f"between {owner!r} and {benchmark_name!r}"
+                )
+
+        total_docs = sum(len(tasks[leaf].eval_docs) for leaf in leaves)
+        if total_docs <= limit:
+            counts = {leaf: len(tasks[leaf].eval_docs) for leaf in leaves}
+        elif len(leaves) > limit:
+            # Centre the selected leaves across the full selector rather than
+            # silently dropping its tail.
+            selected_leaves = [
+                leaves[((2 * index + 1) * len(leaves)) // (2 * limit)]
+                for index in range(limit)
+            ]
+            counts = {leaf: 1 for leaf in selected_leaves}
+        else:
+            # Allocate the shared budget evenly while respecting each leaf's
+            # capacity. Short leaves release their unused share back to the
+            # remaining leaves, so the selector still spends its full budget.
+            counts = {leaf: 0 for leaf in leaves}
+            remaining = limit
+            active = list(leaves)
+            while remaining and active:
+                share, extra = divmod(remaining, len(active))
+                if share == 0:
+                    for leaf in active[:remaining]:
+                        counts[leaf] += 1
+                    break
+                progressed = 0
+                for index, leaf in enumerate(active):
+                    want = share + (index < extra)
+                    capacity = len(tasks[leaf].eval_docs) - counts[leaf]
+                    added = min(want, capacity)
+                    counts[leaf] += added
+                    remaining -= added
+                    progressed += added
+                active = [
+                    leaf
+                    for leaf in active
+                    if counts[leaf] < len(tasks[leaf].eval_docs)
+                ]
+                if not progressed:
+                    break
+
+        for leaf, count in counts.items():
+            num_docs = len(tasks[leaf].eval_docs)
+            allocations[leaf] = (
+                list(range(num_docs))
+                if count == num_docs
+                else [
+                    ((2 * index + 1) * num_docs) // (2 * count)
+                    for index in range(count)
+                ]
+            )
+
+    unclaimed = [name for name in tasks if name not in claimed_by]
+    if unclaimed:
+        raise ValueError(
+            "benchmark-scoped limit found tasks without a benchmark selector: "
+            + ", ".join(unclaimed)
+        )
+
+    selected = tuple(
+        name for name in tasks if name in allocations
+    )
+    return allocations, selected
+
+
 def _without_re_scored_parents(
     leaves: tuple[str, ...], doc_counts: dict[str, int]
 ) -> tuple[str, ...]:
@@ -255,6 +424,7 @@ def plan_avg_at_k(
     benchmark_map: Optional[dict[str, BenchmarkSpec]] = None,
     *,
     limited: bool = False,
+    sampled_benchmarks: Optional[set[str]] = None,
 ) -> dict[str, AvgAtKPlan]:
     """Size ``avg@k`` once per benchmark, keyed by each of its leaf tasks.
 
@@ -278,12 +448,16 @@ def plan_avg_at_k(
         for name in leaves:
             claimants[name].append(bname)
 
+    sampled_benchmarks = sampled_benchmarks or set()
     plans: dict[str, AvgAtKPlan] = {}
     for name, bnames in claimants.items():
         if not bnames:
             continue
         benchmark = max(bnames, key=lambda candidate: (totals[candidate], candidate))
-        k, metric_name = avg_at_k_plan(totals[benchmark], limited=limited)
+        k, metric_name = avg_at_k_plan(
+            totals[benchmark],
+            limited=limited or benchmark in sampled_benchmarks,
+        )
         plans[name] = AvgAtKPlan(
             benchmark=benchmark,
             leaves=candidates[benchmark],

@@ -111,6 +111,7 @@ VERSIONED_CONFIG_FIELDS = {
     "include_defaults",
     "include_path",
     "limit",
+    "limit_scope",
     "log_samples",
     "max_length",
     "max_num_seqs",
@@ -127,6 +128,7 @@ VERSIONED_CONFIG_FIELDS = {
     "samples",
     "schema_version",
     "seed",
+    "skip_benchmarks",
     "task_overrides",
     "timeout",
     "tokenizer_name",
@@ -228,9 +230,22 @@ class EvaluatorConfig:
     limit: float | None = field(
         default=None, metadata={"help": "Limit number of examples per task"}
     )
+    limit_scope: str = field(
+        default="task",
+        metadata={
+            "help": (
+                "Apply limit per leaf task ('task', native) or once per "
+                "configured benchmark selector ('benchmark')."
+            )
+        },
+    )
     samples: str | dict | None = field(
         default=None,
         metadata={"help": "dict, JSON string or path to JSON file with doc indices"},
+    )
+    skip_benchmarks: list[str] = field(
+        default_factory=list,
+        metadata={"help": "Benchmark selectors skipped before task loading"},
     )
 
     # Caching
@@ -382,7 +397,9 @@ class EvaluatorConfig:
         # Override with CLI args (only truthy values or 0, exclude non-config args)
         # `only_model` only selects which model of a campaign file to load; it is
         # not an evaluation setting and must never reach the config dataclass.
-        excluded_args = {"command", "func", "only_model"}  # argparse internal args
+        # Campaign fan-out controls are consumed by the parent process; children
+        # inherit the same argv but must not forward them to the config dataclass.
+        excluded_args = {"command", "func", "only_model", "jobs"}
         cli_args = {
             k: v
             for k, v in vars(namespace).items()
@@ -649,6 +666,17 @@ class EvaluatorConfig:
             )
         base_url = cls._completion_url(config["base_url"], "/v1/completions")
         benchmarks = cls._string_list(config["benchmarks"], "benchmarks")
+        skip_benchmarks = (
+            cls._string_list(config["skip_benchmarks"], "skip_benchmarks")
+            if "skip_benchmarks" in config
+            else []
+        )
+        unknown_skips = sorted(set(skip_benchmarks) - set(benchmarks))
+        if unknown_skips:
+            raise ValueError(
+                "skip_benchmarks must be a subset of benchmarks; unknown: "
+                + ", ".join(unknown_skips)
+            )
         benchmark_config = cls._non_empty_string(
             config.get("benchmark_config", str(DEFAULT_BENCHMARK_CONFIG)),
             "benchmark_config",
@@ -679,7 +707,7 @@ class EvaluatorConfig:
             raise ValueError(
                 "Unknown RWKV profile fields: " + ", ".join(unknown_profile)
             )
-        missing_profile = sorted(RWKV_PROFILE_FIELDS - set(profile))
+        missing_profile = sorted((RWKV_PROFILE_FIELDS - {"generation_prompt"}) - set(profile))
         if missing_profile:
             raise ValueError(
                 "Missing RWKV profile fields: " + ", ".join(missing_profile)
@@ -693,14 +721,9 @@ class EvaluatorConfig:
                 "rwkv_profile.prompt_template must be one of: "
                 + ", ".join(sorted(RWKV_PROMPT_TEMPLATES))
             )
-        generation_prompt = cls._non_empty_string(
-            profile["generation_prompt"], "rwkv_profile.generation_prompt"
-        )
-        if generation_prompt not in RWKV_GENERATION_PROMPTS:
-            raise ValueError(
-                "rwkv_profile.generation_prompt must be one of: "
-                + ", ".join(sorted(RWKV_GENERATION_PROMPTS))
-            )
+        # Legacy presets remain loadable, but task configuration is authoritative.
+        if "generation_prompt" in profile:
+            eval_logger.warning("rwkv_profile.generation_prompt is ignored; RWKV tasks select their own mode")
         wkv_mode = cls._non_empty_string(profile["wkv_mode"], "rwkv_profile.wkv_mode")
         if wkv_mode not in RWKV_WKV_MODES:
             raise ValueError(
@@ -767,7 +790,6 @@ class EvaluatorConfig:
             "num_concurrent": num_concurrent,
             "max_length": max_length,
             "rwkv_prompt_template": prompt_template,
-            "rwkv_generation_prompt": generation_prompt,
         }
         if tokenizer_name is not None:
             model_args["tokenizer"] = tokenizer_name
@@ -807,6 +829,7 @@ class EvaluatorConfig:
         normalized: dict[str, Any] = {
             "model": backend,
             "tasks": benchmarks,
+            "skip_benchmarks": skip_benchmarks,
             "benchmark_config": benchmark_config,
             "batch_size": batch_size,
             "device": device,
@@ -821,7 +844,6 @@ class EvaluatorConfig:
                 "model_name": model_name,
                 "weight_revision": weight_revision,
                 "wkv_mode": wkv_mode,
-                "cot_mode": generation_prompt,
                 "prompt_template": prompt_template,
             },
             "publication": publication,
@@ -840,6 +862,23 @@ class EvaluatorConfig:
             ):
                 raise ValueError("limit must be a positive number")
             normalized["limit"] = limit
+        limit_scope = cls._non_empty_string(
+            config.get("limit_scope", "task"), "limit_scope"
+        )
+        if limit_scope not in {"task", "benchmark"}:
+            raise ValueError("limit_scope must be one of: benchmark, task")
+        if limit_scope == "benchmark":
+            if "limit" not in normalized:
+                raise ValueError("limit_scope=benchmark requires limit")
+            if (
+                isinstance(normalized["limit"], float)
+                and not normalized["limit"].is_integer()
+            ):
+                raise ValueError(
+                    "limit_scope=benchmark requires an integer limit"
+                )
+            normalized["limit"] = int(normalized["limit"])
+        normalized["limit_scope"] = limit_scope
         if "samples" in config:
             samples = config["samples"]
             if not isinstance(samples, dict) or not samples:
@@ -989,6 +1028,14 @@ class EvaluatorConfig:
                 "--limit SHOULD ONLY BE USED FOR TESTING. "
                 "REAL METRICS SHOULD NOT BE COMPUTED USING LIMIT."
             )
+        if self.limit_scope not in {"task", "benchmark"}:
+            raise ValueError("limit_scope must be one of: benchmark, task")
+        if self.limit_scope == "benchmark":
+            if self.limit is None:
+                raise ValueError("limit_scope=benchmark requires limit")
+            if isinstance(self.limit, float) and not self.limit.is_integer():
+                raise ValueError("limit_scope=benchmark requires an integer limit")
+            self.limit = int(self.limit)
 
         # predict_only implies log_samples
         if self.predict_only:

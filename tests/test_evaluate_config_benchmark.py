@@ -5,6 +5,33 @@ from lm_eval.config.evaluate_config import EvaluatorConfig, _classify_benchmark
 from lm_eval.tasks import TaskManager
 
 
+def test_benchmark_mode_inventory_covers_production_selectors():
+    from lm_eval.api.benchmark import read_benchmark_modes, rwkv_task_mode
+
+    modes = read_benchmark_modes()
+    assert set(read_benchmark_fields()) - {"cruxeval"} <= modes.keys()
+    assert rwkv_task_mode("drop", "generate_until") == "no_think"
+    assert rwkv_task_mode("race", "multiple_choice") == "no_think"
+    assert rwkv_task_mode("cruxeval_input_cot", "generate_until", ["cruxeval"]) == "open_think"
+    assert rwkv_task_mode("local_suite", "generate_until", ["rwkv_coding_local"]) == "open_think"
+    with pytest.raises(ValueError, match="native likelihood"):
+        rwkv_task_mode("cruxeval_input_cot", "multiple_choice")
+
+
+@pytest.mark.parametrize("invalid", [
+    'default = "CoT"\n',
+    'default = "no_think"\n[no_think]\nbenchmarks = ["drop"]\n[fake_think]\nbenchmarks = ["drop"]\n[open_think]\nbenchmarks = []\n',
+    'default = "no_think"\n[no_think]\nbenchmarks = [" drop"]\n[fake_think]\nbenchmarks = []\n[open_think]\nbenchmarks = []\n',
+])
+def test_benchmark_mode_inventory_rejects_invalid_entries(tmp_path, invalid):
+    from lm_eval.api.benchmark import read_benchmark_modes
+
+    path = tmp_path / "modes.toml"
+    path.write_text(invalid)
+    with pytest.raises(ValueError):
+        read_benchmark_modes(path)
+
+
 @pytest.fixture(scope="module")
 def task_manager():
     return TaskManager()

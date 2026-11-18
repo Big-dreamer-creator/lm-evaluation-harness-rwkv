@@ -15,13 +15,48 @@ import json
 
 import pytest
 
+import lm_eval.evaluator as evaluator
 from lm_eval.api.benchmark import (
     BenchmarkSpec,
     avg_at_k_plan,
     benchmark_leaves,
     plan_avg_at_k,
+    plan_benchmark_samples,
 )
 from lm_eval.filters import build_filter_ensemble
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_rwkv_no_think_tasks_are_not_avg_eligible(monkeypatch, automatic):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr("lm_eval.api.benchmark.read_benchmark_modes", lambda: {
+        "default": "no_think", "thinking": "open_think", "fake": "fake_think",
+    })
+
+    class _Task:
+        def __init__(self, output_type):
+            self.OUTPUT_TYPE = output_type
+            self.config = SimpleNamespace(metadata={})
+
+    class _LM:
+        SUPPORTS_LOGLIKELIHOOD = True
+        RWKV_TASK_MODES = automatic
+        rwkv_generation_prompt = "no_think"
+
+    tasks = {
+        "native_choice": _Task("multiple_choice"),
+        "direct_answer": _Task("generate_until"),
+        "rolling": _Task("loglikelihood_rolling"),
+        "thinking": _Task("generate_until"),
+        "fake": _Task("generate_until"),
+    }
+
+    eligible = evaluator._avg_at_k_candidate_tasks(tasks, _LM())
+
+    assert "native_choice" not in eligible
+    assert "rolling" not in eligible
+    assert set(eligible) == ({"thinking", "fake"} if automatic else set())
 
 
 @pytest.mark.parametrize(
@@ -77,12 +112,19 @@ class _SizedGroup:
         return list(self._leaves)
 
 
-def _plan(tasks, groups=None, benchmark_map=None, limited=False):
+def _plan(
+    tasks,
+    groups=None,
+    benchmark_map=None,
+    limited=False,
+    sampled_benchmarks=None,
+):
     return plan_avg_at_k(
         {task.task_name: task for task in tasks},
         groups or {},
         benchmark_map,
         limited=limited,
+        sampled_benchmarks=sampled_benchmarks,
     )
 
 
@@ -139,6 +181,33 @@ def test_limited_run_pins_k_to_1():
 
     assert {plan.k for plan in plans.values()} == {1}
     assert {plan.metric_name for plan in plans.values()} == {"avg@1"}
+
+
+def test_benchmark_sampling_pins_only_sampled_benchmarks_to_k_1():
+    small = [_SizedTask("small_a", 250), _SizedTask("small_b", 250)]
+    large = [_SizedTask("large_a", 250), _SizedTask("large_b", 250)]
+    groups = {
+        "small": _SizedGroup("small", small),
+        "large": _SizedGroup("large", large),
+    }
+    benchmark_map = {
+        "small": BenchmarkSpec(
+            name="small", field="reasoning", strategy="group_aggregate"
+        ),
+        "large": BenchmarkSpec(
+            name="large", field="reasoning", strategy="group_aggregate"
+        ),
+    }
+
+    plans = _plan(
+        small + large,
+        groups,
+        benchmark_map,
+        sampled_benchmarks={"large"},
+    )
+
+    assert {plans[name].k for name in ("small_a", "small_b")} == {8}
+    assert {plans[name].k for name in ("large_a", "large_b")} == {1}
 
 
 def test_spec_leaf_names_are_used_without_a_group():
@@ -211,6 +280,120 @@ def test_benchmark_leaves_lists_groups_and_standalones():
         "bench": ("sub_a", "sub_b"),
         "solo": ("solo",),
     }
+
+
+def test_benchmark_sample_plan_spends_limit_once_per_selector():
+    leaves = [_SizedTask(f"subject_{index}", 100) for index in range(45)]
+    tasks = {task.task_name: task for task in leaves}
+    groups = {"kmmlu": _SizedGroup("kmmlu", leaves)}
+    benchmark_map = {
+        "kmmlu": BenchmarkSpec(
+            name="kmmlu",
+            field="knowledge",
+            strategy="group_aggregate",
+        )
+    }
+
+    samples, selected = plan_benchmark_samples(
+        tasks, groups, benchmark_map, limit=50
+    )
+
+    assert len(samples) == 45
+    assert selected == tuple(task.task_name for task in leaves)
+    assert sum(len(indices) for indices in samples.values()) == 50
+    assert all(len(indices) in {1, 2} for indices in samples.values())
+    assert all(indices == sorted(set(indices)) for indices in samples.values())
+
+
+def test_benchmark_sample_plan_spreads_budget_when_group_has_more_leaves():
+    leaves = [_SizedTask(f"subject_{index}", 100) for index in range(66)]
+    tasks = {task.task_name: task for task in leaves}
+    groups = {"tmmluplus": _SizedGroup("tmmluplus", leaves)}
+    benchmark_map = {
+        "tmmluplus": BenchmarkSpec(
+            name="tmmluplus",
+            field="knowledge",
+            strategy="group_aggregate",
+        )
+    }
+
+    samples, selected = plan_benchmark_samples(
+        tasks, groups, benchmark_map, limit=50
+    )
+
+    assert len(samples) == len(selected) == 50
+    assert sum(len(indices) for indices in samples.values()) == 50
+    assert all(indices == [50] for indices in samples.values())
+    assert selected[0] == "subject_0"
+    assert selected[-1] == "subject_65"
+
+
+def test_benchmark_sample_plan_keeps_group_below_limit_complete():
+    leaves = [_SizedTask(f"subject_{index}", 10) for index in range(54)]
+    tasks = {task.task_name: task for task in leaves}
+    groups = {"small_group": _SizedGroup("small_group", leaves)}
+    benchmark_map = {
+        "small_group": BenchmarkSpec(
+            name="small_group",
+            field="knowledge",
+            strategy="group_aggregate",
+        )
+    }
+
+    samples, selected = plan_benchmark_samples(
+        tasks, groups, benchmark_map, limit=5000
+    )
+
+    assert len(samples) == len(selected) == 54
+    assert sum(len(indices) for indices in samples.values()) == 540
+    assert all(indices == list(range(10)) for indices in samples.values())
+
+
+def test_benchmark_sample_plan_redistributes_short_leaf_capacity():
+    leaves = [
+        _SizedTask("short", 10),
+        _SizedTask("long_a", 100),
+        _SizedTask("long_b", 100),
+    ]
+    tasks = {task.task_name: task for task in leaves}
+    groups = {"mixed_group": _SizedGroup("mixed_group", leaves)}
+    benchmark_map = {
+        "mixed_group": BenchmarkSpec(
+            name="mixed_group",
+            field="knowledge",
+            strategy="group_aggregate",
+        )
+    }
+
+    samples, selected = plan_benchmark_samples(
+        tasks, groups, benchmark_map, limit=50
+    )
+
+    assert len(selected) == 3
+    assert sum(len(indices) for indices in samples.values()) == 50
+    assert len(samples["short"]) == 10
+    assert samples["short"] == list(range(10))
+    assert all(indices == sorted(set(indices)) for indices in samples.values())
+
+
+def test_benchmark_sample_plan_spreads_indices_across_leaf_documents():
+    leaves = [_SizedTask("subject", 100)]
+    tasks = {task.task_name: task for task in leaves}
+    groups = {"single_leaf": _SizedGroup("single_leaf", leaves)}
+    benchmark_map = {
+        "single_leaf": BenchmarkSpec(
+            name="single_leaf",
+            field="knowledge",
+            strategy="group_aggregate",
+        )
+    }
+
+    samples, selected = plan_benchmark_samples(
+        tasks, groups, benchmark_map, limit=5
+    )
+
+    assert selected == ("subject",)
+    assert samples["subject"] == [10, 30, 50, 70, 90]
 
 
 _TINY_MC_DATA = [
@@ -304,6 +487,40 @@ def test_a_run_samples_the_benchmark_budget_not_each_leaf(
     assert {config["repeats"] for config in results["configs"].values()} == {2}
     assert avg_at_k_plan(1, limited=False)[0] == 4  # the old per-leaf sizing
     assert results["n-samples"]["bench_leaf_a"] == {"original": 1, "effective": 1}
+
+
+def test_benchmark_scoped_limit_caps_the_whole_group(one_doc_group_task_manager):
+    """A limit of one spends one document across the group, not one per leaf."""
+    from lm_eval.api.benchmark import BenchmarkSpec
+    from lm_eval.models.dummy import DummyLM
+
+    import lm_eval.evaluator as evaluator
+
+    lm = DummyLM()
+    lm.SUPPORTS_AVG_AT_K = True
+    lm._avg_k_samples = {}
+    lm.tokenizer = None
+
+    results = evaluator.simple_evaluate(
+        model=lm,
+        tasks=["bench_tiny"],
+        task_manager=one_doc_group_task_manager,
+        benchmark_map={
+            "bench_tiny": BenchmarkSpec(
+                name="bench_tiny", field="reasoning", strategy="group_fallback"
+            )
+        },
+        limit=1,
+        limit_scope="benchmark",
+        bootstrap_iters=0,
+        log_samples=False,
+    )
+
+    assert len(results["n-samples"]) == 1
+    assert sum(
+        sample_count["effective"]
+        for sample_count in results["n-samples"].values()
+    ) == 1
 
 
 def _default_filters():

@@ -632,6 +632,23 @@ class TestEvaluatorConfigFromCLI:
         assert cfg.gen_kwargs["temperature"] == 0.7
         assert cfg.gen_kwargs["max_tokens"] == 100
 
+    def test_jobs_is_not_a_config_field(self, tmp_path):
+        """Campaign fan-out inherits --jobs; it must not reach EvaluatorConfig."""
+        from argparse import Namespace
+
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        ns = Namespace(
+            tasks=["hellaswag"],
+            output_path=str(tmp_path),
+            log_samples=True,
+            jobs=4,
+        )
+
+        cfg = EvaluatorConfig.from_cli(ns)
+
+        assert cfg.model == "hf"
+
     def test_none_args_use_defaults(self, tmp_path):
         """Test that None values fall back to defaults."""
         from argparse import Namespace
@@ -959,14 +976,13 @@ generation_prompt = "open_think"
             "model": "rwkv7-g1i-1.5b-20260805-ctx16384",
             "base_url": "https://api.rwkv.rs/v1/completions",
             "rwkv_prompt_template": "assistant",
-            "rwkv_generation_prompt": "open_think",
             "num_concurrent": 5,
             "max_length": 16384,
             "seed": 1234,
             "max_gen_toks": 8192,
         }
         assert cfg.metadata["wkv_mode"] == "fp32io16"
-        assert cfg.metadata["cot_mode"] == "open_think"
+        assert "cot_mode" not in cfg.metadata
 
     def test_toml_config_rwkv7_remote_backend(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
@@ -1004,10 +1020,9 @@ wkv_mode = "fp32io16"
             "seed": 1234,
             "max_gen_toks": 8192,
             "rwkv_prompt_template": "assistant",
-            "rwkv_generation_prompt": "fake_think",
         }
         assert cfg.metadata["wkv_mode"] == "fp32io16"
-        assert cfg.metadata["cot_mode"] == "fake_think"
+        assert "cot_mode" not in cfg.metadata
 
     def test_toml_config_task_overrides_max_gen_toks(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
@@ -1188,8 +1203,8 @@ wkv_mode = "fp32io16"
         cfg = EvaluatorConfig.from_config(config)
 
         assert cfg.model == "rwkv7-remote"
-        assert cfg.model_args["rwkv_generation_prompt"] == "no_think"
-        assert cfg.metadata["cot_mode"] == "no_think"
+        assert "rwkv_generation_prompt" not in cfg.model_args
+        assert "cot_mode" not in cfg.metadata
 
     def test_toml_config_rwkv7_remote_backend_with_tokenizer_name(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
@@ -1228,7 +1243,6 @@ wkv_mode = "fp32io16"
             "max_gen_toks": 8192,
             "tokenizer": "/opt/rwkv/tokenizers/rwkv7-g1i-1.5b",
             "rwkv_prompt_template": "assistant",
-            "rwkv_generation_prompt": "fake_think",
         }
 
     def test_toml_config_rwkv7_remote_tokenizer_name_with_trust_remote_code(
@@ -1272,7 +1286,6 @@ wkv_mode = "fp32io16"
             "tokenizer": "BBuf/rwkv-5-world-1b5",
             "trust_remote_code": True,
             "rwkv_prompt_template": "assistant",
-            "rwkv_generation_prompt": "fake_think",
         }
 
     def test_versioned_config_rejects_trust_remote_code_without_tokenizer_name(
@@ -1559,6 +1572,132 @@ rwkv_graphwalks = [0, 4, 9]
 
         assert loaded["samples"] == {"rwkv_graphwalks": [0, 4, 9]}
 
+    def test_versioned_config_accepts_benchmark_scoped_limit(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1l-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["kmmlu"]
+output_dir = "results/kmmlu"
+limit = 50
+limit_scope = "benchmark"
+max_length = 32768
+max_num_seqs = 5
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "no_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        loaded = EvaluatorConfig.load_config(config)
+
+        assert loaded["limit"] == 50
+        assert loaded["limit_scope"] == "benchmark"
+
+    def test_versioned_config_accepts_benchmark_skips(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1l-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["kmmlu", "race"]
+skip_benchmarks = ["kmmlu"]
+output_dir = "results/race"
+limit = 50
+limit_scope = "benchmark"
+max_length = 32768
+max_num_seqs = 5
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "no_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        loaded = EvaluatorConfig.load_config(config)
+
+        assert loaded["skip_benchmarks"] == ["kmmlu"]
+
+    def test_versioned_config_rejects_unknown_benchmark_skip(self, tmp_path):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            """
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1l-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["race"]
+skip_benchmarks = ["missing"]
+output_dir = "results/race"
+limit = 50
+limit_scope = "benchmark"
+max_length = 32768
+max_num_seqs = 5
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "no_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="unknown: missing"):
+            EvaluatorConfig.load_config(config)
+
+    @pytest.mark.parametrize(
+        "extra, message",
+        [
+            ('limit_scope = "benchmark"', "requires limit"),
+            ('limit = 2.5\nlimit_scope = "benchmark"', "integer limit"),
+            ('limit = 50\nlimit_scope = "group"', "must be one of"),
+        ],
+    )
+    def test_versioned_config_rejects_invalid_benchmark_limit_scope(
+        self, tmp_path, extra, message
+    ):
+        from lm_eval.config.evaluate_config import EvaluatorConfig
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            f"""
+schema_version = 1
+backend = "rwkv7-remote"
+model_name = "rwkv7-g1l-1.5b"
+base_url = "https://api.rwkv.rs/v1/completions"
+benchmarks = ["kmmlu"]
+output_dir = "results/kmmlu"
+{extra}
+max_length = 32768
+max_num_seqs = 5
+
+[rwkv_profile]
+prompt_template = "assistant"
+generation_prompt = "no_think"
+wkv_mode = "fp32io16"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match=message):
+            EvaluatorConfig.load_config(config)
+
     def test_versioned_config_accepts_targeted_task_roots(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig
 
@@ -1660,9 +1799,9 @@ wkv_mode = "fp32io16"
 
         assert loaded.tasks == ["race", "drop", "xquad"]
         assert {name: spec.field for name, spec in benchmark_map.items()} == {
-            "race": "reasoning",
-            "drop": "reasoning",
-            "xquad": "reasoning",
+            "race": "reading_comprehension",
+            "drop": "reading_comprehension",
+            "xquad": "reading_comprehension",
         }
 
     @pytest.mark.parametrize(
@@ -1972,7 +2111,7 @@ class TestEvaluatorConfigCampaignModels:
             "/weights/7.2b",
         ]
         assert all(cfg["tasks"] == ["mutual"] for cfg in configs)
-        assert all(cfg["metadata"]["cot_mode"] == "open_think" for cfg in configs)
+        assert all("cot_mode" not in cfg["metadata"] for cfg in configs)
 
     def test_campaign_entries_carry_their_own_weight_revision(self, tmp_path):
         from lm_eval.config.evaluate_config import EvaluatorConfig

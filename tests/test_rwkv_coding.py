@@ -263,6 +263,9 @@ def wire_model(config, monkeypatch):
     from types import SimpleNamespace
 
     class Tokenizer:
+        def batch_decode(self, values, **kwargs):
+            return ["".join(chr(token) for token in value) for value in values]
+
         pad_token_id = 0
         eos_token_id = 0
         bos_token_id = 0
@@ -431,13 +434,13 @@ def test_coding_config_accepts_each_native_rwkv_profile(tmp_path, mode, template
     original = Path(__file__).parents[1] / "configs/eval/rwkv7_coding_local.toml"
     text = (
         original.read_text()
-        .replace('generation_prompt = "open_think"', f'generation_prompt = "{mode}"')
+        .replace('[rwkv_profile]', f'[rwkv_profile]\ngeneration_prompt = "{mode}"')
         .replace('prompt_template = "assistant"', f'prompt_template = "{template}"')
     )
     path = tmp_path / "coding.toml"
     path.write_text(text)
     cfg = CodingConfig.load(path)
-    assert cfg.thinking is (mode == "open_think")
+    assert cfg.thinking is True
     assert cfg.model["model_args"]["rwkv_prompt_template"] == template
 
 
@@ -450,7 +453,6 @@ def test_coding_config_accepts_each_native_rwkv_profile(tmp_path, mode, template
         ("workers = 2", "workers = 0"),
         ("memory_mb = 4096", "memory_mb = 0"),
         ('backend = "rwkv7-remote"', 'backend = "qwen-remote-chat"'),
-        ('generation_prompt = "open_think"', 'generation_prompt = "no_think"'),
         ("apply_chat_template = true", "apply_chat_template = false"),
         ("log_samples = true", "log_samples = false"),
         ('docker_image = "python:3.11-slim"', 'docker_image = "--privileged"'),

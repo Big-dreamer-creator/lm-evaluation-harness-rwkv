@@ -617,9 +617,15 @@ class Run(SubCommand):
                     EVALUATION_PROTOCOL_VERSION,
                     LOGLIKELIHOOD_PROTOCOL_VERSION,
                 )
+                generation_prompt = (
+                    cfg.model_args.get("cot_mode")
+                    or cfg.model_args.get("rwkv_generation_prompt")
+                )
                 fingerprint_payload["evaluation_protocol"] = (
-                    LOGLIKELIHOOD_PROTOCOL_VERSION
-                    if (cfg.model_args.get("cot_mode") or cfg.model_args.get("rwkv_generation_prompt")) == "no_think"
+                    "rwkv-task-modes-v1"
+                    if generation_prompt is None
+                    else LOGLIKELIHOOD_PROTOCOL_VERSION
+                    if generation_prompt == "no_think"
                     else EVALUATION_PROTOCOL_VERSION
                 )
             # HTTP request concurrency and the client-side timeout/retry policy
@@ -648,6 +654,10 @@ class Run(SubCommand):
                 # [publication] section to republish an already-completed
                 # run's results would be treated as a brand new run.
                 "publication",
+                # Skip decisions are operational and may be added while
+                # resuming an interrupted run. They must not invalidate the
+                # already-completed item checkpoints.
+                "skip_benchmarks",
             ):
                 fingerprint_payload.pop(key, None)
             config_fingerprint = compute_config_fingerprint(fingerprint_payload)
@@ -656,6 +666,14 @@ class Run(SubCommand):
                 db_path=db_path,
                 config_fingerprint=config_fingerprint,
                 fresh=bool(checkpoint_cfg.get("fresh", False)),
+            )
+
+        if cfg.skip_benchmarks:
+            skipped = set(cfg.skip_benchmarks)
+            cfg.tasks = [task for task in cfg.tasks if task not in skipped]
+            eval_logger.warning(
+                "Skipping benchmark selectors: %s",
+                ", ".join(cfg.skip_benchmarks),
             )
 
         # Create task manager (metadata already set up in config validation)
@@ -690,6 +708,7 @@ class Run(SubCommand):
                 "delete_requests_cache", False
             ),
             limit=cfg.limit,
+            limit_scope=cfg.limit_scope,
             samples=cfg.samples,
             check_integrity=cfg.check_integrity,
             write_out=cfg.write_out,
@@ -718,9 +737,11 @@ class Run(SubCommand):
 
         # Process results
         if results is not None:
+            samples = None
             if cfg.log_samples:
-                samples = results.pop("samples")
-                _add_truncation_stats(results, samples)
+                samples = results.pop("samples", None)
+                if samples:
+                    _add_truncation_stats(results, samples)
 
             dumped = json.dumps(
                 results, indent=2, default=handle_non_serializable, ensure_ascii=False
@@ -735,7 +756,7 @@ class Run(SubCommand):
                 try:
                     wandb_logger.post_init(results)
                     wandb_logger.log_eval_result()
-                    if cfg.log_samples:
+                    if cfg.log_samples and samples:
                         wandb_logger.log_eval_samples(samples)
                 except Exception as e:  # noqa: BLE001
                     eval_logger.info("Logging to W&B failed: %s", e)
@@ -745,7 +766,7 @@ class Run(SubCommand):
                 try:
                     trackio_logger.post_init(results)
                     trackio_logger.log_eval_result()
-                    if cfg.log_samples:
+                    if cfg.log_samples and samples:
                         trackio_logger.log_eval_samples(samples)
                 except Exception as e:  # noqa: BLE001
                     eval_logger.info("Logging to Trackio failed: %s", e)
@@ -755,7 +776,7 @@ class Run(SubCommand):
                 results=results, samples=samples if cfg.log_samples else None
             )
 
-            if cfg.log_samples:
+            if cfg.log_samples and samples:
                 for task_name in results["configs"]:
                     if task_name not in evaluation_tracker.saved_sample_tasks:
                         evaluation_tracker.save_results_samples(

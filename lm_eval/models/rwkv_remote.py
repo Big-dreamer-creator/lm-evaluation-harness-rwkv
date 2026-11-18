@@ -79,6 +79,15 @@ class RWKV7Remote(LocalCompletionsAPI):
     SUPPORTS_AVG_AT_K = True
     INDEPENDENT_ROLLOUTS = True
     PRESERVE_INPUT_CONTEXT = True
+    # The evaluator materializes one endpoint-concurrency-sized window of
+    # prompts at a time and releases it after scoring. Campaigns span many
+    # benchmarks, so retaining every leaf's prompt graph would grow with the
+    # whole run rather than with the in-flight request pool. The byte ceiling
+    # keeps a long-context leaf from filling that whole pool with 32k-token
+    # prompt strings and token IDs before the first request is dispatched;
+    # short-context leaves still reach their configured concurrency.
+    STREAM_EVALUATION_CHUNKS = True
+    STREAM_WINDOW_MAX_PROMPT_BYTES = 2 * 1024 * 1024
     EVALUATION_PROTOCOL_VERSION = "rwkv-generative-v2"
 
     DEFAULT_BASE_URL = "https://api.rwkv.rs/v1/completions"
@@ -134,7 +143,7 @@ class RWKV7Remote(LocalCompletionsAPI):
         tokenizer_backend=None,
         tokenized_requests=None,
         rwkv_prompt_template="assistant",
-        rwkv_generation_prompt="fake_think",
+        rwkv_generation_prompt=None,
         cot_mode=None,
         task_max_gen_toks: Optional[Dict[str, int]] = None,
         **kwargs,
@@ -143,6 +152,9 @@ class RWKV7Remote(LocalCompletionsAPI):
             tokenizer_backend = "huggingface"
         if tokenized_requests is None:
             tokenized_requests = tokenizer is not None
+        self.RWKV_TASK_MODES = rwkv_generation_prompt is None and cot_mode is None
+        if rwkv_generation_prompt is None:
+            rwkv_generation_prompt = "fake_think"
         if cot_mode is not None:
             rwkv_generation_prompt = cot_mode
         if rwkv_prompt_template not in self.PROMPT_TEMPLATES:
@@ -237,6 +249,33 @@ class RWKV7Remote(LocalCompletionsAPI):
         if sentinel not in probe:
             return None
         return probe.split(sentinel, 1)[1]
+
+    def configure_task(self, task) -> None:
+        """Prototype: RWKVLightevalTask.cot_mode and this adapter's __init__."""
+        if not self.RWKV_TASK_MODES:
+            return
+        from lm_eval.api.benchmark import rwkv_task_mode
+
+        mode = rwkv_task_mode(
+            task.config.task, task.OUTPUT_TYPE,
+            (task.config.metadata or {}).get("rwkv_mode_selectors", ()),
+        )
+        if mode not in self.GENERATION_PROMPTS:
+            raise ValueError(f"{task.config.task}: invalid task RWKV generation mode {mode!r}")
+        self._rwkv_native_likelihood_task = task.OUTPUT_TYPE != "generate_until"
+        self.rwkv_generation_prompt = mode
+        self.SUPPORTS_LOGLIKELIHOOD = mode == "no_think"
+        self.EVALUATION_PROTOCOL_VERSION = (
+            LOGLIKELIHOOD_PROTOCOL_VERSION if self._rwkv_native_likelihood_task
+            else "rwkv-generative-v2"
+        )
+        self._generation_profile = dict(self.SAMPLING_PARAMETERS[mode])
+        self.__dict__.pop("_generation_prompt_cue", None)
+        eval_logger.info(
+            "RWKV task mode: task=%s cot_mode=%s request_type=%s",
+            task.config.task, mode,
+            "LOGPROBS" if task.OUTPUT_TYPE != "generate_until" else "GENERATIVE",
+        )
 
     def _resolve_max_gen_toks(self, task_name: Optional[str]) -> int:
         """Per-task generation budget override, falling back to the model default.

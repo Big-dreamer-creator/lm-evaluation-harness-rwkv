@@ -65,10 +65,14 @@ class TaskFactory:
     def _build_task(self, entry: Entry, overrides: dict[str, Any] | None) -> Task:
         """Build and return a Task."""
         cfg = self._load_full_config(entry, overrides)
+        selectors = cfg.pop("_rwkv_mode_selectors", [])
+        if self._meta.get("rwkv_task_modes"):
+            cfg["metadata"]["rwkv_mode_selectors"] = selectors
 
         # Task-owned RWKV NoCoT variants retain native request construction.
         # Other models and thinking modes keep the task's default config.
-        if cfg.get("metadata", {}).get("rwkv_native_loglikelihood"):
+        if (cfg.get("metadata", {}).get("rwkv_native_loglikelihood")
+                or cfg.get("metadata", {}).get("rwkv_task_modes")):
             cfg.update(deepcopy(cfg["metadata"].get("rwkv_no_think", {})))
 
         # Remove structural keys that aren't part of task config
@@ -118,6 +122,10 @@ class TaskFactory:
         }
         # Merge: group-level defaults < caller overrides (caller takes precedence)
         merged_overrides = {**group_task_overrides, **(overrides or {})}
+        if self._meta.get("rwkv_task_modes"):
+            merged_overrides["_rwkv_mode_selectors"] = [
+                *(merged_overrides.get("_rwkv_mode_selectors") or []), group_name,
+            ]
 
         # Build children from task: list (references to existing tasks/groups/tags)
         task_field = raw_cfg.get("task")
@@ -208,6 +216,13 @@ class TaskFactory:
                     children.append(cast("Group", child_obj))
 
                 case Entry(kind=Kind.TAG):
+                    if self._meta.get("rwkv_task_modes"):
+                        item_overrides = {
+                            **item_overrides,
+                            "_rwkv_mode_selectors": [
+                                *(item_overrides.get("_rwkv_mode_selectors") or []), base_name,
+                            ],
+                        }
                     for task_name in sorted(child_entry.tags):
                         # TODO not adding namespaces currently
                         # namespaced = f"{group_name}::{task_name}"
@@ -254,7 +269,15 @@ class TaskFactory:
                     f"Tag '{entry.name}' references unknown task '{name}', skipping."
                 )
                 continue
-            tasks.append(self._build_task(registry[name], overrides))
+            task_overrides = overrides
+            if self._meta.get("rwkv_task_modes"):
+                task_overrides = {
+                    **(overrides or {}),
+                    "_rwkv_mode_selectors": [
+                        *((overrides or {}).get("_rwkv_mode_selectors") or []), entry.name,
+                    ],
+                }
+            tasks.append(self._build_task(registry[name], task_overrides))
         return tasks
 
     def _load_full_config(
