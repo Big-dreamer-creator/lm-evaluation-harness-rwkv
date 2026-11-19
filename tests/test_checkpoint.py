@@ -54,6 +54,17 @@ def test_fresh_db_starts_empty(tmp_path):
     store.close()
 
 
+def test_run_creation_time_is_stable_across_reopen(tmp_path):
+    store = _make_store(tmp_path)
+    created_at = store.created_at
+    store.close()
+
+    reopened = _make_store(tmp_path)
+
+    assert reopened.created_at == created_at
+    reopened.close()
+
+
 def test_without_operational_args_drops_only_scheduling_knobs():
     values = {
         "model": "rwkv7-g1k-1.5b",

@@ -1495,6 +1495,7 @@ def evaluate(
                 task_name,
                 acc["logged_samples"],
                 append=task_name in streamed_sample_paths,
+                defer_finalize=True,
             )
             if samples_path is None:
                 raise OSError(f"Could not persist sample window for {task_name}")

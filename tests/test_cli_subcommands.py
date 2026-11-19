@@ -1,5 +1,7 @@
 import argparse
 import sys
+from dataclasses import dataclass, field
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -224,6 +226,88 @@ class TestRunCommand:
         # Test auto with repetitions
         args = parser.parse_args(["run", "--batch_size", "auto:5"])
         assert args.batch_size == "auto:5"
+
+    def test_artifact_names_follow_the_checkpoint_run(self, tmp_path, monkeypatch):
+        """A resume must not invent a new samples filename from process time."""
+
+        @dataclass
+        class FakeConfig:
+            output_path: str | None = None
+            hf_hub_log_args: dict = field(default_factory=dict)
+            publication: dict = field(default_factory=dict)
+            checkpoint: dict = field(
+                default_factory=lambda: {
+                    "enabled": True,
+                    "dir": str(tmp_path / "checkpoints"),
+                }
+            )
+            resume: bool = False
+            use_cache: bool = False
+            model: str = "rwkv7-remote"
+            model_args: dict = field(default_factory=lambda: {"model": "fake"})
+            tasks: list = field(default_factory=lambda: ["fake_task"])
+            num_fewshot: int | None = None
+            batch_size: str | int | None = None
+            max_batch_size: int | None = None
+            device: str | None = None
+            cache_requests: dict = field(default_factory=dict)
+            limit: float | None = None
+            limit_scope: str = "full"
+            samples: dict | None = None
+            check_integrity: bool = False
+            write_out: bool = False
+            log_samples: bool = False
+            system_instruction: str | None = None
+            apply_chat_template: bool = False
+            fewshot_as_multiturn: bool = False
+            gen_kwargs: str | None = None
+            verbosity: str = "INFO"
+            predict_only: bool = False
+            seed: list = field(default_factory=lambda: [0, 1234, 1234, 1234])
+            confirm_run_unsafe_code: bool = False
+            metadata: dict = field(default_factory=dict)
+            skip_benchmarks: list = field(default_factory=list)
+            include_path: str | None = None
+            wandb_args: dict | None = None
+            trackio_args: dict | None = None
+
+            def process_tasks(self, metadata):
+                return object(), {}
+
+        cfg = FakeConfig()
+        captured = {}
+
+        class FakeTracker:
+            def __init__(self, **kwargs):
+                self.date_id = "unbound"
+                self.saved_sample_tasks = set()
+                self.push_results_to_hub = False
+                self.push_samples_to_hub = False
+
+        class FakeEvaluatorConfig:
+            @staticmethod
+            def from_cli(args):
+                return cfg
+
+        def fake_tracker(**kwargs):
+            captured["tracker"] = FakeTracker(**kwargs)
+            return captured["tracker"]
+
+        def fake_simple_evaluate(**kwargs):
+            captured["checkpoint_store"] = kwargs["checkpoint_store"]
+            return None
+
+        monkeypatch.setattr(
+            "lm_eval.config.evaluate_config.EvaluatorConfig", FakeEvaluatorConfig
+        )
+        monkeypatch.setattr("lm_eval.loggers.EvaluationTracker", fake_tracker)
+        monkeypatch.setattr("lm_eval.simple_evaluate", fake_simple_evaluate)
+
+        Run._execute_single(argparse.Namespace())
+
+        assert captured["tracker"].date_id == datetime.fromtimestamp(
+            captured["checkpoint_store"].created_at
+        ).isoformat().replace(":", "-")
 
     def test_run_command_seed_parsing(self):
         """Test Run command seed parsing."""

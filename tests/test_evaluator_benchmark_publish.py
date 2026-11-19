@@ -1,4 +1,5 @@
 import json
+import os
 import random
 from pathlib import Path
 
@@ -369,6 +370,7 @@ def test_streaming_windows_are_bounded_and_samples_are_persisted(
 
     assert results["n-samples"]["group_task_fs0"] == {"original": 4, "effective": 4}
     assert results["n-samples"]["group_task_fs1"] == {"original": 4, "effective": 4}
+    assert not list((tmp_path / "streamed").rglob("*.partial"))
 
 
 def test_streaming_windows_respect_the_prompt_byte_budget(
@@ -506,3 +508,143 @@ def test_streaming_reduces_long_prompt_peak_memory(
             tracemalloc.stop()
     print(f"Long-prompt Python peak bytes: {peaks}")
     assert peaks[True] < peaks[False] / 2
+
+
+def _sample_row(doc_id: int) -> dict:
+    return {
+        "doc_id": doc_id,
+        "doc": {"question": f"question {doc_id}"},
+        "target": 0,
+        "arguments": [("prompt", "continuation")],
+        "resps": [["response"]],
+        "filtered_resps": [["response"]],
+        "filter": "none",
+        "metrics": ["acc"],
+        "doc_hash": f"doc-{doc_id}",
+        "prompt_hash": f"prompt-{doc_id}",
+        "target_hash": "target",
+        "acc": 1.0,
+    }
+
+
+def _artifact_doc(task_name: str) -> dict:
+    return {
+        "config": {"model": "dummy", "model_args": {"model": "dummy"}},
+        "results": {task_name: {"acc,none": 1.0}},
+        "configs": {},
+        "versions": {},
+        "lm_eval_version": "test",
+    }
+
+
+def test_deferred_sample_windows_publish_one_file_at_task_end(tmp_path):
+    tracker = EvaluationTracker(output_path=str(tmp_path))
+    tracker.date_id = "run-1"
+
+    first_path = tracker.save_results_samples(
+        "leaf", [_sample_row(0)], defer_finalize=True
+    )
+    assert first_path is not None
+    first_path = Path(first_path)
+    assert first_path.name == "samples_leaf_run-1.jsonl"
+    assert not first_path.exists()
+    [partial] = list(
+        first_path.parent.glob(".samples_leaf_run-1.jsonl.*.partial")
+    )
+    assert [json.loads(line)["doc_id"] for line in partial.read_text().splitlines()] == [0]
+
+    second_path = tracker.save_results_samples(
+        "leaf", [_sample_row(1)], append=True, defer_finalize=True
+    )
+    assert second_path == str(first_path)
+    assert not first_path.exists()
+
+    artifacts = tracker.save_task_artifacts(
+        "leaf", _artifact_doc("leaf"), [], samples_path=str(first_path)
+    )
+
+    assert artifacts is not None
+    assert Path(artifacts["samples"]) == first_path
+    assert first_path.exists()
+    assert [
+        json.loads(line)["doc_id"] for line in first_path.read_text().splitlines()
+    ] == [0, 1]
+    assert not list(first_path.parent.glob("*.partial"))
+
+
+def test_appending_samples_without_a_deferred_file_is_rejected(tmp_path):
+    tracker = EvaluationTracker(output_path=str(tmp_path))
+
+    with pytest.raises(ValueError, match="without starting a deferred sample file"):
+        tracker.save_results_samples("leaf", [_sample_row(0)], append=True)
+
+
+def test_restarted_run_reuses_the_same_sample_name_without_duplicates(tmp_path):
+    tracker = EvaluationTracker(output_path=str(tmp_path))
+    tracker.date_id = "run-1"
+    samples_path = tracker.save_results_samples(
+        "leaf", [_sample_row(0)], defer_finalize=True
+    )
+    tracker.save_task_artifacts(
+        "leaf", _artifact_doc("leaf"), [], samples_path=samples_path
+    )
+    samples_path = Path(samples_path)
+
+    stale_partial = (
+        samples_path.parent / ".samples_leaf_run-1.jsonl.999999.partial"
+    )
+    stale_partial.write_text("stale\n", encoding="utf-8")
+
+    restarted = EvaluationTracker(output_path=str(tmp_path))
+    restarted.date_id = "run-1"
+    resumed_path = restarted.save_results_samples(
+        "leaf", [_sample_row(1)], defer_finalize=True
+    )
+    assert resumed_path == str(samples_path)
+    restarted.save_task_artifacts(
+        "leaf", _artifact_doc("leaf"), [], samples_path=resumed_path
+    )
+
+    assert list(samples_path.parent.glob("samples_leaf_*.jsonl")) == [samples_path]
+    assert [
+        json.loads(line)["doc_id"] for line in samples_path.read_text().splitlines()
+    ] == [1]
+    assert not list(samples_path.parent.glob("*.partial"))
+
+
+def test_benchmark_aggregate_reuses_combined_file_until_a_leaf_changes(tmp_path):
+    tracker = EvaluationTracker(output_path=str(tmp_path / "output"))
+    tracker.date_id = "run-1"
+    leaf_artifact_paths = {}
+    for leaf in ("leaf_a", "leaf_b"):
+        samples_path = tracker.save_results_samples(
+            leaf, [_sample_row(0)], defer_finalize=True
+        )
+        leaf_artifact_paths[leaf] = tracker.save_task_artifacts(
+            leaf, _artifact_doc(leaf), [], samples_path=samples_path
+        )
+    results_doc = {
+        **_artifact_doc("bench"),
+        "leaf_artifact_paths": leaf_artifact_paths,
+    }
+
+    first = tracker.save_benchmark_artifacts("bench", results_doc)
+    combined = Path(first["samples"])
+    assert len(combined.read_text().splitlines()) == 2
+
+    old_ns = 1_000_000_000 * 10**9
+    os.utime(combined, ns=(old_ns, old_ns))
+    second = tracker.save_benchmark_artifacts("bench", results_doc)
+    assert Path(second["samples"]) == combined
+    assert combined.stat().st_mtime_ns == old_ns
+
+    stale_partial = combined.parent / f".{combined.name}.999999.partial"
+    stale_partial.write_text("stale\n", encoding="utf-8")
+    leaf_samples = Path(leaf_artifact_paths["leaf_a"]["samples"])
+    with leaf_samples.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(_sample_row(1)) + "\n")
+    third = tracker.save_benchmark_artifacts("bench", results_doc)
+    assert Path(third["samples"]) == combined
+    assert combined.stat().st_mtime_ns != old_ns
+    assert len(combined.read_text().splitlines()) == 3
+    assert not list(combined.parent.glob("*.partial"))

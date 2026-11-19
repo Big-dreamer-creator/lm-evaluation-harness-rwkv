@@ -360,10 +360,14 @@ class CheckpointStore:
         self._init_run(config_fingerprint, fresh)
 
     def _init_run(self, config_fingerprint: str, fresh: bool) -> None:
+        now = time.time()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                row = self._conn.execute("SELECT run_id FROM runs LIMIT 1").fetchone()
+                row = self._conn.execute(
+                    "SELECT run_id, created_at FROM runs LIMIT 1"
+                ).fetchone()
+                created_at = float(row[1]) if row is not None else None
                 if row is not None:
                     existing_run_id = row[0]
                     if fresh:
@@ -376,6 +380,7 @@ class CheckpointStore:
                         self._conn.execute("DELETE FROM benchmarks")
                         self._conn.execute("DELETE FROM runs")
                         row = None
+                        created_at = None
                     elif existing_run_id != config_fingerprint:
                         self._conn.execute("ROLLBACK")
                         raise CheckpointConfigMismatchError(
@@ -385,7 +390,6 @@ class CheckpointStore:
                             "intentionally discard the existing state, or point "
                             "checkpoint.dir elsewhere."
                         )
-                now = time.time()
                 if row is None:
                     self._conn.execute(
                         "INSERT INTO runs "
@@ -399,6 +403,7 @@ class CheckpointStore:
                         (now, config_fingerprint),
                     )
                 self._conn.execute("COMMIT")
+                self.created_at = now if created_at is None else created_at
             except BaseException:
                 try:
                     self._conn.execute("ROLLBACK")

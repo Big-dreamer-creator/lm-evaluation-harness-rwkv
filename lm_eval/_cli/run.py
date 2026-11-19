@@ -7,6 +7,7 @@ import subprocess
 import sys
 import textwrap
 from collections.abc import Sequence
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 
@@ -667,6 +668,12 @@ class Run(SubCommand):
                 config_fingerprint=config_fingerprint,
                 fresh=bool(checkpoint_cfg.get("fresh", False)),
             )
+            # Keep artifact names stable across resumes. The run identity is
+            # already persisted in the checkpoint; using process start time
+            # here made every restart write a complete duplicate sample set.
+            evaluation_tracker.date_id = datetime.fromtimestamp(
+                checkpoint_store.created_at
+            ).isoformat().replace(":", "-")
 
         if cfg.skip_benchmarks:
             skipped = set(cfg.skip_benchmarks)

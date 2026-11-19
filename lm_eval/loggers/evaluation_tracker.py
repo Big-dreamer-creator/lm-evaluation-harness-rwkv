@@ -1,3 +1,4 @@
+import glob
 import json
 import logging
 import os
@@ -177,6 +178,8 @@ class EvaluationTracker:
         self.output_path = output_path
         self.date_id = datetime.now().isoformat().replace(":", "-")
         self.saved_sample_tasks: set[str] = set()
+        self._sample_partial_paths: dict[str, Path] = {}
+        self._sample_final_paths: dict[str, Path] = {}
         self.push_results_to_hub = push_results_to_hub
         self.push_samples_to_hub = push_samples_to_hub
         self.public_repo = public_repo
@@ -333,6 +336,9 @@ class EvaluationTracker:
             samples_path = self.save_results_samples(task_name, samples)
         if samples_path is None:
             return None
+        samples_path = self._finalize_results_samples(task_name, samples_path)
+        if samples_path is None:
+            return None
         return self._write_artifact_files(task_name, results, Path(samples_path))
 
     def save_benchmark_artifacts(
@@ -369,15 +375,81 @@ class EvaluationTracker:
         combined_samples_path = (
             root / f"samples_{benchmark_name}_{self.date_id}.jsonl"
         )
-        with combined_samples_path.open("w", encoding="utf-8") as combined:
+        manifest_path = root / f"samples_{benchmark_name}_{self.date_id}.manifest.json"
+        leaf_manifest = [
+            {
+                "path": str(path.resolve()),
+                "size": path.stat().st_size,
+                "mtime_ns": path.stat().st_mtime_ns,
+                "ctime_ns": path.stat().st_ctime_ns,
+                "inode": path.stat().st_ino,
+            }
+            for path in leaf_samples_paths
+        ]
+        manifest = {"version": 1, "leaves": leaf_manifest}
+        if combined_samples_path.is_file() and manifest_path.is_file():
+            try:
+                if json.loads(manifest_path.read_text("utf-8")) == manifest:
+                    return self._write_artifact_files(
+                        benchmark_name, results_doc, combined_samples_path
+                    )
+            except (OSError, TypeError, ValueError):
+                pass
+
+        self._remove_stale_partials(combined_samples_path)
+        combined_temporary = root / (
+            f".{combined_samples_path.name}.{os.getpid()}.partial"
+        )
+        with combined_temporary.open("w", encoding="utf-8") as combined:
             for leaf_samples_path in leaf_samples_paths:
                 with leaf_samples_path.open(encoding="utf-8") as leaf_file:
                     for line in leaf_file:
                         if line.strip():
                             combined.write(line)
+        combined_temporary.replace(combined_samples_path)
+        manifest_temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        manifest_temporary.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        manifest_temporary.replace(manifest_path)
         return self._write_artifact_files(
             benchmark_name, results_doc, combined_samples_path
         )
+
+    def _finalize_results_samples(
+        self,
+        task_name: str,
+        samples_path: str | Path | None = None,
+    ) -> Path | None:
+        """Atomically publish the samples file written for this task window."""
+        final_path = self._sample_final_paths.get(task_name)
+        partial_path = self._sample_partial_paths.get(task_name)
+        if partial_path is None:
+            return Path(samples_path) if samples_path is not None else final_path
+        if final_path is None:
+            if samples_path is None:
+                return None
+            final_path = Path(samples_path)
+        partial_path.replace(final_path)
+        self._sample_partial_paths.pop(task_name, None)
+        self._sample_final_paths.pop(task_name, None)
+        # A crash between windows leaves the previous process's partial file
+        # behind. The resumed run rewrites the same task from its checkpoint,
+        # so once this process publishes the final file those stale partials
+        # can never become part of the artifact.
+        self._remove_stale_partials(final_path)
+        return final_path
+
+    @staticmethod
+    def _remove_stale_partials(final_path: Path, keep: Path | None = None) -> None:
+        """Remove abandoned ``.<name>.<pid>.partial`` files for one artifact."""
+        for stale_partial in final_path.parent.glob(
+            f".{glob.escape(final_path.name)}.*.partial"
+        ):
+            if keep is not None and stale_partial.name == keep.name:
+                continue
+            stale_partial.unlink(missing_ok=True)
 
     def _write_artifact_files(
         self,
@@ -436,6 +508,7 @@ class EvaluationTracker:
         task_name: str,
         samples: list[dict[str, Any]],
         append: bool = False,
+        defer_finalize: bool = False,
     ) -> str | None:
         """Saves the samples results to the output path.
 
@@ -444,6 +517,9 @@ class EvaluationTracker:
         Args:
             task_name (str): The task name to save the samples for.
             samples (dict): The samples results to save.
+            append (bool): Append this window to the current task's samples file.
+            defer_finalize (bool): Keep the samples in a partial file until
+                ``save_task_artifacts`` atomically publishes the completed task.
         """
         file_results_samples = None
         if self.output_path:
@@ -457,8 +533,23 @@ class EvaluationTracker:
             path.mkdir(parents=True, exist_ok=True)
 
             file_results_samples = path / f"samples_{task_name}_{self.date_id}.jsonl"
+            partial_samples = self._sample_partial_paths.get(task_name)
+            if append and partial_samples is None:
+                raise ValueError(
+                    f"cannot append resumed samples for {task_name!r} without "
+                    "starting a deferred sample file"
+                )
+            if partial_samples is None:
+                partial_samples = path / (
+                    f".{file_results_samples.name}.{os.getpid()}.partial"
+                )
+                self._sample_partial_paths[task_name] = partial_samples
+                self._sample_final_paths[task_name] = file_results_samples
+                self._remove_stale_partials(
+                    file_results_samples, keep=partial_samples
+                )
             info_once(eval_logger, f"Saving per-task samples to {path}/*.jsonl")
-            with open(file_results_samples, "a" if append else "w", encoding="utf-8") as f:
+            with open(partial_samples, "a" if append else "w", encoding="utf-8") as f:
                 for sample in samples:
                     # we first need to sanitize arguments and resps
                     # otherwise we won't be able to load the dataset
@@ -487,6 +578,11 @@ class EvaluationTracker:
                     )
                     f.write(sample_dump)
             self.saved_sample_tasks.add(task_name)
+
+            if not defer_finalize:
+                file_results_samples = self._finalize_results_samples(
+                    task_name, file_results_samples
+                )
 
             if self.api and self.push_samples_to_hub:
                 try:
