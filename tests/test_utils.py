@@ -793,3 +793,64 @@ def test_ruler_dataset_entrypoints_forward_remote_tokenizer_metadata(
             "tokenizer_model": "rwkv7-g1i-1.5b-20260805-ctx16384",
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("module_name", "entrypoint", "dataset_reader"),
+    [
+        ("cwe_utils", "get_cw_dataset", None),
+        ("fwe_utils", "fwe_download", None),
+        ("vt_utils", "get_vt_dataset", None),
+        ("qa_utils", "get_squad", "read_squad"),
+    ],
+)
+def test_ruler_dataset_entrypoints_preserve_local_model_tokenizer(
+    monkeypatch, module_name, entrypoint, dataset_reader
+):
+    module = pytest.importorskip(f"lm_eval.tasks.ruler.{module_name}")
+    expected_tokenizer = object()
+    tokenizer_kwargs = []
+
+    def fake_get_tokenizer(**kwargs):
+        tokenizer_kwargs.append(kwargs)
+        return expected_tokenizer
+
+    def fake_get_dataset(tokenizer, **kwargs):
+        assert tokenizer is expected_tokenizer
+        return [{"input": "test", "outputs": ["answer"]}]
+
+    monkeypatch.setattr(module, "get_tokenizer", fake_get_tokenizer)
+    monkeypatch.setattr(module, "get_dataset", fake_get_dataset)
+    if dataset_reader:
+        monkeypatch.setattr(module, dataset_reader, lambda: ([], []))
+
+    result = getattr(module, entrypoint)(
+        max_seq_lengths=[4096],
+        model="Qwen/Qwen3.5-2B",
+        generation_parameters={"temperature": 0.0},
+    )
+
+    assert len(result["test"]) == 1
+    assert tokenizer_kwargs == [{"model": "Qwen/Qwen3.5-2B"}]
+
+
+def test_ruler_local_tokenizer_rejects_empty_vocab(monkeypatch):
+    from lm_eval.tasks.ruler import common_utils
+
+    class EmptyTokenizer:
+        vocab_size = 0
+
+        def __call__(self, text):
+            return type("Encoding", (), {"input_ids": []})()
+
+    common_utils.get_tokenizer.cache_clear()
+    monkeypatch.setattr(
+        common_utils.AutoTokenizer,
+        "from_pretrained",
+        lambda *args, **kwargs: EmptyTokenizer(),
+    )
+    try:
+        with pytest.raises(ValueError, match="0 tokens"):
+            common_utils.get_tokenizer(tokenizer="empty-vocab")
+    finally:
+        common_utils.get_tokenizer.cache_clear()

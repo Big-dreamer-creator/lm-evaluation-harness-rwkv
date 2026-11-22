@@ -23,7 +23,11 @@ import numpy as np
 from scipy.special import zeta
 from tqdm import tqdm
 
-from lm_eval.tasks.ruler.common_utils import DEFAULT_SEQ_LENGTHS, get_tokenizer
+from lm_eval.tasks.ruler.common_utils import (
+    DEFAULT_SEQ_LENGTHS,
+    get_tokenizer,
+    resolve_tokenizer_kwargs,
+)
 
 
 if TYPE_CHECKING:
@@ -160,7 +164,7 @@ def get_dataset(tokenizer, max_seq_length=None, **kwargs):
 
 def fwe_download(**kwargs):
     seq_lengths = kwargs.pop("max_seq_lengths", DEFAULT_SEQ_LENGTHS)
-    tokenizer = get_tokenizer(**kwargs)
+    tokenizer = get_tokenizer(**resolve_tokenizer_kwargs(kwargs))
     df = (
         get_dataset(tokenizer, max_seq_length=seq) for seq in seq_lengths
     )

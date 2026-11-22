@@ -23,7 +23,14 @@ DEFAULT_SEQ_LENGTHS = [
 # The keys a model name can arrive under. RULER tasks are handed the parsed
 # `--model_args`, and each backend names the model differently: `pretrained`
 # for local HuggingFace models, `model` for the API backends.
-TOKENIZER_ARG_KEYS = ("tokenizer", "pretrained", "model")
+TOKENIZER_ARG_KEYS = (
+    "tokenizer",
+    "pretrained",
+    "tokenizer_base_url",
+    "tokenizer_model",
+    "model",
+)
+TOKENIZER_NAME_KEYS = ("tokenizer", "pretrained", "model")
 
 
 def resolve_tokenizer_name(kwargs: dict) -> str | None:
@@ -36,11 +43,28 @@ def resolve_tokenizer_name(kwargs: dict) -> str | None:
     raises `TypeError: unhashable type: 'dict'` and the assertion below never
     gets the chance to say what is actually wrong.
     """
-    for key in TOKENIZER_ARG_KEYS:
+    for key in TOKENIZER_NAME_KEYS:
         value = kwargs.get(key)
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def resolve_tokenizer_kwargs(kwargs: dict) -> dict:
+    """Pull ``get_tokenizer``'s own arguments out of a synthetic task's kwargs.
+
+    Synthetic RULER tasks receive the parsed model metadata as arbitrary
+    keyword arguments. ``get_tokenizer`` is decorated with ``functools.cache``,
+    which hashes every argument before the body runs, so passing an unhashable
+    value such as ``generation_parameters={...}`` raises ``TypeError`` before
+    tokenizer resolution can run. Keep only the known string-valued tokenizer
+    keys at the cached boundary.
+    """
+    return {
+        key: kwargs[key]
+        for key in TOKENIZER_ARG_KEYS
+        if isinstance(kwargs.get(key), str) and kwargs[key]
+    }
 
 
 class RemoteRulerTokenizer:
@@ -79,7 +103,6 @@ def get_tokenizer(
     tokenizer_base_url=None,
     tokenizer_model=None,
     model=None,
-    **kwargs,
 ) -> Union[
     RemoteRulerTokenizer,
     "transformers.PreTrainedTokenizer",
@@ -92,7 +115,7 @@ def get_tokenizer(
             "Using remote tokenizer %s for synthetic tasks.", tokenizer_base_url
         )
         return RemoteRulerTokenizer(tokenizer_base_url, remote_model)
-    pretrained = tokenizer or pretrained
+    pretrained = tokenizer or pretrained or model
     assert pretrained, (
         "No tokenizer or pretrained provided. RULER tasks generate their own "
         "data and need a tokenizer to size it to each target length; pass one "
