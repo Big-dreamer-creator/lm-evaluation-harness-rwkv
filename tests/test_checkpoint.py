@@ -217,6 +217,50 @@ def test_serialize_deserialize_plain_string_roundtrip():
     assert deserialize_response(data) == "plain text"
 
 
+def test_completion_resume_retains_dispatched_prompt_evidence():
+    class Completion(str):
+        def __new__(cls, text, finish_reason=None, *, raw_response=None):
+            value = super().__new__(cls, text)
+            value.finish_reason = finish_reason
+            value.raw_response = raw_response
+            return value
+
+    response = Completion("answer", raw_response=None)
+    response.prompt = "Question: 2+2?\nAnswer: "
+    response.prompt_token_ids = [11, 22, 33]
+    response.output_token_ids = [44]
+    response.seed = 7
+    response.truncated = False
+
+    restored = deserialize_response(serialize_response(response))
+
+    assert restored == "answer"
+    assert restored.prompt == response.prompt
+    assert restored.prompt_token_ids == [11, 22, 33]
+    assert restored.output_token_ids == [44]
+    assert restored.seed == 7
+    assert restored.truncated is False
+
+
+def test_completion_resume_retains_thinking_contract():
+    class Completion(str):
+        def __new__(cls, text, finish_reason=None, *, raw_response=None):
+            value = super().__new__(cls, text)
+            value.finish_reason = finish_reason
+            value.raw_response = raw_response
+            return value
+
+    response = Completion(">The answer is B", "length")
+    response.requires_think_close = True
+    response.thinking_closed = False
+
+    restored = deserialize_response(serialize_response(response))
+
+    assert restored.requires_think_close is True
+    assert restored.thinking_closed is False
+    assert restored.truncated is True
+
+
 def test_responses_without_a_rollout_record_round_trip_as_plain_tuples():
     """Older responses (and every non-RWKV backend) keep serializing as bare
     2-tuples: the per-rollout record must not change their wire shape.

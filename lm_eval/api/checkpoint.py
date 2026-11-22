@@ -187,15 +187,35 @@ def serialize_response(response: Any) -> str:
     if isinstance(response, str):
         finish_reason = getattr(response, "finish_reason", None)
         raw_response = getattr(response, "raw_response", None)
-        if finish_reason is not None or raw_response is not None or hasattr(response, "requires_think_close"):
+        prompt = getattr(response, "prompt", None)
+        prompt_token_ids = getattr(response, "prompt_token_ids", None)
+        output_token_ids = getattr(response, "output_token_ids", None)
+        truncated = getattr(response, "truncated", None)
+        if truncated is None:
+            truncated = finish_reason in {"length", "max_tokens"}
+        if (
+            finish_reason is not None
+            or raw_response is not None
+            or prompt is not None
+            or prompt_token_ids is not None
+            or output_token_ids is not None
+            or hasattr(response, "requires_think_close")
+        ):
             return json.dumps(
                 {
                     "kind": "rwkv_completion",
                     "text": str(response),
                     "requires_think_close": bool(getattr(response, "requires_think_close", False)),
+                    "thinking_closed": bool(getattr(response, "thinking_closed", False)),
                     "seed": getattr(response, "seed", None),
                     "finish_reason": finish_reason,
                     "raw_response": raw_response,
+                    "prompt": prompt,
+                    "prompt_token_ids": prompt_token_ids,
+                    "output_token_ids": output_token_ids,
+                    "reasoning": getattr(response, "reasoning", None),
+                    "request_type": getattr(response, "request_type", None),
+                    "truncated": bool(truncated),
                 },
                 default=str,
                 ensure_ascii=False,
@@ -229,11 +249,33 @@ def deserialize_response(data: str) -> Any:
             prompt_token_ids=payload.get("prompt_token_ids"),
         )
     if kind == "rwkv_completion":
-        from lm_eval.models.openai_completions import _RWKVCompletion
+        try:
+            from lm_eval.models.openai_completions import _RWKVCompletion
+        except ImportError:
+            class _RWKVCompletion(str):
+                """Checkpoint-only stand-in until the RWKV model backend is present."""
+
+                def __new__(cls, text, finish_reason=None, *, raw_response=None):
+                    value = super().__new__(cls, text)
+                    value.finish_reason = finish_reason
+                    value.raw_response = raw_response
+                    return value
 
         value = _RWKVCompletion(payload["text"], payload.get("finish_reason"), raw_response=payload.get("raw_response"))
         value.requires_think_close = bool(payload.get("requires_think_close", False))
+        value.thinking_closed = bool(payload.get("thinking_closed", False))
         value.seed = payload.get("seed")
+        value.prompt = payload.get("prompt")
+        value.prompt_token_ids = payload.get("prompt_token_ids")
+        value.output_token_ids = payload.get("output_token_ids")
+        value.reasoning = payload.get("reasoning")
+        value.request_type = payload.get("request_type")
+        value.truncated = bool(
+            payload.get(
+                "truncated",
+                payload.get("finish_reason") in {"length", "max_tokens"},
+            )
+        )
         return value
     if kind == "str":
         return payload["text"]
