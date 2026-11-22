@@ -1135,9 +1135,17 @@ class TemplateAPI(TemplateLM):
                     if any(
                         len(x) + max_gen_toks > self.max_length for x in encodings_list
                     ):
-                        eval_logger.warning(
-                            f"Some contexts exceeded (max length: ({self.max_length}) - max_gen_toks: ({max_gen_toks}). They were left truncated."
-                        )
+                        if strict_context:
+                            eval_logger.warning(
+                                f"Some contexts exceeded the declared max length "
+                                f"({self.max_length}) - max_gen_toks ({max_gen_toks}), "
+                                "but were left untruncated; the inference backend "
+                                "context is authoritative."
+                            )
+                        else:
+                            eval_logger.warning(
+                                f"Some contexts exceeded (max length: ({self.max_length}) - max_gen_toks: ({max_gen_toks}). They were left truncated."
+                            )
 
                 req = encodings_list if self.tokenized_requests else contexts
                 try:
@@ -1218,9 +1226,17 @@ class TemplateAPI(TemplateLM):
                     if any(
                         len(x) + max_gen_toks > self.max_length for x in encodings_list
                     ):
-                        eval_logger.warning(
-                            f"Some contexts exceeded (max length: ({self.max_length}) - max_gen_toks ({max_gen_toks}). They were left truncated."
-                        )
+                        if strict_context:
+                            eval_logger.warning(
+                                f"Some contexts exceeded the declared max length "
+                                f"({self.max_length}) - max_gen_toks ({max_gen_toks}), "
+                                "but were left untruncated; the inference backend "
+                                "context is authoritative."
+                            )
+                        else:
+                            eval_logger.warning(
+                                f"Some contexts exceeded (max length: ({self.max_length}) - max_gen_toks ({max_gen_toks}). They were left truncated."
+                            )
 
                 req = encodings_list if self.tokenized_requests else contexts
                 results = itertools.chain.from_iterable(

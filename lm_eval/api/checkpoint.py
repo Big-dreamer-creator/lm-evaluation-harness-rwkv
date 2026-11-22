@@ -145,6 +145,9 @@ def model_fingerprint(lm: Any) -> str:
 
 
 def serialize_response(response: Any) -> str:
+    def has_evidence(fields: tuple[str, ...]) -> bool:
+        return any(getattr(response, field, None) is not None for field in fields)
+
     # Checked ahead of the generic `isinstance(response, tuple)` branch below:
     # `RWKVLoglikelihoodResponse` *is* a tuple (so every other consumer keeps
     # unpacking/zipping it like a bare 2-tuple), but a plain `list(response)`
@@ -152,10 +155,21 @@ def serialize_response(response: Any) -> str:
     # loss this type exists to prevent -- so it needs its own `kind` to round
     # -trip that evidence across a checkpoint resume.
     if isinstance(response, tuple) and (
-        getattr(response, "raw_response", None) is not None
-        or getattr(response, "finish_reason", None) is not None
-        or getattr(response, "unparsed", False)
-        or getattr(response, "rollouts", None) is not None
+        has_evidence(
+            (
+                "raw_response",
+                "finish_reason",
+                "prompt",
+                "prompt_token_ids",
+                "output_token_ids",
+                "text",
+                "parsed_answer",
+                "rollouts",
+                "request_type",
+            )
+        )
+        or bool(getattr(response, "unparsed", False))
+        or bool(getattr(response, "truncated", False))
     ):
         return json.dumps(
             {
@@ -187,7 +201,23 @@ def serialize_response(response: Any) -> str:
     if isinstance(response, str):
         finish_reason = getattr(response, "finish_reason", None)
         raw_response = getattr(response, "raw_response", None)
-        if finish_reason is not None or raw_response is not None or hasattr(response, "requires_think_close"):
+        if (
+            has_evidence(
+                (
+                    "requires_think_close",
+                    "seed",
+                    "finish_reason",
+                    "raw_response",
+                    "prompt",
+                    "prompt_token_ids",
+                    "output_token_ids",
+                    "reasoning",
+                    "request_type",
+                    "request_url",
+                )
+            )
+            or bool(getattr(response, "truncated", False))
+        ):
             return json.dumps(
                 {
                     "kind": "rwkv_completion",
@@ -399,7 +429,7 @@ class CheckpointStore:
                     )
                 else:
                     self._conn.execute(
-                        "UPDATE runs SET updated_at=? WHERE run_id=?",
+                        "UPDATE runs SET updated_at=?, status='running' WHERE run_id=?",
                         (now, config_fingerprint),
                     )
                 self._conn.execute("COMMIT")
@@ -430,6 +460,13 @@ class CheckpointStore:
             "artifact_metadata_path": row[2],
             "publish_status": row[3],
         }
+
+    def get_run_status(self) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM runs WHERE run_id=?", (self.run_id,)
+            ).fetchone()
+        return row[0] if row is not None else None
 
     def start_benchmark(self, task_name: str, task_fingerprint: str) -> None:
         now = time.time()
@@ -550,11 +587,80 @@ class CheckpointStore:
             )
             self._conn.execute("COMMIT")
 
+    def mark_benchmark_skipped(self, task_name: str) -> None:
+        """Persist an intentional benchmark-level skip across resumes.
+
+        Context-length failures are not retryable: re-dispatching the same
+        inputs after a restart cannot make them fit the configured input
+        budget. Keeping the benchmark as ``running`` made resumed campaigns
+        repeatedly materialize and reject the same prompts.
+        """
+        now = time.time()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                "INSERT INTO benchmarks "
+                "(run_id, task_name, task_fingerprint, status, started_at, "
+                "completed_at, publish_status) "
+                "VALUES (?, ?, NULL, 'skipped', ?, ?, 'none') "
+                "ON CONFLICT(run_id, task_name) DO UPDATE SET "
+                "status='skipped', completed_at=excluded.completed_at",
+                (self.run_id, task_name, now, now),
+            )
+            self._conn.execute("COMMIT")
+
     def set_publish_status(self, task_name: str, status: str) -> None:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             self._conn.execute(
                 "UPDATE benchmarks SET publish_status=? WHERE run_id=? AND task_name=?",
                 (status, self.run_id, task_name),
+            )
+            self._conn.execute("COMMIT")
+
+    def finalize_run_status(self) -> str:
+        """Persist a terminal status derived from the actual benchmark rows.
+
+        ``completed`` means every benchmark completed and published without
+        skips or publication failures. Intentional skips and publication
+        failures remain visible as ``completed_with_errors`` instead of being
+        hidden behind a generic successful-looking count.
+        """
+        with self._lock:
+            benchmark_statuses = {
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT DISTINCT status FROM benchmarks WHERE run_id=?",
+                    (self.run_id,),
+                ).fetchall()
+            }
+            publish_statuses = {
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT DISTINCT publish_status FROM benchmarks WHERE run_id=?",
+                    (self.run_id,),
+                ).fetchall()
+            }
+            if not benchmark_statuses or benchmark_statuses & {"pending", "running"}:
+                status = "failed"
+            elif "skipped" in benchmark_statuses or "failed" in publish_statuses:
+                status = "completed_with_errors"
+            else:
+                status = "completed"
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                (status, time.time(), self.run_id),
+            )
+            self._conn.execute("COMMIT")
+        return status
+
+    def mark_run_failed(self) -> None:
+        """Persist an interrupted or otherwise unsuccessful run."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                "UPDATE runs SET status='failed', updated_at=? WHERE run_id=?",
+                (time.time(), self.run_id),
             )
             self._conn.execute("COMMIT")

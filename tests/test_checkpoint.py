@@ -212,7 +212,46 @@ def test_mark_benchmark_completed_and_publish_status(tmp_path):
 
     store.set_publish_status("task", "succeeded")
     assert store.get_benchmark("task")["publish_status"] == "succeeded"
+
+
+def test_mark_benchmark_skipped_is_persistent(tmp_path):
+    store = _make_store(tmp_path)
+    db_path = str(tmp_path / "run.sqlite3")
+    fingerprint = compute_config_fingerprint({"config": ("model", "a")})
+
+    store.start_benchmark("task", "task-fp")
+    store.mark_benchmark_skipped("task")
+
+    benchmark = store.get_benchmark("task")
+    assert benchmark["status"] == "skipped"
+    assert benchmark["publish_status"] == "none"
     store.close()
+
+    reopened = CheckpointStore(db_path, fingerprint)
+    assert reopened.get_benchmark("task")["status"] == "skipped"
+    reopened.close()
+
+
+def test_run_status_reflects_skips_resume_and_failure(tmp_path):
+    store = _make_store(tmp_path)
+    db_path = str(tmp_path / "run.sqlite3")
+    fingerprint = compute_config_fingerprint({"config": ("model", "a")})
+    assert store.get_run_status() == "running"
+
+    store.start_benchmark("task", "task-fp")
+    store.mark_benchmark_completed("task", "results.json", "metadata.json")
+    store.set_publish_status("task", "succeeded")
+    store.mark_benchmark_skipped("skipped-task")
+
+    assert store.finalize_run_status() == "completed_with_errors"
+    assert store.get_run_status() == "completed_with_errors"
+    store.close()
+
+    reopened = CheckpointStore(db_path, fingerprint)
+    assert reopened.get_run_status() == "running"
+    reopened.mark_run_failed()
+    assert reopened.get_run_status() == "failed"
+    reopened.close()
 
 
 def test_mark_items_completed_async(tmp_path):
@@ -282,6 +321,27 @@ def test_serialize_deserialize_rwkv_completion_retains_dispatched_prompt_evidenc
     assert restored.request_url == "https://api.example/v1/completions"
 
 
+def test_serialize_deserialize_rwkv_completion_retains_prompt_only_evidence():
+    """Prompt evidence alone must select the rich completion branch.
+
+    A completion does not necessarily carry a finish reason or raw response
+    (for example, a response constructed by a test or a resumed rollout); the
+    serializer must still preserve the dispatched input instead of falling
+    back to a plain string.
+    """
+    from lm_eval.models.openai_completions import _RWKVCompletion
+
+    response = _RWKVCompletion("generated text")
+    response.prompt = "User: question\nAssistant: <think>"
+    response.prompt_token_ids = [1, 2, 3, 4]
+
+    restored = deserialize_response(serialize_response(response))
+
+    assert restored == "generated text"
+    assert restored.prompt == response.prompt
+    assert restored.prompt_token_ids == response.prompt_token_ids
+
+
 def test_serialize_deserialize_rwkv_loglikelihood_roundtrip():
     from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
 
@@ -307,6 +367,23 @@ def test_serialize_deserialize_rwkv_loglikelihood_roundtrip():
     assert restored.finish_reason == "stop"
     assert restored.output_token_ids == [1, 2, 3]
     assert restored.truncated is False
+
+
+def test_serialize_deserialize_rwkv_loglikelihood_retains_prompt_only_evidence():
+    from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
+
+    response = RWKVLoglikelihoodResponse(
+        0.0,
+        True,
+        prompt="ctx\n\nAnswer:",
+        prompt_token_ids=[1, 2, 3],
+    )
+
+    restored = deserialize_response(serialize_response(response))
+
+    assert restored == (0.0, True)
+    assert restored.prompt == response.prompt
+    assert restored.prompt_token_ids == response.prompt_token_ids
 
 
 def test_serialize_deserialize_keeps_the_per_rollout_record():

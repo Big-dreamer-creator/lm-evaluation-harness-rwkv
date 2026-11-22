@@ -157,6 +157,13 @@ def test_remote_writes_thinking_contract_to_checkpoint_before_return(monkeypatch
 
     monkeypatch.setenv("RWKV_API_KEY", "unit-test")
     model = _build(rwkv_generation_prompt="open_think", seed=100)
+    model.tokenized_requests = True
+    monkeypatch.setattr(
+        model,
+        "tok_encode",
+        lambda texts, **kwargs: [[21, 22, 23] for _ in texts],
+    )
+    monkeypatch.setattr(model, "decode_batch", lambda token_ids: ["question"])
     store = CheckpointStore(str(tmp_path / "run.sqlite3"), "test")
     key = ItemKey("slot", "request", "idempotency", "task", 0, 0, "generate_until", 2)
     store.register_pending_items([key])
@@ -169,6 +176,8 @@ def test_remote_writes_thinking_contract_to_checkpoint_before_return(monkeypatch
     restored = deserialize_response(store.get_items("task")["slot"]["result_json"])
     assert restored.seed == 102
     assert restored.requires_think_close is True
+    assert restored.prompt == "question"
+    assert restored.prompt_token_ids == [21, 22, 23]
     store.close()
 
 

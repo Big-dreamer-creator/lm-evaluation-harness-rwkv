@@ -105,9 +105,27 @@ def get_tokenizer(
         )
         return RemoteRulerTokenizer(tokenizer_base_url, remote_model)
     pretrained = tokenizer or pretrained or model
-    assert pretrained, "No tokenizer or pretrained provided."
+    assert pretrained, (
+        "No tokenizer or pretrained provided. RULER tasks generate their own "
+        "data and need a tokenizer to size it to each target length; pass one "
+        "with `--model_args tokenizer=<name>`."
+    )
     eval_logger.info(f"Using tokenizer {pretrained} for synthetic tasks.")
-    return AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
+
+    # Every synthetic task sizes its prompts by token count, so a tokenizer that
+    # under-reports lengths sends the samplers into unbounded loops. A repo that
+    # ships no tokenizer files (a GGUF-only repo, say) still loads under
+    # `trust_remote_code=True` as an empty-vocab tokenizer that encodes anything
+    # to 0 tokens -- reject it here rather than in each sampler.
+    if len(tok("The quick brown fox jumps over the lazy dog.").input_ids) == 0:
+        raise ValueError(
+            f"Tokenizer '{pretrained}' encodes a non-empty string to 0 tokens "
+            f"(vocab_size={getattr(tok, 'vocab_size', '?')}), so sequence lengths "
+            "cannot be measured. Point the synthetic tasks at a repo that ships "
+            'tokenizer files, e.g. --metadata=\'{"tokenizer": "Qwen/Qwen3-0.6B"}\'.'
+        )
+    return tok
 
 
 def postprocess_pred(prediction: list[str]) -> list[str]:

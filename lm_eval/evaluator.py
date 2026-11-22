@@ -1439,7 +1439,24 @@ def evaluate(
                     doc,
                     [req.filtered_resps[filter_key] for req in document_requests],
                 )
-                if (getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
+                generations = task._avg_k_current_responses
+                if (
+                    task.OUTPUT_TYPE == "generate_until"
+                    and getattr(lm, "EVALUATION_PROTOCOL_VERSION", None)
+                    and generations
+                    and all(
+                        hasattr(response, "truncated")
+                        or hasattr(response, "finish_reason")
+                        for response in generations
+                    )
+                ):
+                    _record_rollout_stats(
+                        task,
+                        doc_id,
+                        len(generations),
+                        sum(_is_truncated(response) for response in generations),
+                    )
+                elif (getattr(lm, "SUPPORTS_LOGLIKELIHOOD", False)
                         and task.OUTPUT_TYPE == "multiple_choice"):
                     _record_rollout_stats(task, doc_id, 1, 0)
                 if log_samples:
@@ -1539,6 +1556,8 @@ def evaluate(
             entry = {
                 "text": text,
                 "prompt": getattr(response, "prompt", None),
+                "prompt_token_ids": getattr(response, "prompt_token_ids", None),
+                "seed": getattr(response, "seed", None),
                 "tool_calls": message.get("tool_calls") or [],
                 "finish_reason": getattr(response, "finish_reason", None)
                 or choice.get("finish_reason"),
