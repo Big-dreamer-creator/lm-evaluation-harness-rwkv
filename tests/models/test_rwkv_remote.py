@@ -23,6 +23,21 @@ def test_remote_sends_sampling_fields_to_vllm_directly():
     assert payload["stop"] == [model.PROMPT_STOPS[model.rwkv_prompt_template]]
 
 
+@pytest.mark.parametrize("cot_mode", ["open_think", "fake_think"])
+def test_remote_thinking_modes_do_not_inherit_single_answer_newline_stop(cot_mode):
+    model = _build(rwkv_generation_prompt=cot_mode)
+
+    payload = model._create_payload(
+        "question",
+        generate=True,
+        gen_kwargs={"max_gen_toks": 24576, "until": ["\n", "Answer:"]},
+    )
+
+    assert payload["stop"] == [model.PROMPT_STOPS[model.rwkv_prompt_template]]
+    assert "\n" not in payload["stop"]
+    assert payload["max_tokens"] == 24576
+
+
 def test_remote_independent_seeds_share_one_concurrent_dispatch(monkeypatch):
     model = _build(num_concurrent=4, seed=100)
     captured = []
@@ -40,7 +55,7 @@ def test_remote_independent_seeds_share_one_concurrent_dispatch(monkeypatch):
     assert "seed" not in request.args[1]
 
 
-def test_remote_context_budget_preserves_all_prompt_tokens(monkeypatch):
+def test_remote_context_budget_preserves_prompt_and_generation_budget(monkeypatch):
     model = _build(num_concurrent=4, max_length=100)
     model.tokenized_requests = True
     monkeypatch.setattr(model, "tok_encode", lambda texts, **kw: [list(range(len(text))) for text in texts])
@@ -54,7 +69,7 @@ def test_remote_context_budget_preserves_all_prompt_tokens(monkeypatch):
     request = Instance(request_type="generate_until", doc={}, arguments=("q" * 80, {"until": [], "max_gen_toks": 8192}), idx=0)
     model.generate_until([request])
     assert len(captured[0][0][0]) == 80
-    assert captured[0][1][0][1]["max_gen_toks"] == 20
+    assert captured[0][1][0][1]["max_gen_toks"] == 8192
 
 
 def test_remote_checkpoint_identity_includes_prompt_mode():

@@ -45,7 +45,7 @@ BENCHMARK_FIELDS = frozenset(
     }
 )
 DEFAULT_BENCHMARK_CONFIG = (
-    Path(__file__).resolve().parents[2] / "configs" / "benchmarks.toml"
+    Path(__file__).resolve().parent.parent / "config" / "benchmarks.toml"
 )
 
 

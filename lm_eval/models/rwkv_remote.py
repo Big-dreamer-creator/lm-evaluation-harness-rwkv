@@ -730,8 +730,17 @@ class RWKV7Remote(LocalCompletionsAPI):
         gen_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> dict:
+        payload_gen_kwargs = gen_kwargs
+        if (
+            generate
+            and self.rwkv_generation_prompt != "no_think"
+            and gen_kwargs
+        ):
+            payload_gen_kwargs = {
+                key: value for key, value in gen_kwargs.items() if key != "until"
+            }
         payload = super()._create_payload(
-            messages, generate=generate, gen_kwargs=gen_kwargs, **kwargs
+            messages, generate=generate, gen_kwargs=payload_gen_kwargs, **kwargs
         )
         if not generate:
             return payload

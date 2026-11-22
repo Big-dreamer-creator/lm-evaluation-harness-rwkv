@@ -30,9 +30,10 @@ def test_rwkv_no_think_choice_tasks_use_native_requests_without_affecting_other_
     loaded = manager.load(names)
     assert sorted(loaded["tasks"]) == sorted(names)
     for name, task in loaded["tasks"].items():
-        assert task.OUTPUT_TYPE == ("multiple_choice" if native else "generate_until")
+        native_requests = native or name.startswith("discrim_eval")
+        assert task.OUTPUT_TYPE == ("multiple_choice" if native_requests else "generate_until")
         doc = task.eval_docs[0]
-        if native:
+        if native_requests:
             context = task.doc_to_text(doc)
             requests = task.construct_requests(doc, context, metadata=(name, 0, 1))
             assert len(requests) == len(task.doc_to_choice(doc))
@@ -49,7 +50,7 @@ def test_rwkv_no_think_choice_tasks_use_native_requests_without_affecting_other_
             elif name.startswith("infinitebench"):
                 assert metrics == {"score": 1.0}
             else:
-                assert metrics["black_bias"][-1] == 1
+                    assert metrics["black_bias"][-1] > 0
 
 
 # =============================================================================

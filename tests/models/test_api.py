@@ -520,6 +520,27 @@ def test_model_call_shrinks_max_tokens_on_context_overflow(endpoint_api):
     assert second_payload["max_tokens"] == endpoint_api.max_length - 2040
 
 
+def test_model_call_preserves_strict_context_generation_budget(endpoint_api):
+    endpoint_api.PRESERVE_INPUT_CONTEXT = True
+    overflow_response = MagicMock()
+    overflow_response.ok = False
+    overflow_response.status_code = 400
+    overflow_response.text = (
+        "prompt contains at least 2040 input tokens, please reduce."
+    )
+
+    with patch("requests.post", return_value=overflow_response) as mock_post:
+        with pytest.raises(ContextLengthExhausted):
+            endpoint_api.model_call(
+                ["hello"],
+                generate=True,
+                gen_kwargs={"max_tokens": 24576, "until": []},
+            )
+
+    assert mock_post.call_count == 1
+    assert mock_post.call_args.kwargs["json"]["max_tokens"] == 24576
+
+
 def test_model_call_raises_context_length_exhausted_when_unshrinkable(endpoint_api):
     overflow_response = MagicMock()
     overflow_response.ok = False
@@ -613,6 +634,37 @@ def test_amodel_call_shrinks_in_place_on_context_overflow(endpoint_api):
     assert len(post_calls) == 2
     assert post_calls[0][0] == post_calls[1][0] == endpoint_api.base_url
     assert post_calls[1][1]["max_tokens"] == endpoint_api.max_length - 2040
+
+
+def test_amodel_call_preserves_strict_context_generation_budget(endpoint_api):
+    endpoint_api.PRESERVE_INPUT_CONTEXT = True
+    overflow = _async_response(
+        ok=False, status=400, text="prompt contains at least 2040 input tokens."
+    )
+    post_calls = []
+
+    def fake_post(url, json, headers):
+        post_calls.append((url, dict(json)))
+        return DummyAsyncContextManager(overflow)
+
+    session = MagicMock()
+    session.post = fake_post
+    sem = asyncio.Semaphore(1)
+
+    async def run():
+        return await endpoint_api.amodel_call(
+            session,
+            sem,
+            ["hello"],
+            generate=True,
+            gen_kwargs={"max_tokens": 24576, "until": []},
+        )
+
+    with pytest.raises(ContextLengthExhausted):
+        asyncio.run(run())
+
+    assert len(post_calls) == 1
+    assert post_calls[0][1]["max_tokens"] == 24576
 
 
 def test_amodel_call_raises_api_request_error_on_other_failures(endpoint_api):

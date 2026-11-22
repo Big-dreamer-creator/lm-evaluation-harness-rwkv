@@ -1,6 +1,9 @@
+from pathlib import Path
+
 import pytest
 
-from lm_eval.api.benchmark import read_benchmark_fields
+import lm_eval
+from lm_eval.api.benchmark import DEFAULT_BENCHMARK_CONFIG, read_benchmark_fields
 from lm_eval.config.evaluate_config import EvaluatorConfig, _classify_benchmark
 from lm_eval.tasks import TaskManager
 
@@ -84,6 +87,13 @@ def test_benchmark_fields_are_read_from_explicit_top_level_mapping(tmp_path):
         "wmdp": "knowledge",
         "race": "reasoning",
     }
+
+
+def test_default_benchmark_config_ships_inside_the_package():
+    package_config = Path(lm_eval.__file__).resolve().parent / "config" / "benchmarks.toml"
+    assert DEFAULT_BENCHMARK_CONFIG == package_config
+    assert DEFAULT_BENCHMARK_CONFIG.is_file()
+    assert read_benchmark_fields(DEFAULT_BENCHMARK_CONFIG)["discrim_eval"] == "reasoning"
 
 
 def test_benchmark_field_config_rejects_duplicate_selector(tmp_path):

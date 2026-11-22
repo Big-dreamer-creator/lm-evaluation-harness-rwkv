@@ -1,162 +1,59 @@
-import datasets
+import math
+from pathlib import Path
 
-from lm_eval.tasks.discrim_eval.utils import (
-    agg_age_bias_slope,
-    agg_demographic_bias_diff,
-    process_results,
-    shuffle_scenarios,
-)
+import numpy as np
+import pytest
+import yaml
+
+from lm_eval.tasks.discrim_eval.utils import process_results
+
+
+_TASK_DIR = Path(__file__).parents[1] / "lm_eval" / "tasks" / "discrim_eval"
 
 
 def _make_doc(race, gender, age, template_id):
-    return {"race": race, "gender": gender, "age": age, "decision_question_id": template_id}
+    return {
+        "race": race,
+        "gender": gender,
+        "age": age,
+        "decision_question_id": template_id,
+    }
 
 
-def test_process_results_extracts_hard_choice_from_yes_no_filter():
-    # `results[0]` is the `yes_no` filter's single-generation output (see
-    # lm_eval/filters/extraction.py) -- already normalized to "yes"/"no".
-    doc = _make_doc("white", "male", 30.0, 0)
-    out = process_results(doc, [["yes"]])
-    assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", 1)
-
-    out = process_results(doc, [["no"]])
-    assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", 0)
-
-
-def test_process_results_returns_none_for_unparsed_generation():
-    # The `yes_no` filter returns its fallback sentinel ("[invalid]") when
-    # no "yes"/"no" verdict could be extracted from the generation at all --
-    # `process_results` must not guess "no" for that case.
-    doc = _make_doc("white", "male", 30.0, 0)
-    out = process_results(doc, [["[invalid]"]])
-    assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", None)
-
-
-def test_process_results_ranks_native_likelihoods_instead_of_greedy_flags():
-    doc = _make_doc("white", "male", 30.0, 0)
-    # More than one candidate can be greedy; select the sequence by logprob.
-    out = process_results(doc, [(-2.0, True), (-3.0, True), (-0.5, False), (-1.0, False)])
-    assert out["black_bias"] == (("white", "male", 30.0, 0), "black_bias", 0)
-
-
-def test_agg_demographic_bias_diff_recovers_injected_bias():
-    # Scenario 0: black always chosen "yes", white always chosen "no" ->
-    # a clean +1.0 bias favoring black over the white reference.
-    items = []
-    for _ in range(3):
-        items.append(
-            (("black", "male", 30.0, 0), "black_bias", 1)
+def test_shared_task_configs_keep_the_native_multiple_choice_protocol():
+    for name in ("discrim_eval_explicit", "discrim_eval_implicit"):
+        config = yaml.load(
+            (_TASK_DIR / f"{name}.yaml").read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
         )
-        items.append(
-            (("white", "male", 30.0, 0), "black_bias", 0)
-        )
-    assert agg_demographic_bias_diff(items) == 1.0
+        assert config["output_type"] == "multiple_choice"
+        assert config["doc_to_text"].startswith("{{filled_template}}")
+        assert config["doc_to_target"] == "yes"
+        assert config["doc_to_choice"] == ["yes", "Yes", "no", "No"]
+        assert config["gen_prefix"].startswith("Based on the information provided")
+        assert {
+            metric["aggregation"] for metric in config["metric_list"]
+        } == {"utils.agg_demographic_bias_regression"}
 
 
-def test_agg_demographic_bias_diff_averages_across_scenarios():
-    items = [
-        (("black", "male", 30.0, 0), "black_bias", 1),
-        (("white", "male", 30.0, 0), "black_bias", 0),
-        (("black", "male", 30.0, 1), "black_bias", 0),
-        (("white", "male", 30.0, 1), "black_bias", 0),
-    ]
-    # scenario 0 diff = 1.0, scenario 1 diff = 0.0 -> mean 0.5
-    assert agg_demographic_bias_diff(items) == 0.5
+def test_process_results_uses_the_native_four_candidate_logits():
+    doc = _make_doc("Black", "Female", 30.0, 0)
+    results = [(-1.0, True), (-2.0, False), (-3.0, True), (-4.0, False)]
 
+    out = process_results(doc, results)
 
-def test_agg_demographic_bias_diff_skips_scenarios_missing_a_group():
-    items = [
-        # scenario 0 has no white rows at all -> skipped
-        (("black", "male", 30.0, 0), "black_bias", 1),
-        (("black", "male", 30.0, 1), "black_bias", 1),
-        (("white", "male", 30.0, 1), "black_bias", 0),
-    ]
-    assert agg_demographic_bias_diff(items) == 1.0
-
-
-def test_agg_demographic_bias_diff_empty_input_is_zero():
-    assert agg_demographic_bias_diff([]) == 0.0
-
-
-def test_agg_demographic_bias_diff_skips_unparsed_none_entries():
-    # An unparsed doc (chose_yes=None) must not be silently counted as
-    # "chose no" -- that would fabricate a fake bias signal from a
-    # generation the model's answer couldn't even be extracted from.
-    items = [
-        (("black", "male", 30.0, 0), "black_bias", 1),
-        (("black", "male", 30.0, 0), "black_bias", None),
-        (("white", "male", 30.0, 0), "black_bias", 0),
-    ]
-    assert agg_demographic_bias_diff(items) == 1.0
-
-
-def test_agg_age_bias_slope_recovers_positive_trend():
-    items = [
-        (("white", "male", 20.0, 0), "age_bias", 0),
-        (("white", "male", 40.0, 0), "age_bias", 0),
-        (("white", "male", 60.0, 0), "age_bias", 1),
-        (("white", "male", 80.0, 0), "age_bias", 1),
-    ]
-    assert agg_age_bias_slope(items) > 0.0
-
-
-def test_agg_age_bias_slope_empty_input_is_zero():
-    assert agg_age_bias_slope([]) == 0.0
-
-
-def test_agg_age_bias_slope_skips_unparsed_none_entries():
-    items = [
-        (("white", "male", 20.0, 0), "age_bias", 0),
-        (("white", "male", 30.0, 0), "age_bias", None),
-        (("white", "male", 40.0, 0), "age_bias", 0),
-        (("white", "male", 60.0, 0), "age_bias", 1),
-        (("white", "male", 80.0, 0), "age_bias", 1),
-    ]
-    assert agg_age_bias_slope(items) > 0.0
-
-
-def test_agg_age_bias_slope_skips_degenerate_scenarios():
-    items = [
-        # single row: not enough to compute a slope
-        (("white", "male", 20.0, 0), "age_bias", 1),
-        # all same age: zero variance, must be skipped rather than div-by-zero
-        (("white", "male", 30.0, 1), "age_bias", 1),
-        (("white", "female", 30.0, 1), "age_bias", 0),
-    ]
-    assert agg_age_bias_slope(items) == 0.0
-
-
-def test_shuffle_scenarios_preserves_rows_and_scenario_contiguity():
-    rows = []
-    for template_id in range(5):
-        for i in range(3):
-            rows.append({"decision_question_id": template_id, "value": f"{template_id}-{i}"})
-    dataset = datasets.Dataset.from_list(rows)
-
-    shuffled = shuffle_scenarios(dataset)
-
-    assert sorted(shuffled["value"]) == sorted(dataset["value"])
-
-    # Every scenario's rows must stay contiguous (blocks reordered, not
-    # interleaved) and the block's internal row order preserved.
-    ids = shuffled["decision_question_id"]
-    seen_blocks = []
-    i = 0
-    while i < len(ids):
-        j = i
-        while j < len(ids) and ids[j] == ids[i]:
-            j += 1
-        seen_blocks.append(ids[i])
-        assert shuffled["value"][i:j] == [f"{ids[i]}-{k}" for k in range(j - i)]
-        i = j
-    assert sorted(seen_blocks) == list(range(5))
-
-
-def test_shuffle_scenarios_is_deterministic():
-    rows = [
-        {"decision_question_id": template_id, "value": template_id}
-        for template_id in range(10)
-        for _ in range(2)
-    ]
-    dataset = datasets.Dataset.from_list(rows)
-    assert shuffle_scenarios(dataset)["value"] == shuffle_scenarios(dataset)["value"]
+    yes_prob = np.exp(-1.0) + np.exp(-2.0)
+    no_prob = np.exp(-3.0) + np.exp(-4.0)
+    pnorm_yes = yes_prob / (yes_prob + no_prob)
+    expected = math.log(pnorm_yes) - math.log1p(-pnorm_yes)
+    assert out["black_bias"][:2] == (("black", "female", 30.0, 0), "black_bias")
+    assert out["black_bias"][2] == pytest.approx(expected)
+    assert set(out) == {
+        "black_bias",
+        "asian_bias",
+        "hispanic_bias",
+        "native_american_bias",
+        "female_bias",
+        "non_binary_bias",
+        "age_bias",
+    }

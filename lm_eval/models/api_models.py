@@ -75,8 +75,8 @@ class ApiRequestError(RuntimeError):
 
 
 class ContextLengthExhausted(ApiRequestError):
-    """Raised when a request's prompt tokens leave no positive token budget
-    for a completion, even after shrinking the requested max tokens to fit.
+    """Raised when a request's prompt leaves no positive completion budget,
+    or when a strict-input backend rejects an over-context prompt.
     """
 
 
@@ -627,10 +627,13 @@ class TemplateAPI(TemplateLM):
                     response.status_code, response.text
                 )
                 if prompt_tokens is not None:
-                    adjusted = shrink_max_tokens(payload, self.max_length - prompt_tokens)
-                    if adjusted is not None:
-                        payload = adjusted
-                        continue
+                    if not getattr(self, "PRESERVE_INPUT_CONTEXT", False):
+                        adjusted = shrink_max_tokens(
+                            payload, self.max_length - prompt_tokens
+                        )
+                        if adjusted is not None:
+                            payload = adjusted
+                            continue
                     raise ContextLengthExhausted(
                         f"Prompt requires at least {prompt_tokens} input tokens, "
                         f"leaving no positive completion budget within max_length={self.max_length}."
@@ -702,12 +705,13 @@ class TemplateAPI(TemplateLM):
                         response.status, error_text
                     )
                     if prompt_tokens is not None:
-                        adjusted = shrink_max_tokens(
-                            payload, self.max_length - prompt_tokens
-                        )
-                        if adjusted is not None:
-                            payload = adjusted
-                            continue
+                        if not getattr(self, "PRESERVE_INPUT_CONTEXT", False):
+                            adjusted = shrink_max_tokens(
+                                payload, self.max_length - prompt_tokens
+                            )
+                            if adjusted is not None:
+                                payload = adjusted
+                                continue
                         raise ContextLengthExhausted(
                             f"Prompt requires at least {prompt_tokens} input tokens, "
                             f"leaving no positive completion budget within max_length={self.max_length}."
@@ -1039,7 +1043,6 @@ class TemplateAPI(TemplateLM):
         prepared_seeds = []
         if independent:
             counts = {}
-            token_counts = {}
             prepared = []
             for request, key in zip(requests, item_keys, strict=True):
                 args = request.args
@@ -1051,14 +1054,10 @@ class TemplateAPI(TemplateLM):
                 counts[slot] = counts.get(slot, 0) + 1
                 gen["seed"] = int(gen.get("seed", self._seed)) + ordinal
                 prepared_seeds.append(gen["seed"])
-                if strict_context and self.tokenized_requests:
-                    if args[0] not in token_counts:
-                        token_counts[args[0]] = len(self.tok_encode([args[0]], add_special_tokens=self.add_bos_token)[0])
-                    room = self.max_length - token_counts[args[0]]
-                    if room <= 0:
-                        raise ContextLengthExhausted("Prompt exhausts the context window; input was preserved")
-                    cap_key = "max_tokens" if "max_tokens" in gen else "max_gen_toks"
-                    gen[cap_key] = min(int(gen.get(cap_key, self._max_gen_toks)), room)
+                # `strict_context` backends must send the configured completion
+                # budget unchanged. The inference backend owns the real context
+                # limit; an over-context prompt fails at dispatch instead of
+                # silently lowering this request's generation budget.
                 prepared.append(replace(request, arguments=(args[0], gen, *args[2:])))
             requests = prepared
 
@@ -1134,9 +1133,17 @@ class TemplateAPI(TemplateLM):
                     if any(
                         len(x) + max_gen_toks > self.max_length for x in encodings_list
                     ):
-                        eval_logger.warning(
-                            f"Some contexts exceeded (max length: ({self.max_length}) - max_gen_toks: ({max_gen_toks}). They were left truncated."
-                        )
+                        if strict_context:
+                            eval_logger.warning(
+                                f"Some contexts exceeded the declared max length "
+                                f"({self.max_length}) - max_gen_toks ({max_gen_toks}), "
+                                "but were left untruncated; the inference backend "
+                                "context is authoritative."
+                            )
+                        else:
+                            eval_logger.warning(
+                                f"Some contexts exceeded (max length: ({self.max_length}) - max_gen_toks: ({max_gen_toks}). They were left truncated."
+                            )
 
                 req = encodings_list if self.tokenized_requests else contexts
                 try:
@@ -1220,9 +1227,17 @@ class TemplateAPI(TemplateLM):
                     if any(
                         len(x) + max_gen_toks > self.max_length for x in encodings_list
                     ):
-                        eval_logger.warning(
-                            f"Some contexts exceeded (max length: ({self.max_length}) - max_gen_toks ({max_gen_toks}). They were left truncated."
-                        )
+                        if strict_context:
+                            eval_logger.warning(
+                                f"Some contexts exceeded the declared max length "
+                                f"({self.max_length}) - max_gen_toks ({max_gen_toks}), "
+                                "but were left untruncated; the inference backend "
+                                "context is authoritative."
+                            )
+                        else:
+                            eval_logger.warning(
+                                f"Some contexts exceeded (max length: ({self.max_length}) - max_gen_toks ({max_gen_toks}). They were left truncated."
+                            )
 
                 req = encodings_list if self.tokenized_requests else contexts
                 results = itertools.chain.from_iterable(
