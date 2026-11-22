@@ -243,6 +243,25 @@ def test_serialize_deserialize_rwkv_completion_roundtrip():
     assert restored.raw_response == {"choices": [{"text": "generated text"}]}
 
 
+def test_completion_resume_retains_dispatched_prompt_evidence():
+    from lm_eval.models.openai_completions import _RWKVCompletion
+
+    response = _RWKVCompletion("answer")
+    response.prompt = "User: actual input\nAssistant: <think"
+    response.prompt_token_ids = [1, 2, 3]
+    response.output_token_ids = [4]
+    response.seed = 7
+
+    restored = deserialize_response(serialize_response(response))
+
+    assert restored == "answer"
+    assert restored.prompt == response.prompt
+    assert restored.prompt_token_ids == [1, 2, 3]
+    assert restored.output_token_ids == [4]
+    assert restored.seed == 7
+    assert restored.truncated is False
+
+
 def test_serialize_deserialize_rwkv_loglikelihood_roundtrip():
     from lm_eval.models.rwkv_choice import RWKVLoglikelihoodResponse
 

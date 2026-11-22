@@ -130,6 +130,7 @@ def test_remote_writes_thinking_contract_to_checkpoint_before_return(monkeypatch
     restored = deserialize_response(store.get_items("task")["slot"]["result_json"])
     assert restored.seed == 102
     assert restored.requires_think_close is True
+    assert restored.prompt == "question"
     store.close()
 
 
