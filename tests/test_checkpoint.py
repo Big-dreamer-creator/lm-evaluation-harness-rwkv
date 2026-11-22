@@ -275,6 +275,16 @@ def test_serialize_deserialize_tuple_roundtrip():
     assert deserialize_response(data) == (0.5, True)
 
 
+def test_serialize_tuple_with_partial_evidence_uses_defensive_defaults():
+    class EvidenceTuple(tuple):
+        text = "partial evidence"
+        prompt = "prompt"
+
+    restored = deserialize_response(serialize_response(EvidenceTuple((0.5, True))))
+
+    assert restored == (0.5, True)
+
+
 def test_serialize_deserialize_plain_string_roundtrip():
     data = serialize_response("plain text")
     assert deserialize_response(data) == "plain text"

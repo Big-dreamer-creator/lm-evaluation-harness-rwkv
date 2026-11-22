@@ -22,19 +22,6 @@ DEFAULT_SEQ_LENGTHS = [
 TOKENIZER_ARG_KEYS = ("tokenizer", "pretrained", "tokenizer_base_url", "tokenizer_model", "model")
 
 
-def resolve_tokenizer_name(kwargs: dict) -> str | None:
-    """Pick the tokenizer name out of the model args a synthetic task is given.
-
-    Returns the first non-empty string among `tokenizer`, `pretrained` and
-    `model`, or None if there is none.
-    """
-    for key in ("tokenizer", "pretrained", "model"):
-        value = kwargs.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
 def resolve_tokenizer_kwargs(kwargs: dict) -> dict:
     """Pull `get_tokenizer`'s own arguments out of a synthetic task's kwargs.
 

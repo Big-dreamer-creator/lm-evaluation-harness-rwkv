@@ -698,49 +698,59 @@ class Run(SubCommand):
         eval_logger.info("Selected Tasks: %s", cfg.tasks)
 
         # Run evaluation
-        results = simple_evaluate(
-            model=cfg.model,
-            model_args=cfg.model_args,
-            tasks=cfg.tasks,
-            num_fewshot=cfg.num_fewshot,
-            batch_size=cfg.batch_size,
-            max_batch_size=cfg.max_batch_size,
-            device=cfg.device,
-            use_cache=cfg.use_cache,
-            cache_requests=cfg.cache_requests.get("cache_requests", False),
-            rewrite_requests_cache=cfg.cache_requests.get(
-                "rewrite_requests_cache", False
-            ),
-            delete_requests_cache=cfg.cache_requests.get(
-                "delete_requests_cache", False
-            ),
-            limit=cfg.limit,
-            limit_scope=cfg.limit_scope,
-            samples=cfg.samples,
-            check_integrity=cfg.check_integrity,
-            write_out=cfg.write_out,
-            log_samples=cfg.log_samples,
-            evaluation_tracker=evaluation_tracker,
-            system_instruction=cfg.system_instruction,
-            apply_chat_template=cfg.apply_chat_template,
-            fewshot_as_multiturn=cfg.fewshot_as_multiturn,
-            gen_kwargs=cfg.gen_kwargs,
-            task_manager=task_manager,
-            verbosity=cfg.verbosity,
-            predict_only=cfg.predict_only,
-            random_seed=cfg.seed[0] if cfg.seed else None,
-            numpy_random_seed=cfg.seed[1] if cfg.seed else None,
-            torch_random_seed=cfg.seed[2] if cfg.seed else None,
-            fewshot_random_seed=cfg.seed[3] if cfg.seed else None,
-            confirm_run_unsafe_code=cfg.confirm_run_unsafe_code,
-            metadata=cfg.metadata,
-            task_callback=scoreboard_callback,
-            checkpoint_store=checkpoint_store,
-            benchmark_map=benchmark_map,
-        )
-
-        if checkpoint_store is not None:
-            checkpoint_store.close()
+        checkpoint_run_status = None
+        try:
+            results = simple_evaluate(
+                model=cfg.model,
+                model_args=cfg.model_args,
+                tasks=cfg.tasks,
+                num_fewshot=cfg.num_fewshot,
+                batch_size=cfg.batch_size,
+                max_batch_size=cfg.max_batch_size,
+                device=cfg.device,
+                use_cache=cfg.use_cache,
+                cache_requests=cfg.cache_requests.get("cache_requests", False),
+                rewrite_requests_cache=cfg.cache_requests.get(
+                    "rewrite_requests_cache", False
+                ),
+                delete_requests_cache=cfg.cache_requests.get(
+                    "delete_requests_cache", False
+                ),
+                limit=cfg.limit,
+                limit_scope=cfg.limit_scope,
+                samples=cfg.samples,
+                check_integrity=cfg.check_integrity,
+                write_out=cfg.write_out,
+                log_samples=cfg.log_samples,
+                evaluation_tracker=evaluation_tracker,
+                system_instruction=cfg.system_instruction,
+                apply_chat_template=cfg.apply_chat_template,
+                fewshot_as_multiturn=cfg.fewshot_as_multiturn,
+                gen_kwargs=cfg.gen_kwargs,
+                task_manager=task_manager,
+                verbosity=cfg.verbosity,
+                predict_only=cfg.predict_only,
+                random_seed=cfg.seed[0] if cfg.seed else None,
+                numpy_random_seed=cfg.seed[1] if cfg.seed else None,
+                torch_random_seed=cfg.seed[2] if cfg.seed else None,
+                fewshot_random_seed=cfg.seed[3] if cfg.seed else None,
+                confirm_run_unsafe_code=cfg.confirm_run_unsafe_code,
+                metadata=cfg.metadata,
+                task_callback=scoreboard_callback,
+                checkpoint_store=checkpoint_store,
+                benchmark_map=benchmark_map,
+            )
+        except BaseException:
+            if checkpoint_store is not None:
+                checkpoint_store.mark_run_failed()
+            raise
+        else:
+            if checkpoint_store is not None:
+                checkpoint_run_status = checkpoint_store.finalize_run_status()
+                eval_logger.info("Checkpoint run status: %s", checkpoint_run_status)
+        finally:
+            if checkpoint_store is not None:
+                checkpoint_store.close()
 
         # Process results
         if results is not None:
@@ -812,3 +822,6 @@ class Run(SubCommand):
 
             if cfg.trackio_args:
                 trackio_logger.finish()
+
+        if checkpoint_run_status == "completed_with_errors":
+            raise SystemExit(1)

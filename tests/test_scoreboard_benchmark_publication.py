@@ -321,6 +321,21 @@ def test_rwkv_model_parses_name_with_explicit_ctx_len():
     }
 
 
+def test_rwkv_model_falls_back_from_serving_alias_to_weight_revision():
+    """A serving alias may carry a deployment suffix the board does not use."""
+    assert _rwkv_model(
+        "rwkv7-g1m-preview-1.5b",
+        65536,
+        weight_revision="rwkv7-g1m-1.5b-temp6629-ctx65536",
+    ) == {
+        "arch_version": "rwkv7",
+        "data_version": "G1m",
+        "param_size": "1.5b",
+        "ctx_len": 65536,
+        "is_preview": False,
+    }
+
+
 def test_publication_config_controls_preview_identity():
     config = PublicationConfig.from_mapping(
         {
@@ -424,6 +439,28 @@ def test_build_score_reads_ctx_from_metadata_weight_revision(tmp_path):
         "param_size": "1.5b",
         "ctx_len": 16384,
             "is_preview": False,
+    }
+
+
+def test_build_score_uses_weight_revision_for_serving_alias_identity(tmp_path):
+    run_dir = tmp_path / "rwkv7-g1m-preview-1.5b-remote-unit"
+    leaves = {"leaf_a": _leaf_artifacts(run_dir, "leaf_a", docs=10, k=1, plain=0.5)}
+    doc = _benchmark_doc(run_dir, leaves)
+    doc["config"] = {
+        "model": "rwkv7-remote",
+        "model_args": {**_MODEL_ARGS, "model": "rwkv7-g1m-preview-1.5b"},
+        "metadata": {"weight_revision": "rwkv7-g1m-1.5b-temp6629-ctx65536"},
+        "evaluation_protocol": "rwkv-generative-v2",
+    }
+
+    _, score = build_score(doc, _publish_config({"bench": {"field": "reasoning"}}))
+
+    assert score["model"] == {
+        "arch_version": "rwkv7",
+        "data_version": "G1m",
+        "param_size": "1.5b",
+        "ctx_len": 65536,
+        "is_preview": False,
     }
 
 
@@ -728,6 +765,39 @@ def test_upload_rejects_name_only_server_before_ambiguous_write(monkeypatch):
     with pytest.raises(ScoreboardError, match="cannot guarantee benchmark_id/field identity"):
         publisher._upload({"benchmark_id": 1}, benchmark_name="mmlu")
     assert payloads == [{"benchmark_id": 1}]
+
+
+def test_publish_uploads_resolved_id_without_name_only_payload(monkeypatch):
+    """The payload carries the registered id, never an ambiguous name-only fallback."""
+    publisher = _publisher(monkeypatch, rerun_reason=None)
+    uploads = []
+
+    def fake_send(path, *, body=None, timeout=None, method="POST"):
+        if path == "/api/health":
+            return {"status": "ok"}
+        assert path == "/api/add_benchmarks"
+        return {"benchmark_id": 17}
+
+    def fake_upload(score, *, benchmark_name=None, allow_expire=True):
+        uploads.append((score, benchmark_name, allow_expire))
+        return {"success": True, "score_id": 99, "benchmark_id": 17}
+
+    monkeypatch.setattr(publisher, "_send", fake_send)
+    monkeypatch.setattr(publisher, "_upload", fake_upload)
+
+    receipt = publisher.publish(
+        {"name": "mmlu", "field": "knowledge", "num_samples": 10, "avg_k": 1},
+        {"score": 0.5},
+    )
+
+    assert uploads == [
+        (
+            {"score": 0.5, "benchmark_id": 17},
+            "mmlu",
+            True,
+        )
+    ]
+    assert receipt["benchmark_id"] == 17
 
 
 def _fake_response(payload: dict):

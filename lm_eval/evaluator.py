@@ -1115,6 +1115,7 @@ def evaluate(
     # leaves are all done), never once per leaf task.
     benchmark_trackers: dict[str, dict[str, Any]] = {}
     leaf_to_benchmark: dict[str, str] = {}
+    publish_outcomes: dict[str, str] = {}
     if benchmark_map and (task_callback is not None or checkpoint_store is not None):
         for bname, spec in benchmark_map.items():
             if spec.leaf_task_names is not None:
@@ -1568,7 +1569,6 @@ def evaluate(
                 entry.update({
                     "request_type": "loglikelihood",
                     "request_url": lm.base_url,
-                    "prompt_token_ids": response.prompt_token_ids,
                     "finish_reason": None,
                     "loglikelihood": response[0],
                     "raw_response": raw_response,
@@ -1756,6 +1756,8 @@ def evaluate(
                 existing is not None and existing["publish_status"] == "succeeded"
             )
             checkpoint_store.start_benchmark(bname, fingerprint)
+            if skip_publish:
+                publish_outcomes[bname] = "published"
 
         results_doc = {
             **_rwkv_task_context(lm, task_callback_context, eval_tasks[leaves[-1]]),
@@ -1803,25 +1805,54 @@ def evaluate(
                 )
                 publish_ok = True
                 if isinstance(callback_status, dict):
-                    publish_ok = callback_status.get("publication") not in (
-                        "failed",
-                        None,
-                    )
+                    publication = callback_status.get("publication")
+                    uploaded = bool(callback_status.get("uploaded", False))
+                    if publication == "validated":
+                        publish_ok = True
+                        publish_status = "validated"
+                        publish_outcomes[bname] = "validated"
+                    elif publication == "complete":
+                        publish_ok = uploaded
+                        publish_status = "succeeded" if uploaded else "failed"
+                        publish_outcomes[bname] = (
+                            "published" if uploaded else "publication_failed"
+                        )
+                    elif publication is None and uploaded:
+                        # Backward-compatible callback contract: an explicit
+                        # upload acknowledgement is stronger evidence than the
+                        # legacy status label.
+                        publish_ok = True
+                        publish_status = "succeeded"
+                        publish_outcomes[bname] = "published"
+                    elif publication not in ("failed", None):
+                        publish_ok = True
+                        publish_status = "succeeded" if uploaded else "none"
+                        publish_outcomes[bname] = (
+                            "published" if uploaded else "unpublished"
+                        )
+                    else:
+                        publish_ok = False
+                        publish_status = "failed"
+                        publish_outcomes[bname] = "publication_failed"
                     eval_logger.log(
                         logging.INFO if publish_ok else logging.WARNING,
                         "Benchmark %s publication=%s uploaded=%s%s",
                         bname,
-                        callback_status.get("publication", "unknown"),
-                        callback_status.get("uploaded", False),
+                        publication or "unknown",
+                        uploaded,
                         f" error={callback_status['error']}"
                         if callback_status.get("error")
                         else "",
                     )
-                if checkpoint_store is not None:
-                    checkpoint_store.set_publish_status(
-                        bname, "succeeded" if publish_ok else "failed"
+                else:
+                    publish_status = "succeeded"
+                    publish_outcomes[bname] = (
+                        "published" if publish_ok else "publication_failed"
                     )
+                if checkpoint_store is not None:
+                    checkpoint_store.set_publish_status(bname, publish_status)
             except Exception as error:  # noqa: BLE001
+                publish_outcomes[bname] = "publication_failed"
                 eval_logger.warning("Task callback failed for %s: %s", bname, error)
                 if checkpoint_store is not None:
                     checkpoint_store.set_publish_status(bname, "failed")
@@ -1941,6 +1972,39 @@ def evaluate(
         bname = leaf_to_benchmark.get(task_name, task_name)
         schedule_units.setdefault(bname, []).append((task_name, acc, task_limit))
 
+    total_benchmark_units = len(schedule_units)
+    progress_counts = {
+        "published": 0,
+        "publication_failed": 0,
+        "skipped": 0,
+        "validated": 0,
+        "unpublished": 0,
+    }
+    if checkpoint_store is not None:
+        previously_skipped: list[str] = []
+        for bname in list(schedule_units):
+            existing = checkpoint_store.get_benchmark(bname)
+            if existing is None or existing["status"] != "skipped":
+                continue
+            previously_skipped.append(bname)
+            for task_name, _acc, _task_limit in schedule_units.pop(bname):
+                eval_results_acc.pop(task_name, None)
+        if previously_skipped:
+            progress_counts["skipped"] += len(previously_skipped)
+            eval_logger.warning(
+                "Benchmark progress: %d/%d accounted; published=%d "
+                "publication_failed=%d skipped=%d validated=%d unpublished=%d; "
+                "previously_skipped=%s",
+                sum(progress_counts.values()),
+                total_benchmark_units,
+                progress_counts["published"],
+                progress_counts["publication_failed"],
+                progress_counts["skipped"],
+                progress_counts["validated"],
+                progress_counts["unpublished"],
+                ", ".join(sorted(previously_skipped)),
+            )
+
     # One benchmark at a time, in lighteval-rwkv's order: benchmarks that do
     # not generate first, then fewest pending rollouts first, so short
     # benchmarks publish early. Reordering is only safe when every rank sees
@@ -1969,6 +2033,8 @@ def evaluate(
             # artifacts, omit this selector from this run's result, and let
             # later selectors continue instead of aborting the whole batch.
             skipped_benchmarks[bname] = str(error)
+            if checkpoint_store is not None:
+                checkpoint_store.mark_benchmark_skipped(bname)
             eval_logger.warning(
                 "Skipping benchmark %s: %s",
                 bname,
@@ -1976,6 +2042,38 @@ def evaluate(
             )
             for task_name, _acc, _task_limit in schedule_units[bname]:
                 eval_results_acc.pop(task_name, None)
+        outcome = (
+            "skipped"
+            if bname in skipped_benchmarks
+            else publish_outcomes.get(bname, "unpublished")
+        )
+        progress_counts[outcome] += 1
+        eval_logger.info(
+            "Benchmark progress: %d/%d accounted; published=%d "
+            "publication_failed=%d skipped=%d validated=%d unpublished=%d; "
+            "latest=%s outcome=%s",
+            sum(progress_counts.values()),
+            total_benchmark_units,
+            progress_counts["published"],
+            progress_counts["publication_failed"],
+            progress_counts["skipped"],
+            progress_counts["validated"],
+            progress_counts["unpublished"],
+            bname,
+            outcome,
+        )
+
+    eval_logger.info(
+        "Benchmark campaign summary: %d/%d accounted; published=%d "
+        "publication_failed=%d skipped=%d validated=%d unpublished=%d",
+        sum(progress_counts.values()),
+        total_benchmark_units,
+        progress_counts["published"],
+        progress_counts["publication_failed"],
+        progress_counts["skipped"],
+        progress_counts["validated"],
+        progress_counts["unpublished"],
+    )
 
     if RANK == 0:
         if skipped_benchmarks:

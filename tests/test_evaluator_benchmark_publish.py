@@ -143,6 +143,30 @@ def test_leaf_tasks_never_published_only_benchmark_is(
     assert metadata_doc["benchmark"] == results_doc["benchmark"]
 
 
+def test_progress_counts_publication_failure_separately(
+    benchmark_fixture_task_manager, tmp_path, caplog
+):
+    calls = []
+
+    def failing_callback(task_name, artifact_paths):
+        calls.append((task_name, artifact_paths))
+        return {
+            "publication": "failed",
+            "uploaded": False,
+            "error": "scoreboard rejected the upload",
+        }
+
+    failing_callback.calls = calls
+    with caplog.at_level("INFO", logger="lm_eval.evaluator"):
+        callback_calls, _ = _run_test_group(
+            benchmark_fixture_task_manager, failing_callback, tmp_path
+        )
+
+    assert len(callback_calls) == 1
+    assert "Benchmark campaign summary: 1/1 accounted" in caplog.text
+    assert "published=0 publication_failed=1 skipped=0" in caplog.text
+
+
 def test_simple_evaluate_writes_run_metadata_into_the_published_artifact(
     benchmark_fixture_task_manager, recording_callback, tmp_path, monkeypatch
 ):
@@ -306,6 +330,50 @@ def test_already_published_benchmark_skips_callback_but_updates_checkpoint(
     )
 
     assert len(calls) == 0
+    benchmark_row = checkpoint_store.get_benchmark("test_group")
+    assert benchmark_row["publish_status"] == "succeeded"
+
+
+def test_validated_benchmark_is_published_on_a_later_resume(
+    benchmark_fixture_task_manager, tmp_path
+):
+    """A dry-run validation must not make a real publication look complete."""
+    from lm_eval.api.checkpoint import CheckpointStore
+
+    checkpoint_store = CheckpointStore(str(tmp_path / "checkpoint.sqlite"), "run-1")
+    validated_calls = []
+
+    def validated_callback(task_name, artifact_paths):
+        validated_calls.append((task_name, artifact_paths))
+        return {"publication": "validated", "uploaded": False}
+
+    validated_callback.calls = validated_calls
+    _run_test_group(
+        benchmark_fixture_task_manager,
+        validated_callback,
+        tmp_path,
+        checkpoint_store=checkpoint_store,
+    )
+
+    assert len(validated_calls) == 1
+    benchmark_row = checkpoint_store.get_benchmark("test_group")
+    assert benchmark_row["publish_status"] == "validated"
+
+    published_calls = []
+
+    def published_callback(task_name, artifact_paths):
+        published_calls.append((task_name, artifact_paths))
+        return {"publication": "complete", "uploaded": True}
+
+    published_callback.calls = published_calls
+    _run_test_group(
+        benchmark_fixture_task_manager,
+        published_callback,
+        tmp_path,
+        checkpoint_store=checkpoint_store,
+    )
+
+    assert len(published_calls) == 1
     benchmark_row = checkpoint_store.get_benchmark("test_group")
     assert benchmark_row["publish_status"] == "succeeded"
 

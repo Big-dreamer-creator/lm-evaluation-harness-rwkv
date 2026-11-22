@@ -583,13 +583,30 @@ def _rwkv_model(
     ctx_len: int,
     *,
     is_preview: bool = False,
+    weight_revision: str | None = None,
 ) -> dict[str, Any]:
-    """Build the board's model identity from the served weight."""
-    match = MODEL_NAME_PATTERN.match(model_name)
+    """Build the board's model identity from the served weight.
+
+    ``model_name`` doubles as the literal API ``model=`` value, so a serving
+    alias may carry a deployment suffix that is not part of the weight identity
+    (for example ``rwkv7-g1m-preview-1.5b``). ``weight_revision`` is the full
+    weight-release stem and is the authoritative identity source when present;
+    the API alias remains the fallback for configs that embed it directly.
+    """
+    sources = []
+    if weight_revision is not None:
+        sources.append((str(weight_revision), "weight_revision"))
+    sources.append((str(model_name), "model name"))
+    match = None
+    for text, _kind in sources:
+        match = MODEL_NAME_PATTERN.match(text)
+        if match is not None:
+            break
     if match is None:
+        searched = ", ".join(f"{kind} {text!r}" for text, kind in sources)
         raise ScoreboardError(
-            f"cannot derive arch_version/data_version/param_size from model name "
-            f"{model_name!r}; expected '<arch_version>-<data_version>-<param_size>'"
+            f"cannot derive arch_version/data_version/param_size from {searched}; "
+            "expected '<arch_version>-<data_version>-<param_size>'"
         )
     arch_version, data_token, param_size = match.groups()
     if arch_version not in ARCH_VERSIONS:
@@ -1362,6 +1379,7 @@ def build_score(
             model_name, *artifact_hint_paths, weight_revision=weight_revision
         ),
         is_preview=config.is_preview,
+        weight_revision=weight_revision,
     )
     payload = {
         "benchmark_id": None,

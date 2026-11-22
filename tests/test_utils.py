@@ -782,6 +782,7 @@ def test_ruler_dataset_entrypoints_forward_remote_tokenizer_metadata(
 
     result = getattr(module, entrypoint)(
         max_seq_lengths=[4096],
+        generation_parameters={"temperature": 0.0},
         tokenizer_base_url="http://127.0.0.1:8000/v1/completions",
         tokenizer_model="rwkv7-g1i-1.5b-20260805-ctx16384",
     )
